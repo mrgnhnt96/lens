@@ -1,7 +1,7 @@
 ---
 name: review
 description: Review the current change with lens before opening a PR. Fresh-context reviewers look at the diff in parallel, an Opus verifier drops anything it can't show failing, and only blocker and major findings are reported. Use when the user runs /review or asks for a lens review of their branch.
-argument-hint: "[<base>] [--intent <file>]"
+argument-hint: "[<base>] [--intent <file>] [--no-fix]"
 ---
 
 # /review: the local pass
@@ -15,8 +15,9 @@ files and the task from `tb peek`, and nothing else.
 The local pass runs four profiles: `impact-assessment` (lead, first), then `correctness`,
 `testing` and `intent-alignment` in parallel. Other profiles lens picks are left to the PR pass.
 
-Arguments: an optional base ref (default: origin's default branch, then `main`, then `master`)
-and `--intent <file>`: a ticket or spec the change implements, for `intent-alignment`.
+Arguments: an optional base ref (default: origin's default branch, then `main`, then `master`),
+`--intent <file>`: a ticket or spec the change implements, for `intent-alignment`, and
+`--no-fix`: report blockers without running the fix loop (step 7).
 
 Keep it moving: every step below that spawns agents spawns them **all in one message** so they
 run in parallel. Don't read the repo yourself beyond what a step says.
@@ -142,5 +143,72 @@ Dropped 3 findings the verifier couldn't show failing; 5 below major.
 Report: .review/feat/x.json
 ```
 
-With no findings, say so in one line plus the `Ran` / `Dropped` lines. Don't fix anything:
-the review reports, and fixing is a separate step the user (or the fix loop) chooses.
+With no findings, say so in one line plus the `Ran` / `Dropped` lines. Majors are reported, not
+fixed. Blockers go to the fix loop (step 7) unless `--no-fix` was passed.
+
+## 7. Fix the blockers
+
+A blocker stops the change, but the human sees it last: a fixer agent fixes it, the reviewers
+check again, and after every failed check a Haiku judge decides whether to try again or bring
+the human in. `lens fix` keeps the ledger and its rules (the cap of 5 attempts, what counts as
+fixed); you only run the agents and hand it their replies. Never edit the code yourself, and
+never decide for the judge.
+
+Take the blockers one at a time, in report order (fixes share the working tree). For each,
+`lens` being `${CLAUDE_PLUGIN_ROOT}/bin/lens`:
+
+```sh
+lens fix start --report <report> --finding <id>
+```
+
+It prints a step: `ledger`, `attempts`, `cap` and `next`. Do what `next` says, and keep going
+with the step each command prints, until `next` is `done` or `escalate`. Save every agent reply
+in full to the ledger's folder (`<work>/fix/`) as `<id>-<what>-<n>.md`, never elsewhere in the
+repo: anything outside `.review/` would count as part of the fix.
+
+- **`fix`**: spawn one `lens:fixer` agent:
+
+  ```
+  Ledger: <ledger>
+  Finding <id> (<profiles>): <file>:<line>  <title>
+  Failure: <failureScenario>
+  How it fails:
+  <howItFails>
+  Guidelines: <guideline file paths, or "none">
+  ```
+
+  Then save the attempt's diff: `lens fix diff --ledger <ledger> > <work>/fix/<id>-pending.patch`
+  (untracked files included). When it's empty the fixer changed nothing: skip straight to
+  `lens fix record --ledger <ledger> --fixer <its reply>`. Otherwise, in **one message**: a
+  `lens:verifier` with the original finding exactly as in step 5, and a `lens:reviewer` per
+  profile that raised it, as in step 4, adding:
+
+  ```
+  This is a re-review of a fix for finding <id> (<title>). The fix: <work>/fix/<id>-pending.patch.
+  Raise only what the fix itself breaks.
+  ```
+
+  Verify their blocker and major findings as in step 5 (in one message). Write the re-review
+  as `{"original": <the verifier's json>, "newFindings": [<each confirmed finding>]}` and record
+  the attempt:
+
+  ```sh
+  lens fix record --ledger <ledger> --fixer <fixer reply> --review <re-review>
+  ```
+
+  It counts as fixed only when the verifier drops the original finding and nothing new is
+  confirmed.
+
+- **`judge`**: spawn one `lens:escalator` agent (Haiku) with `Ledger: <ledger>`, then
+  `lens fix judge --ledger <ledger> --decision <its reply>`. An unparseable reply fails the
+  command: spawn it once more, and if that fails too, treat it as `escalate` with reason "the
+  judge's reply couldn't be read".
+
+- **`done`**: print `lens fix summary --ledger <ledger>`'s first line and move to the next blocker.
+
+- **`escalate`**: print `lens fix summary --ledger <ledger>` as it is and move to the next
+  blocker. Its attempts stay in the working tree; the summary says how to see them.
+
+The ledger also marks the finding in the report (`fix.status`: `open`, `resolved` or
+`escalated`), so a caller such as `tb done` can tell a fixed blocker from one waiting on the
+human. End with one line: how many blockers were fixed and how many need the human.
