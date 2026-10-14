@@ -5,7 +5,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use lens::{diff, profile, select};
+use lens::{diff, map, profile, select};
 
 /// Agent code review for Claude Code.
 #[derive(Parser)]
@@ -28,6 +28,18 @@ enum Command {
         /// The default profiles. Defaults to $LENS_PROFILES_DIR, then the plugin's profiles/.
         #[arg(long)]
         defaults: Option<PathBuf>,
+    },
+    /// Map the change since <base>: changed files and symbols, their callers and covering tests.
+    Map {
+        /// The ref the change is measured from (its merge base with HEAD).
+        #[arg(long)]
+        base: String,
+        /// The repo to map. Defaults to the current directory.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// The provider to use instead of .lens.toml's: "grep" (built in) or a program.
+        #[arg(long)]
+        provider: Option<String>,
     },
 }
 
@@ -64,6 +76,14 @@ fn main() -> Result<()> {
                 languages: select::languages(&change.files).into_iter().collect(),
                 selection: select::select(&profiles, &change.files)?,
             };
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Command::Map {
+            base,
+            repo,
+            provider,
+        } => {
+            let out = map::build(&repo, &base, provider.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
     }
