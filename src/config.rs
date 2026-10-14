@@ -12,6 +12,8 @@ pub const FILE: &str = ".lens.toml";
 pub struct Config {
     #[serde(default)]
     pub map: MapConfig,
+    #[serde(default)]
+    pub pr: PrConfig,
 }
 
 /// `[map]`: who builds the change map.
@@ -40,6 +42,38 @@ pub enum Input {
     Stdin,
     /// Appended to the provider's arguments.
     Args,
+}
+
+/// `[pr]`: how the PR pass posts its findings.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrConfig {
+    /// Whose account the comments come from.
+    #[serde(default)]
+    pub post_as: PostAs,
+    /// The environment variable holding the bot's token, for `post_as = "bot"`.
+    /// Defaults to `LENS_BOT_TOKEN`.
+    pub bot_token_env: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PostAs {
+    /// The account `gh` is logged in as.
+    #[default]
+    Owner,
+    /// A bot account, through the token in `bot_token_env`.
+    Bot,
+}
+
+impl PrConfig {
+    pub const DEFAULT_BOT_TOKEN_ENV: &'static str = "LENS_BOT_TOKEN";
+
+    pub fn bot_token_env(&self) -> &str {
+        self.bot_token_env
+            .as_deref()
+            .unwrap_or(Self::DEFAULT_BOT_TOKEN_ENV)
+    }
 }
 
 /// Reads `<root>/.lens.toml`; a repo without one gets the defaults.
@@ -73,6 +107,18 @@ mod tests {
             Some(ProviderSpec::Argv(vec!["ra-map".into(), "--fast".into()]))
         );
         assert_eq!(c.map.input, Input::Args);
+    }
+
+    #[test]
+    fn pr_posts_as_the_owner_unless_set_to_bot() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.pr.post_as, PostAs::Owner);
+        assert_eq!(c.pr.bot_token_env(), "LENS_BOT_TOKEN");
+        let c: Config =
+            toml::from_str("[pr]\npost_as = \"bot\"\nbot_token_env = \"REVIEW_BOT\"\n").unwrap();
+        assert_eq!(c.pr.post_as, PostAs::Bot);
+        assert_eq!(c.pr.bot_token_env(), "REVIEW_BOT");
+        assert!(toml::from_str::<Config>("[pr]\npost_as = \"me\"\n").is_err());
     }
 
     #[test]
