@@ -1,0 +1,5 @@
+{
+  "name": "naming-intuitivity",
+  "conformsTo": "reviewer@1",
+  "description": "Naming, method shape, and whether a reader could predict behavior from the signature alone."
+}

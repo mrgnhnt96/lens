@@ -1,0 +1,5 @@
+{
+  "name": "correctness",
+  "conformsTo": "reviewer@1",
+  "description": "Logic errors, race conditions, resource leaks, null handling, async mistakes — bugs that will bite at runtime."
+}

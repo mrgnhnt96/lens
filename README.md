@@ -10,4 +10,32 @@ real problems reach you.
 Works in any repo. Taskboard calls it at `tb done` and from its PR flow, but
 lens doesn't depend on taskboard.
 
+## Layout
+
+```
+.claude-plugin/plugin.json   plugin manifest
+skills/review/               the /review skill
+bin/lens                     shim that runs the lens binary built from this repo
+profiles/                    the default reviewer profiles (format in profiles/README.md)
+src/                         the lens CLI (Rust)
+```
+
+Build the binary with `cargo build --release`; `bin/lens` finds `target/release/lens`
+(or `$LENS_BIN`, or `~/.cargo/bin/lens`) and points it at `profiles/`.
+
+## `lens profiles --base <ref>`
+
+Prints, as JSON, the profiles that apply to everything that changed since the merge base of
+`<ref>` and `HEAD` (commits, staged, unstaged and untracked files):
+
+- `enabled: false` never runs.
+- `languages` gates: the change must touch a file in one of them.
+- `globs` and `pathKeywords` select the profile when any changed path matches.
+- `inferenceRules` can't be judged from paths: a profile that only has rules left to check
+  comes back with `decision: "infer"` and the caller asks a model.
+- A profile with no globs, keywords or rules runs whenever it passes its gate.
+
+A repo's own `review-profiles/<name>/profile.md` replaces the default with that name; new
+names are added.
+
 Plan: https://claude.ai/code/artifact/a12f42b8-ee3b-41ee-953b-94b9091d47b1

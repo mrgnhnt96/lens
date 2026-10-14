@@ -1,0 +1,5 @@
+{
+  "name": "architecture",
+  "conformsTo": "reviewer@1",
+  "description": "Layering, coupling, separation of concerns, consistency with the codebase's established patterns."
+}

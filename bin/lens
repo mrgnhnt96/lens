@@ -1,0 +1,42 @@
+#!/bin/sh
+# Shim: run the lens binary built from this repo, or an installed one.
+
+self=$0
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case $link in
+    /*) self=$link ;;
+    *) self=$(dirname "$self")/$link ;;
+  esac
+done
+here=$(cd "$(dirname "$self")" 2>/dev/null && pwd -P)
+me=$(realpath "$self" 2>/dev/null || echo "$self")
+
+# An executable that isn't this shim (both are called lens).
+pick() {
+  [ -n "$1" ] && [ -f "$1" ] && [ -x "$1" ] && [ "$(realpath "$1" 2>/dev/null || echo "$1")" != "$me" ]
+}
+
+bin=
+if [ -n "$LENS_BIN" ] && pick "$LENS_BIN"; then
+  bin=$LENS_BIN
+elif [ -n "$here" ] && pick "$here/../target/release/lens"; then
+  bin=$here/../target/release/lens
+elif [ -n "$here" ] && pick "$here/../target/debug/lens"; then
+  bin=$here/../target/debug/lens
+elif pick "$HOME/.cargo/bin/lens"; then
+  bin=$HOME/.cargo/bin/lens
+fi
+
+if [ -z "$bin" ]; then
+  echo "lens: no lens binary found; run 'cargo build --release' in ${here%/bin}" >&2
+  exit 127
+fi
+
+# The default profiles ship in the plugin root, next to bin/.
+if [ -z "$LENS_PROFILES_DIR" ] && [ -n "$here" ] && [ -d "$here/../profiles" ]; then
+  LENS_PROFILES_DIR=$(cd "$here/../profiles" && pwd -P)
+  export LENS_PROFILES_DIR
+fi
+
+exec "$bin" "$@"

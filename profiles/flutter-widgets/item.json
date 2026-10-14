@@ -1,0 +1,5 @@
+{
+  "name": "flutter-widgets",
+  "conformsTo": "reviewer@1",
+  "description": "Flutter widget performance + lifecycle — method/static-method-returned widgets, missing const, composition, setState/mounted, listener teardown. Dart files only."
+}
