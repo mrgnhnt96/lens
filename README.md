@@ -15,7 +15,7 @@ lens doesn't depend on taskboard.
 ```
 .claude-plugin/plugin.json   plugin manifest
 skills/review/               the /review skill and its prepare script
-agents/                      the reviewer and verifier subagents /review spawns
+agents/                      the subagents /review spawns: reviewer, verifier, fixer, escalator
 bin/lens                     shim that runs the lens binary built from this repo
 profiles/                    the default reviewer profiles (format in profiles/README.md)
 src/                         the lens CLI (Rust)
@@ -53,5 +53,24 @@ provider = ["tools/lens-map", "--fast"]
 ```
 
 The contract and the output format are in [docs/PROVIDERS.md](docs/PROVIDERS.md).
+
+## `lens fix`
+
+The blocker fix loop's ledger. `/review` runs a fixer agent on each blocker, re-reviews the
+fix, and asks a Haiku judge after every failed re-review whether to try again or bring you in;
+`lens fix` keeps the record and the rules a model doesn't get to bend: at most 5 attempts
+(`--cap`), and a fix counts only when the verifier drops the finding and nothing new is
+confirmed.
+
+```sh
+lens fix start   --report .review/feat/x.json --finding F1   # prints the next step
+lens fix diff    --ledger <ledger>                            # the attempt in progress
+lens fix record  --ledger <ledger> --fixer <reply> --review <re-review>
+lens fix judge   --ledger <ledger> --decision <judge reply>
+lens fix summary --ledger <ledger>                            # what to tell the human
+```
+
+Each command but `diff` and `summary` prints `{"next": "fix" | "judge" | "done" | "escalate"}`.
+The ledger format is in [docs/REVIEW.md](docs/REVIEW.md).
 
 Plan: https://claude.ai/code/artifact/a12f42b8-ee3b-41ee-953b-94b9091d47b1

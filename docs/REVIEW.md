@@ -60,3 +60,47 @@ of `*`, so it never reaches a commit. The pass's inputs sit beside it in `.revie
 - `map.error`: the provider's error when `lens map` failed; the pass ran without a map.
 - `profiles[].ran: false` with `reason`: a local-pass profile that didn't apply. Profiles left
   to the PR pass aren't listed.
+- `findings[].fix`: set on a blocker once the fix loop takes it up:
+  `{"status": "open" | "resolved" | "escalated", "attempts": 2, "ledger": "<path>"}`.
+
+## The fix ledger
+
+The fix loop keeps one ledger per blocker at `.review/<branch>/fix/<id>.json`, written only by
+`lens fix`, with each attempt's diff beside it as `<id>-attempt-<n>.patch`.
+
+```json
+{
+  "version": 1,
+  "findingId": "F1",
+  "finding": { "id": "F1", "file": "src/parser.rs", "line": 42, "severity": "blocker", "…": "…" },
+  "report": "/repo/.review/feat/x.json",
+  "root": "/repo",
+  "baseTree": "72557a01ef…",
+  "cap": 5,
+  "status": "escalated",
+  "attempts": [
+    {
+      "n": 1,
+      "before": "72557a01ef…",
+      "after": "9c1e04b7d2…",
+      "patch": "/repo/.review/feat/x/fix/F1-attempt-1.patch",
+      "changedLines": 6,
+      "fixer": { "summary": "reject empty input in parse()", "needsDecision": null },
+      "review": {
+        "original": { "verdict": "confirmed", "howItFails": "1. login() …" },
+        "newFindings": []
+      },
+      "resolved": false,
+      "decision": { "decision": "escalate", "needs": "no-progress", "reason": "…" }
+    }
+  ],
+  "escalation": { "by": "judge", "needs": "no-progress", "reason": "…" }
+}
+```
+
+- `baseTree`, `before`, `after`: the working tree as git tree objects (untracked files
+  included, `.review/` and ignored files left out). `git diff <baseTree>` shows every attempt.
+- An attempt is `resolved` when its diff isn't empty, the verifier drops the original finding
+  and the re-review confirms nothing new. An attempt that changed nothing has no `review`.
+- `escalation.by`: `judge` (the Haiku escalation judge called it) or `cap` (the attempt that
+  hit `cap` failed; the judge isn't asked).
