@@ -14,11 +14,13 @@ lens doesn't depend on taskboard.
 
 ```
 .claude-plugin/plugin.json   plugin manifest
-skills/review/               the /review skill
+skills/review/               the /review skill and its prepare script
+agents/                      the reviewer and verifier subagents /review spawns
 bin/lens                     shim that runs the lens binary built from this repo
 profiles/                    the default reviewer profiles (format in profiles/README.md)
 src/                         the lens CLI (Rust)
 docs/PROVIDERS.md            the change-map provider contract
+docs/REVIEW.md               the .review/<branch>.json format
 ```
 
 Build the binary with `cargo build --release`; `bin/lens` finds `target/release/lens`
