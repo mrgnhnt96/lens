@@ -5,7 +5,8 @@ change in parallel, a verifier drops anything it can't show failing, and only
 real problems reach you.
 
 - **Local pass** (`/review`): about 5 minutes, before you open a PR.
-- **PR pass**: about 15 minutes, run without a terminal, posting findings on the PR.
+- **PR pass** (`/review --pr <n>`): about 15 minutes, run without a terminal
+  (`claude -p "/review --pr 12"`), posting verified findings on the PR as inline comments.
 
 Works in any repo. Taskboard calls it at `tb done` and from its PR flow, but
 lens doesn't depend on taskboard.
@@ -14,13 +15,13 @@ lens doesn't depend on taskboard.
 
 ```
 .claude-plugin/plugin.json   plugin manifest
-skills/review/               the /review skill and its prepare script
+skills/review/               the /review skill (SKILL.md local, PR.md PR pass) and its prepare scripts
 agents/                      the subagents /review spawns: reviewer, verifier, fixer, escalator
 bin/lens                     shim that runs the lens binary built from this repo
 profiles/                    the default reviewer profiles (format in profiles/README.md)
 src/                         the lens CLI (Rust)
 docs/PROVIDERS.md            the change-map provider contract
-docs/REVIEW.md               the .review/<branch>.json format
+docs/REVIEW.md               the .review/<branch>.json and .review/pr-<n>.json format
 ```
 
 Build the binary with `cargo build --release`; `bin/lens` finds `target/release/lens`
@@ -72,5 +73,23 @@ lens fix summary --ledger <ledger>                            # what to tell the
 
 Each command but `diff` and `summary` prints `{"next": "fix" | "judge" | "done" | "escalate"}`.
 The ledger format is in [docs/REVIEW.md](docs/REVIEW.md).
+
+## `lens pr earlier --pr <n>` and `lens pr post --pr <n> --report <file> --diff <patch>`
+
+The PR pass's GitHub side, through `gh`. `earlier` lists the lens findings already posted on the
+PR. `post` posts a report as one review at the reviewed commit: an inline comment per new finding
+on a line the diff shows (minor and nit collapsed), the rest in the review's summary. Findings an
+earlier run posted (same finding, or the same file within 3 lines) are skipped, and a rerun with
+nothing new posts nothing. `--dry-run` prints the payload instead.
+
+Who posts is set in `.lens.toml`:
+
+```toml
+[pr]
+post_as = "bot"                   # "owner" (default): whoever `gh` is logged in as
+bot_token_env = "LENS_BOT_TOKEN"  # the env var holding the bot's token (this is the default)
+```
+
+With `post_as = "bot"`, `lens pr` fails rather than post as the owner when the variable is unset.
 
 Plan: https://claude.ai/code/artifact/a12f42b8-ee3b-41ee-953b-94b9091d47b1

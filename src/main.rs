@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use lens::{diff, fix, map, profile, select};
+use lens::{config, diff, fix, map, pr, profile, select};
 
 /// Agent code review for Claude Code.
 #[derive(Parser)]
@@ -45,6 +45,11 @@ enum Command {
     Fix {
         #[command(subcommand)]
         command: FixCommand,
+    },
+    /// The PR pass's GitHub side, through `gh` (posting as .lens.toml's `[pr] post_as`).
+    Pr {
+        #[command(subcommand)]
+        command: PrCommand,
     },
 }
 
@@ -94,6 +99,38 @@ enum FixCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum PrCommand {
+    /// Print the findings earlier lens runs posted on a PR, as JSON.
+    Earlier {
+        /// The PR number.
+        #[arg(long)]
+        pr: u64,
+        /// The repo the PR belongs to. Defaults to the current directory.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Post a PR pass's verified findings as one review with inline comments, skipping the ones
+    /// an earlier run already posted. Prints what it posted and skipped, as JSON.
+    Post {
+        /// The PR number.
+        #[arg(long)]
+        pr: u64,
+        /// The pass's report, `.review/pr-<n>.json`.
+        #[arg(long)]
+        report: PathBuf,
+        /// The PR's diff, to tell which lines can take an inline comment.
+        #[arg(long)]
+        diff: PathBuf,
+        /// The repo the PR belongs to. Defaults to the current directory.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Print the review instead of posting it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfilesOut<'a> {
@@ -138,6 +175,50 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
         Command::Fix { command } => run_fix(command)?,
+        Command::Pr { command } => run_pr(command)?,
+    }
+    Ok(())
+}
+
+fn run_pr(command: PrCommand) -> Result<()> {
+    match command {
+        PrCommand::Earlier { pr, repo } => {
+            let gh = pr::Gh::new(&repo, &config::load(&repo)?.pr)?;
+            println!("{}", serde_json::to_string_pretty(&gh.earlier(pr)?)?);
+        }
+        PrCommand::Post {
+            pr: number,
+            report,
+            diff,
+            repo,
+            dry_run,
+        } => {
+            let cfg = config::load(&repo)?.pr;
+            let gh = pr::Gh::new(&repo, &cfg)?;
+            let text = std::fs::read_to_string(&report)
+                .with_context(|| format!("reading {}", report.display()))?;
+            let report: pr::Report = serde_json::from_str(&text)
+                .with_context(|| format!("parsing {}", report.display()))?;
+            let patch = std::fs::read_to_string(&diff)
+                .with_context(|| format!("reading {}", diff.display()))?;
+            let plan = pr::plan(&report, &gh.earlier(number)?, &pr::commentable(&patch));
+            let url = match (&plan.review, dry_run) {
+                (Some(review), false) => gh.post(number, review)?,
+                _ => None,
+            };
+            let out = serde_json::json!({
+                "pr": number,
+                "postAs": cfg.post_as,
+                "dryRun": dry_run,
+                "posted": plan.review.is_some() && !dry_run,
+                "review": url,
+                "inline": plan.inline,
+                "inBody": plan.in_body,
+                "skipped": plan.skipped,
+                "payload": if dry_run { plan.review } else { None },
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
     }
     Ok(())
 }

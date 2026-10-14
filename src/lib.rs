@@ -7,5 +7,6 @@ pub mod diff;
 pub mod fix;
 pub mod lang;
 pub mod map;
+pub mod pr;
 pub mod profile;
 pub mod select;

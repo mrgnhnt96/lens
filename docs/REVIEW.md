@@ -50,7 +50,7 @@ of `*`, so it never reaches a commit. The pass's inputs sit beside it in `.revie
 }
 ```
 
-- `pass`: `local` for `/review`.
+- `pass`: `local` for `/review`, `pr` for `/review --pr <n>`.
 - `dirty`: the working tree had uncommitted or untracked changes; they were reviewed too.
 - `findings`: blocker and major only, every one confirmed by a verifier. `severity` is the
   verifier's, `line` the verifier's when it moved it. Ids are `F1`, `F2`, … in report order
@@ -104,3 +104,19 @@ The fix loop keeps one ledger per blocker at `.review/<branch>/fix/<id>.json`, w
   and the re-review confirms nothing new. An attempt that changed nothing has no `review`.
 - `escalation.by`: `judge` (the Haiku escalation judge called it) or `cap` (the attempt that
   hit `cap` failed; the judge isn't asked).
+
+## The PR pass
+
+`/review --pr <n>` saves to `.review/pr-<n>.json`, with its inputs in `.review/pr-<n>/` (plus
+`pr.json`, `intent.md`, `posted.json` and, when the checkout isn't at the PR's head, `tree/`).
+The format is the same, except:
+
+- `pass` is `pr`, and `pr` is `{ "number": 12, "url": "https://github.com/o/r/pull/12" }`.
+  `branch` is the PR's head branch, `head` its head commit, `base` `origin/<its base>`.
+- `findings` holds every confirmed finding, `minor` and `nit` included; `dropped` only the
+  unverified ones. Every profile lens picked is listed in `profiles`.
+
+`lens pr post` reads the report and posts it; it uses `head`, `base`, `risk`, `assessment`,
+`profiles`, `findings` and the length of `dropped`, and ignores the rest. Each posted comment
+ends with `<!-- lens:finding key=<hash of file and title> -->` and the review body with
+`<!-- lens:review head=<sha> -->`, which is how later runs find what's already there.

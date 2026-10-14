@@ -1,10 +1,13 @@
 ---
 name: review
-description: Review the current change with lens before opening a PR. Fresh-context reviewers look at the diff in parallel, an Opus verifier drops anything it can't show failing, and only blocker and major findings are reported. Use when the user runs /review or asks for a lens review of their branch.
-argument-hint: "[<base>] [--intent <file>] [--no-fix]"
+description: Review the current change with lens before opening a PR. Fresh-context reviewers look at the diff in parallel, an Opus verifier drops anything it can't show failing, and only blocker and major findings are reported. Use when the user runs /review or asks for a lens review of their branch. `/review --pr <n>` runs the PR pass instead: every matching profile, all severities, posted on the PR.
+argument-hint: "[<base>] [--intent <file>] [--no-fix] | --pr <n>"
 ---
 
 # /review: the local pass
+
+**`--pr <n>`: stop here and follow `${CLAUDE_PLUGIN_ROOT}/skills/review/PR.md` instead.** That's
+the PR pass; the rest of this file is the local pass.
 
 A review in about 5 minutes on a ~100-line diff. You orchestrate; you don't review. Every
 judgment about the code comes from a subagent with a fresh context: a reviewer per profile, then
