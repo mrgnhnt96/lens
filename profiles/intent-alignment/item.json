@@ -1,0 +1,5 @@
+{
+  "name": "intent-alignment",
+  "conformsTo": "reviewer@1",
+  "description": "Does the change actually satisfy the linked ticket and documented design — fully, and without scope creep?"
+}

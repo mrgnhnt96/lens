@@ -1,0 +1,5 @@
+{
+  "name": "flutter-localization",
+  "conformsTo": "reviewer@1",
+  "description": "Localization conventions for ARB files / l10n — new keys over edits, param descriptions, tokenized styled strings. Triggers on .arb and l10n changes."
+}

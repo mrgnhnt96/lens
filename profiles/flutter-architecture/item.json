@@ -1,0 +1,5 @@
+{
+  "name": "flutter-architecture",
+  "conformsTo": "reviewer@1",
+  "description": "Layered Flutter architecture — separation of business logic from UI, bloc/Cubit state, get_it DI, no god-object/BuildContext passing, composition over deep inheritance. Dart files only."
+}

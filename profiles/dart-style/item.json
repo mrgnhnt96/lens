@@ -1,0 +1,5 @@
+{
+  "name": "dart-style",
+  "conformsTo": "reviewer@1",
+  "description": "Dart language idioms and readability per common Dart/Flutter house style — typing, enums, naming, finals, constructors, dead code. Dart files only."
+}

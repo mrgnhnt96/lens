@@ -1,0 +1,5 @@
+{
+  "name": "performance",
+  "conformsTo": "reviewer@1",
+  "description": "N+1 patterns, hot-path allocations, blocking I/O, sync-over-async, algorithmic complexity regressions."
+}

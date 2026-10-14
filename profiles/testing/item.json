@@ -1,0 +1,5 @@
+{
+  "name": "testing",
+  "conformsTo": "reviewer@1",
+  "description": "Test coverage for the change, brittle tests, mock-vs-reality mismatches, untested edge paths."
+}
