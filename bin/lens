@@ -33,6 +33,12 @@ if [ -z "$bin" ]; then
   exit 127
 fi
 
+# The plugin root holds the prompts and scripts `lens review` runs.
+if [ -z "$LENS_PLUGIN_ROOT" ] && [ -n "$here" ] && [ -d "$here/../prompts" ]; then
+  LENS_PLUGIN_ROOT=$(cd "$here/.." && pwd -P)
+  export LENS_PLUGIN_ROOT
+fi
+
 # The default profiles ship in the plugin root, next to bin/.
 if [ -z "$LENS_PROFILES_DIR" ] && [ -n "$here" ] && [ -d "$here/../profiles" ]; then
   LENS_PROFILES_DIR=$(cd "$here/../profiles" && pwd -P)

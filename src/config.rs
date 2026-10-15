@@ -14,6 +14,33 @@ pub struct Config {
     pub map: MapConfig,
     #[serde(default)]
     pub pr: PrConfig,
+    #[serde(default)]
+    pub review: ReviewConfig,
+}
+
+/// `[review]`: how `lens review` runs its agents.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ReviewConfig {
+    /// A change of at most this many lines gets the correctness reviewer only.
+    pub small_lines: u32,
+    /// Agents running at once.
+    pub parallel: usize,
+    /// Minutes before an agent is stopped.
+    pub timeout_mins: u64,
+    /// The fixer's `claude --permission-mode`: it edits the tree and runs tests, headless.
+    pub fixer_permission_mode: String,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        ReviewConfig {
+            small_lines: 40,
+            parallel: 4,
+            timeout_mins: 20,
+            fixer_permission_mode: "bypassPermissions".into(),
+        }
+    }
 }
 
 /// `[map]`: who builds the change map.
@@ -119,6 +146,16 @@ mod tests {
         assert_eq!(c.pr.post_as, PostAs::Bot);
         assert_eq!(c.pr.bot_token_env(), "REVIEW_BOT");
         assert!(toml::from_str::<Config>("[pr]\npost_as = \"me\"\n").is_err());
+    }
+
+    #[test]
+    fn review_settings_default_and_override() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.review.small_lines, 40);
+        assert_eq!(c.review.fixer_permission_mode, "bypassPermissions");
+        let c: Config = toml::from_str("[review]\nsmall_lines = 10\n").unwrap();
+        assert_eq!(c.review.small_lines, 10);
+        assert_eq!(c.review.parallel, 4);
     }
 
     #[test]
