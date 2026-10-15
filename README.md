@@ -1,35 +1,41 @@
 # lens
 
-Agent code review as a Claude Code plugin. Fresh-context reviewers look at a
-change in parallel, a verifier drops anything it can't show failing, and only
-real problems reach you.
+Agent code review in one binary. Fresh-context reviewers look at a change in parallel, a
+verifier drops anything it can't show failing, and only real problems reach you.
 
-- **Local pass** (`/review`, or `lens review`): a few minutes, before you open a PR.
-- **PR pass** (`/review --pr <n>`, or `lens review --pr <n>`): run without a terminal
-  (`claude -p "/review --pr 12"`), posting verified findings on the PR as inline comments.
+- **Local pass** (`lens review`): a few minutes, before you open a PR.
+- **PR pass** (`lens review --pr <n>`): posts verified findings on the PR as inline comments.
 
 `lens review` runs the whole pass itself; no model orchestrates it. Each reviewer, verifier and
 fixer is its own headless `claude -p`, started as lean as a review allows (see below), so a
-review costs only what its agents read and write.
+review costs only what its agents read and write. It needs `claude` (logged in) and `git` on the
+PATH, and `gh` for the PR pass.
 
-Works in any repo. Taskboard calls it at `tb done` and from its PR flow, but
-lens doesn't depend on taskboard.
+Works in any repo. Taskboard runs it when a task is submitted and from its PR flow, but lens
+doesn't depend on taskboard.
+
+## Install
+
+```sh
+cargo install --locked --path .
+```
+
+The binary carries everything it runs: the agents' prompts, the default profiles and the prepare
+scripts are compiled in, and written to `~/.cache/lens/<hash>/` (or `$XDG_CACHE_HOME`) the first
+time a build runs. Set `LENS_ASSETS` to a checkout to use its files instead, while working on
+them.
 
 ## Layout
 
 ```
-.claude-plugin/plugin.json   plugin manifest
-skills/review/               the /review skill (runs `lens review`) and its prepare scripts
 prompts/                     the agents' system prompts: reviewer, verifier, fixer, escalator
-bin/lens                     shim that runs the lens binary built from this repo
 profiles/                    the default reviewer profiles (format in profiles/README.md)
+scripts/                     prepare.sh and prepare-pr.sh, which gather a pass's inputs
+build.rs                     compiles prompts/, profiles/ and scripts/ into the binary
 src/                         the lens CLI (Rust)
 docs/PROVIDERS.md            the change-map provider contract
 docs/REVIEW.md               the .review/<branch>.json and .review/pr-<n>.json format
 ```
-
-Build the binary with `cargo build --release`; `bin/lens` finds `target/release/lens`
-(or `$LENS_BIN`, or `~/.cargo/bin/lens`) and points it at `profiles/` and `prompts/`.
 
 ## `lens review [<base>] [--intent <file>] [--no-fix] [--full]`, `lens review --pr <n>`
 

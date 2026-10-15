@@ -3,6 +3,7 @@
 //! own headless Claude session, and keeps the ledger of the blocker fix loop.
 
 pub mod agent;
+pub mod assets;
 pub mod config;
 pub mod diff;
 pub mod fix;

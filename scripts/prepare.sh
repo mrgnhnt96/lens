@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Gather what a /review pass needs into .review/<branch>/ and print a summary as JSON.
+# Gather what a `lens review` pass needs into .review/<branch>/ and print a summary as JSON.
 #
 #   prepare.sh [<base>]
 #
@@ -13,7 +13,7 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd -P)
-lens=${LENS:-$here/../../../bin/lens}
+lens=${LENS:-lens}
 
 root=$(git rev-parse --show-toplevel)
 cd "$root"

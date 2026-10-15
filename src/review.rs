@@ -57,25 +57,6 @@ const INLINE_DIFF_MAX: usize = 150_000;
 const INLINE_MAP_MAX: usize = 60_000;
 const INLINE_GUIDELINE_MAX: usize = 20_000;
 
-/// Where lens's own files are: `$LENS_PLUGIN_ROOT` (set by `bin/lens`), `$CLAUDE_PLUGIN_ROOT`, or a
-/// folder holding `.claude-plugin/` above the binary (a cargo build inside the plugin checkout).
-pub fn plugin_root() -> Result<PathBuf> {
-    for var in ["LENS_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"] {
-        if let Some(dir) = std::env::var_os(var).map(PathBuf::from) {
-            if dir.join("prompts").is_dir() {
-                return Ok(dir);
-            }
-        }
-    }
-    let exe = std::env::current_exe()?.canonicalize()?;
-    for dir in exe.ancestors().skip(1) {
-        if dir.join(".claude-plugin").is_dir() && dir.join("prompts").is_dir() {
-            return Ok(dir.to_path_buf());
-        }
-    }
-    bail!("can't find the lens plugin (its prompts/ folder); set LENS_PLUGIN_ROOT")
-}
-
 /// A finding as a reviewer raised it, after merging duplicates.
 #[derive(Debug, Clone)]
 struct Finding {
@@ -357,7 +338,8 @@ fn reason_of(p: &Value) -> String {
 /// Everything one pass works from.
 struct Pass {
     opts: Options,
-    plugin: PathBuf,
+    /// lens's own files (`assets::root`).
+    assets: PathBuf,
     root: PathBuf,
     /// Where agents read the code: the repo, or the PR's tree.
     tree_dir: PathBuf,
@@ -480,7 +462,7 @@ impl Pass {
     fn system_prompt(&self, role: &str, context: &str) -> Result<PathBuf> {
         let path = self.work.join("agents").join(format!("{role}.system.md"));
         fs::create_dir_all(path.parent().unwrap())?;
-        let text = format!("{}\n\n{}", agent::role_prompt(&self.plugin, role)?, context);
+        let text = format!("{}\n\n{}", agent::role_prompt(&self.assets, role)?, context);
         fs::write(&path, text)?;
         Ok(path)
     }
@@ -593,10 +575,10 @@ impl Pass {
 
 /// Runs a pass and returns what to print.
 pub fn run(opts: Options) -> Result<Done> {
-    let plugin = plugin_root()?;
+    let assets = crate::assets::root()?;
     let root = PathBuf::from(git(&opts.repo, &["rev-parse", "--show-toplevel"])?.trim());
     let cfg = config::load(&root)?;
-    let prepared = prepare(&plugin, &root, &opts)?;
+    let prepared = prepare(&assets, &root, &opts)?;
     let work = PathBuf::from(
         prepared["work"]
             .as_str()
@@ -620,7 +602,7 @@ pub fn run(opts: Options) -> Result<Done> {
     };
     let mut pass = Pass {
         opts,
-        plugin,
+        assets,
         root,
         tree_dir,
         work,
@@ -645,8 +627,8 @@ pub fn run(opts: Options) -> Result<Done> {
     }
 }
 
-fn prepare(plugin: &Path, root: &Path, opts: &Options) -> Result<Value> {
-    let scripts = plugin.join("skills/review/scripts");
+fn prepare(assets: &Path, root: &Path, opts: &Options) -> Result<Value> {
+    let scripts = assets.join("scripts");
     let mut cmd = match opts.pr {
         Some(n) => {
             let mut c = Command::new(scripts.join("prepare-pr.sh"));
@@ -665,7 +647,7 @@ fn prepare(plugin: &Path, root: &Path, opts: &Options) -> Result<Value> {
             "LENS_PROFILES_DIR",
             std::env::var_os("LENS_PROFILES_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| plugin.join("profiles")),
+                .unwrap_or_else(|| assets.join("profiles")),
         );
     let out = cmd.output().context("running the prepare script")?;
     if !out.status.success() {
@@ -1066,7 +1048,7 @@ fn fix_loop(pass: &mut Pass, report: &Value) -> Result<()> {
     let escalator_sys = pass.work.join("agents").join("escalator.system.md");
     fs::write(
         &escalator_sys,
-        agent::role_prompt(&pass.plugin, "escalator")?,
+        agent::role_prompt(&pass.assets, "escalator")?,
     )?;
     let profiles: Value =
         serde_json::from_str(&fs::read_to_string(pass.work.join("profiles.json"))?)?;
