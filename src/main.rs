@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use lens::{config, diff, fix, map, pr, profile, select};
+use lens::{config, diff, fix, map, pr, profile, review, select};
 
 /// Agent code review for Claude Code.
 #[derive(Parser)]
@@ -17,6 +17,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Review the change: run the reviewers, verify their findings, write the report to
+    /// .review/<branch>.json and take blockers through the fix loop. Each agent runs as its own
+    /// headless `claude -p`. Progress goes to stderr, the summary to stdout.
+    Review {
+        /// The base ref. Defaults to origin's default branch, then main, then master.
+        base: Option<String>,
+        /// A ticket or spec the change implements, for intent-alignment.
+        #[arg(long)]
+        intent: Option<PathBuf>,
+        /// Report blockers without running the fix loop.
+        #[arg(long)]
+        no_fix: bool,
+        /// Review the whole change, even when only part of it changed since the last review.
+        #[arg(long)]
+        full: bool,
+        /// Run the PR pass on this PR: every profile, all severities, posted on the PR.
+        #[arg(long, conflicts_with_all = ["base", "no_fix", "full"])]
+        pr: Option<u64>,
+        /// With --pr: build the review but don't post it.
+        #[arg(long, requires = "pr")]
+        dry_run: bool,
+        /// The repo to review. Defaults to the current directory.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
     /// Pick the reviewer profiles that apply to the change since <base> and print them as JSON.
     Profiles {
         /// The ref the change is measured from (its merge base with HEAD).
@@ -173,6 +198,27 @@ fn main() -> Result<()> {
         } => {
             let out = map::build(&repo, &base, provider.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Command::Review {
+            base,
+            intent,
+            no_fix,
+            full,
+            pr,
+            dry_run,
+            repo,
+        } => {
+            let intent = intent.map(|p| p.canonicalize()).transpose()?;
+            let done = review::run(review::Options {
+                repo,
+                base,
+                intent,
+                no_fix,
+                full,
+                pr,
+                dry_run,
+            })?;
+            println!("{}", done.summary);
         }
         Command::Fix { command } => run_fix(command)?,
         Command::Pr { command } => run_pr(command)?,

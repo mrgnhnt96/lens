@@ -1,9 +1,10 @@
 # The review file
 
-`/review` saves each pass to `.review/<branch>.json` in the reviewed repo (a detached HEAD is
+`lens review` saves each pass to `.review/<branch>.json` in the reviewed repo (a detached HEAD is
 `detached-<short sha>`). The fix loop and the PR pass read it. `.review/` holds a `.gitignore`
 of `*`, so it never reaches a commit. The pass's inputs sit beside it in `.review/<branch>/`:
-`diff.patch`, `map.json`, `profiles.json`, `task.json`, `impact.md`.
+`diff.patch`, `map.json`, `profiles.json`, `task.json`, `intent.md`; `agents/` holds each agent's
+system prompts and replies, and `prev/` the report (and fix ledgers) this one replaced.
 
 ```json
 {
@@ -14,19 +15,21 @@ of `*`, so it never reaches a commit. The pass's inputs sit beside it in `.revie
   "mergeBase": "71fae7c…",
   "head": "ff379e4…",
   "dirty": true,
+  "tree": "9c1e04b7d2…",
   "changedLines": 104,
+  "mode": "delta",
+  "tier": "full",
+  "delta": { "from": "72557a01ef…", "changedLines": 48 },
   "startedAt": "2026-10-14T19:40:02Z",
   "finishedAt": "2026-10-14T19:44:14Z",
-  "seconds": { "total": 252, "prepare": 6, "lead": 71, "reviewers": 118, "verify": 57 },
+  "seconds": { "total": 252, "reviewers": 118, "verify": 57, "fix": 0 },
+  "agents": 5,
+  "costUsd": 0.61,
   "map": { "provider": "grep", "error": null },
-  "risk": "moderate",
-  "assessment": "**Impact** — …",
   "profiles": [
-    { "name": "impact-assessment", "ran": true, "model": "opus", "reason": "always", "findings": 0 },
     { "name": "correctness", "ran": true, "model": "opus", "reason": "always", "findings": 3 },
-    { "name": "testing", "ran": true, "model": "sonnet", "reason": "inference: changes behavior", "findings": 2 },
-    { "name": "intent-alignment", "ran": false, "reason": "no task context" },
-    { "name": "focus: token parsing", "ran": true, "model": "opus", "reason": "lead focus area", "findings": 1 }
+    { "name": "testing", "ran": true, "model": "sonnet", "reason": "inferred", "findings": 2 },
+    { "name": "intent-alignment", "ran": false, "reason": "no task context" }
   ],
   "findings": [
     {
@@ -50,8 +53,19 @@ of `*`, so it never reaches a commit. The pass's inputs sit beside it in `.revie
 }
 ```
 
-- `pass`: `local` for `/review`, `pr` for `/review --pr <n>`.
+- `pass`: `local` for `lens review`, `pr` for `lens review --pr <n>`.
 - `dirty`: the working tree had uncommitted or untracked changes; they were reviewed too.
+- `tree`: the working tree the pass reviewed, as a git tree object (untracked files in). The
+  next pass compares against it (or against the last fix attempt's `after`).
+- `mode`: `full`, or `delta` when only what changed since the last report (`delta.from`) was
+  reviewed. A delta carries the last report's findings over: unfixed blockers, and majors in
+  files the delta touched, are verified again; other majors are kept as they were.
+- `incomplete`: the profiles whose reviewer gave no readable reply. The next pass doesn't trust
+  such a report and reviews the whole change.
+- `tier`: `skip` (only docs changed: no agents ran), `small` (at most `[review] small_lines`
+  changed lines: correctness only) or `full`.
+- `agents`, `costUsd`: how many agent sessions the pass ran and what they cost, as Claude Code
+  reports it.
 - `findings`: blocker and major only, every one confirmed by a verifier. `severity` is the
   verifier's, `line` the verifier's when it moved it. Ids are `F1`, `F2`, … in report order
   (blockers first).
@@ -59,7 +73,7 @@ of `*`, so it never reaches a commit. The pass's inputs sit beside it in `.revie
   Duplicates raised by several profiles are merged into one entry listing them all.
 - `map.error`: the provider's error when `lens map` failed; the pass ran without a map.
 - `profiles[].ran: false` with `reason`: a local-pass profile that didn't apply. Profiles left
-  to the PR pass aren't listed.
+  to the PR pass aren't listed. `failed` is set when the reviewer's reply had no readable JSON.
 - `findings[].fix`: set on a blocker once the fix loop takes it up:
   `{"status": "open" | "resolved" | "escalated", "attempts": 2, "ledger": "<path>"}`.
 
@@ -131,12 +145,14 @@ The fix loop keeps one ledger per blocker at `.review/<branch>/fix/<id>.json`, w
 
 ## The PR pass
 
-`/review --pr <n>` saves to `.review/pr-<n>.json`, with its inputs in `.review/pr-<n>/` (plus
+`lens review --pr <n>` saves to `.review/pr-<n>.json`, with its inputs in `.review/pr-<n>/` (plus
 `pr.json`, `intent.md`, `posted.json` and, when the checkout isn't at the PR's head, `tree/`).
 The format is the same, except:
 
 - `pass` is `pr`, and `pr` is `{ "number": 12, "url": "https://github.com/o/r/pull/12" }`.
-  `branch` is the PR's head branch, `head` its head commit, `base` `origin/<its base>`.
+  `branch` is the PR's head branch, `head` its head commit, `base` `origin/<its base>`. It has
+  `risk` and `assessment` from the `impact-assessment` lead, its focus-area reviewers are listed
+  in `profiles` as `focus: <title>`, and it has no `tree`, `mode` or `tier`.
 - `findings` holds every confirmed finding, `minor` and `nit` included; `dropped` only the
   unverified ones. Every profile lens picked is listed in `profiles`.
 

@@ -414,7 +414,7 @@ fn short(sha: &str) -> &str {
 
 /// The working tree as a tree object, untracked (not ignored) files included, without touching
 /// the repo's index.
-fn snapshot(root: &Path) -> Result<String> {
+pub fn snapshot(root: &Path) -> Result<String> {
     let index = PathBuf::from(git(root, &["rev-parse", "--git-path", "lens-fix-index"])?.trim());
     let index = if index.is_absolute() {
         index
