@@ -60,7 +60,7 @@ index=$tmp/index
 GIT_INDEX_FILE=$index git read-tree HEAD
 GIT_INDEX_FILE=$index git add -A .
 tree=$(GIT_INDEX_FILE=$index git write-tree)
-git diff --no-color --no-ext-diff --full-index --src-prefix=a/ --dst-prefix=b/ \
+git diff --no-color --no-ext-diff --no-textconv --full-index --src-prefix=a/ --dst-prefix=b/ \
   "$merge_base" "$tree" -- > "$work/diff.patch"
 lines=$(grep -c '^[+-]' "$work/diff.patch" || true)
 headers=$(grep -cE '^(\+\+\+|---) ' "$work/diff.patch" || true)
