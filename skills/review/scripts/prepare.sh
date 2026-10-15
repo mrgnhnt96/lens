@@ -6,7 +6,8 @@
 # <base> defaults to origin's default branch, then main, then master. Writes:
 #   profiles.json  `lens profiles --base <base>`
 #   map.json       `lens map --base <base>` (map.err instead when the provider fails)
-#   diff.patch     the change since the merge base: commits, staged, unstaged and untracked files
+#   diff.patch     the change since the merge base: commits, staged, unstaged and untracked files,
+#                  as a full-index diff that `git apply --cached` replays onto the merge base
 #   task.json      `tb peek`, when tb is installed and this terminal has a task
 #   started        the start time, in epoch seconds
 set -euo pipefail
@@ -49,12 +50,18 @@ else
 fi
 map_secs=$(( $(date +%s) - map_start ))
 
-{
-  git diff "$merge_base" --
-  git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do
-    git diff --no-index -- /dev/null "$f" || true
-  done
-} > "$work/diff.patch"
+# The working tree as a tree object (untracked files in, ignored ones out), so diff.patch is one
+# full-index diff from the merge base. `git apply --cached` of it onto the merge base rebuilds this
+# tree exactly, binary files included (their blobs are stored by `git add`): that's how tb checks
+# the review is still fresh. See docs/REVIEW.md.
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/lens-prepare.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+index=$tmp/index
+GIT_INDEX_FILE=$index git read-tree HEAD
+GIT_INDEX_FILE=$index git add -A .
+tree=$(GIT_INDEX_FILE=$index git write-tree)
+git diff --no-color --no-ext-diff --full-index --src-prefix=a/ --dst-prefix=b/ \
+  "$merge_base" "$tree" -- > "$work/diff.patch"
 lines=$(grep -c '^[+-]' "$work/diff.patch" || true)
 headers=$(grep -cE '^(\+\+\+|---) ' "$work/diff.patch" || true)
 changed=$(( ${lines:-0} - ${headers:-0} ))

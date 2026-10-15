@@ -63,6 +63,30 @@ of `*`, so it never reaches a commit. The pass's inputs sit beside it in `.revie
 - `findings[].fix`: set on a blocker once the fix loop takes it up:
   `{"status": "open" | "resolved" | "escalated", "attempts": 2, "ledger": "<path>"}`.
 
+## Freshness: what `tb submit` checks
+
+The task board takes a local report as current when the change it reviewed is the change the
+checkout holds now. It reads `.review/<branch>.json` (the branch `git symbolic-ref` gives, or
+`detached-<short sha>`) and compares two patch ids (`git patch-id --stable` of a `git diff
+--binary`):
+
+- **Reviewed**: from `mergeBase` to the reviewed tree. That tree is the last fix attempt's `after`
+  when a finding has a ledger; otherwise `head^{tree}` when `dirty` is false; otherwise the tree
+  `git apply --cached .review/<branch>/diff.patch` builds on top of `mergeBase`.
+- **Now**: from `git merge-base <base> HEAD` to the working tree as a tree object (untracked files
+  in, ignored ones out).
+
+Only `base`, `mergeBase`, `head`, `dirty`, `branch`, `findings[].fix.ledger` and `diff.patch` count.
+Timestamps, `changedLines` and file mtimes don't, so a commit or a clean rebase of the same change
+keeps the report fresh and any edit to the tree, untracked files included, makes it stale.
+
+So `diff.patch` has to replay exactly. `prepare.sh` writes it as one `git diff --full-index` from
+`mergeBase` to a snapshot of the working tree, made with `git add -A` into a throwaway index. Binary
+files show as `Binary files … differ`, which keeps the patch readable for reviewers, and still
+apply: the full index line names a blob `git add` already stored. A patch built from `git diff
+--no-index` per untracked file had short index lines, so any untracked binary (screenshots, media)
+made `git apply` fail and every review read as older than the change.
+
 ## The fix ledger
 
 The fix loop keeps one ledger per blocker at `.review/<branch>/fix/<id>.json`, written only by
