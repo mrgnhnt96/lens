@@ -1,7 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
@@ -50,7 +50,7 @@ enum Command {
         /// The repo to review. Defaults to the current directory.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
-        /// The default profiles. Defaults to $LENS_PROFILES_DIR, then the plugin's profiles/.
+        /// The default profiles. Defaults to $LENS_PROFILES_DIR, then the ones built into lens.
         #[arg(long)]
         defaults: Option<PathBuf>,
     },
@@ -80,7 +80,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum FixCommand {
-    /// Open the loop for one finding of a /review report and snapshot the working tree.
+    /// Open the loop for one finding of a `lens review` report and snapshot the working tree.
     Start {
         /// The report, `.review/<branch>.json`.
         #[arg(long)]
@@ -309,23 +309,10 @@ fn read_reply(path: &Path) -> Result<serde_json::Value> {
     fix::parse_reply(&text).with_context(|| format!("in {}", path.display()))
 }
 
-/// `$LENS_PROFILES_DIR`, then `$CLAUDE_PLUGIN_ROOT/profiles`, then a `profiles/` folder beside a
-/// `.claude-plugin/` in one of the binary's ancestors (a cargo build inside the plugin checkout).
+/// `$LENS_PROFILES_DIR`, else the profiles built into lens.
 fn default_profiles_dir() -> Result<PathBuf> {
     if let Some(dir) = env::var_os("LENS_PROFILES_DIR") {
         return Ok(dir.into());
     }
-    if let Some(root) = env::var_os("CLAUDE_PLUGIN_ROOT") {
-        let dir = PathBuf::from(root).join("profiles");
-        if dir.is_dir() {
-            return Ok(dir);
-        }
-    }
-    let exe = env::current_exe()?.canonicalize()?;
-    for dir in exe.ancestors().skip(1) {
-        if dir.join(".claude-plugin").is_dir() && dir.join("profiles").is_dir() {
-            return Ok(dir.join("profiles"));
-        }
-    }
-    bail!("can't find the default profiles; pass --defaults or set LENS_PROFILES_DIR")
+    Ok(lens::assets::root()?.join("profiles"))
 }

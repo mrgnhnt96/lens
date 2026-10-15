@@ -1,5 +1,5 @@
 //! The blocker fix loop's ledger: one file per finding that records every attempt (the fix's
-//! diff and the re-review) and decides what comes next. The `/review` skill drives the agents;
+//! diff and the re-review) and decides what comes next. `lens review` drives the agents;
 //! this module keeps the rules that must not depend on a model: the attempt cap, when an attempt
 //! counts as a fix, and when the loop has to stop and bring the human in.
 
@@ -118,7 +118,7 @@ pub enum EscalatedBy {
     Cap,
 }
 
-/// What the skill does next.
+/// What the fix loop does next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Next {

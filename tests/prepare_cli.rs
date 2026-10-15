@@ -63,7 +63,7 @@ fn diff_patch_replays_onto_the_merge_base_with_untracked_binaries() {
     write(d, "promo/frame.png", &[0, 0xff, 0, 0xfe, 0, 1]);
     write(d, "notes.txt", b"new\n");
 
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/review/scripts/prepare.sh");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/prepare.sh");
     let out = Command::new("bash")
         .arg(script)
         .arg("main")

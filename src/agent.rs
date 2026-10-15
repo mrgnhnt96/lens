@@ -337,9 +337,9 @@ pub fn claude_program() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("claude"))
 }
 
-/// A role's prompt file (`prompts/<role>.md`) without its frontmatter.
-pub fn role_prompt(plugin_root: &Path, role: &str) -> Result<String> {
-    let path = plugin_root.join("prompts").join(format!("{role}.md"));
+/// A role's prompt (`<assets>/prompts/<role>.md`) without its frontmatter.
+pub fn role_prompt(assets: &Path, role: &str) -> Result<String> {
+    let path = assets.join("prompts").join(format!("{role}.md"));
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     Ok(strip_frontmatter(&text).trim().to_string())

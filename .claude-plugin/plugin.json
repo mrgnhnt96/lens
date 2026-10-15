@@ -1,8 +1,0 @@
-{
-  "name": "lens",
-  "displayName": "lens",
-  "version": "0.1.0",
-  "description": "Agent code review: fresh-context reviewers look at a change in parallel and a verifier drops anything it can't show failing.",
-  "author": { "name": "Morgan Hunt" },
-  "keywords": ["code-review", "review", "agents"]
-}

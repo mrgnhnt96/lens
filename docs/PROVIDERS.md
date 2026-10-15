@@ -136,4 +136,4 @@ Anything that reads stdin and prints JSON works. A sketch for rust-analyzer or g
    test targets, graph tags).
 4. Print the object above.
 
-Keep it fast: `/review` calls `lens map` on every local pass, inside a 5-minute budget.
+Keep it fast: `lens review` calls `lens map` on every local pass, inside a 5-minute budget.

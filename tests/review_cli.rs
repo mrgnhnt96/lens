@@ -131,15 +131,14 @@ impl Fixture {
     }
 
     fn review_with(&self, base: &[&str], args: &[&str], env: &[(&str, &Path)]) -> String {
-        let plugin = Path::new(env!("CARGO_MANIFEST_DIR"));
         let out = Command::new(env!("CARGO_BIN_EXE_lens"))
             .arg("review")
             .args(base)
             .args(args)
             .envs(env.iter().copied())
             .current_dir(self.repo())
-            .env("LENS_PLUGIN_ROOT", plugin)
-            .env("LENS_PROFILES_DIR", plugin.join("profiles"))
+            // The files built into lens, written under this test's own cache.
+            .env("XDG_CACHE_HOME", self.dir.path().join("cache"))
             .env("LENS_CLAUDE", &self.fake)
             .env("FAKE_LOG", &self.log)
             // Keep tb out of it: no task context.

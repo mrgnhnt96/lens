@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Gather what a `/review --pr <n>` pass needs into .review/pr-<n>/ and print a summary as JSON.
+# Gather what a `lens review --pr <n>` pass needs into .review/pr-<n>/ and print a summary as JSON.
 #
 #   prepare-pr.sh <n>
 #
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd -P)
-lens=${LENS:-$here/../../../bin/lens}
+lens=${LENS:-lens}
 gh=${LENS_GH:-gh}
 
 pr=${1:-}
