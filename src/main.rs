@@ -32,6 +32,10 @@ enum Command {
         /// Review the whole change, even when only part of it changed since the last review.
         #[arg(long)]
         full: bool,
+        /// The per-PR floor: one Sonnet correctness reviewer, only when the change touches a
+        /// `[floor] risky` glob of .lens.toml; no fix loop.
+        #[arg(long, conflicts_with_all = ["pr", "full"])]
+        floor: bool,
         /// Run the PR pass on this PR: every profile, all severities, posted on the PR.
         #[arg(long, conflicts_with_all = ["base", "no_fix", "full"])]
         pr: Option<u64>,
@@ -235,6 +239,7 @@ fn main() -> Result<()> {
             intent,
             no_fix,
             full,
+            floor,
             pr,
             dry_run,
             repo,
@@ -246,6 +251,7 @@ fn main() -> Result<()> {
                 intent,
                 no_fix,
                 full,
+                floor,
                 pr,
                 dry_run,
             })?;

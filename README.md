@@ -37,7 +37,7 @@ docs/PROVIDERS.md            the change-map provider contract
 docs/REVIEW.md               the .review/<branch>.json and .review/pr-<n>.json format
 ```
 
-## `lens review [<base>] [--intent <file>] [--no-fix] [--full]`, `lens review --pr <n>`
+## `lens review [<base>] [--intent <file>] [--no-fix] [--full]`, `lens review --floor`, `lens review --pr <n>`
 
 Runs a pass and prints its summary; the report goes to `.review/<branch>.json` (format in
 [docs/REVIEW.md](docs/REVIEW.md)).
@@ -77,6 +77,21 @@ small_lines = 40                            # at most this many changed lines: c
 parallel = 4                                # agents running at once
 timeout_mins = 20                           # per agent
 fixer_permission_mode = "bypassPermissions" # the fixer edits and runs tests, headless
+```
+
+**The floor.** Deep review runs on the sweep, so each PR keeps only a cheap check:
+`lens review --floor` runs one Sonnet `correctness` reviewer, and only when the change touches a
+path matching a glob under `[floor] risky` in the repo's `.lens.toml`. Any other change runs
+nothing and prints so. Put the code where a miss costs most there: auth, migrations, money.
+Globs follow `globset`, where `*` also crosses `/`, and match repo-relative paths. Its findings
+are verified like any local pass's, but the floor raises only what this change caused, and it
+doesn't start the fix loop. The report records tier `floor`. A repo with no `[floor]` section
+never gets a floor review.
+
+```toml
+# .lens.toml
+[floor]
+risky = ["src/auth/**", "migrations/**", "**/billing/*.rs", "**/payment*"]
 ```
 
 `$LENS_CLAUDE` names the `claude` program to run (the tests use a fake).

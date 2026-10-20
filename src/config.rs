@@ -17,6 +17,8 @@ pub struct Config {
     #[serde(default)]
     pub review: ReviewConfig,
     #[serde(default)]
+    pub floor: FloorConfig,
+    #[serde(default)]
     pub sweep: SweepConfig,
 }
 
@@ -43,6 +45,16 @@ impl Default for SweepConfig {
             daily_budget_usd: None,
         }
     }
+}
+
+/// `[floor]`: what `lens review --floor` guards.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FloorConfig {
+    /// Globs (`globset`, where `*` also crosses `/`) for the paths worth a review on every PR:
+    /// auth, migrations, money code. A change touching none of them gets no floor review.
+    #[serde(default)]
+    pub risky: Vec<String>,
 }
 
 /// `[review]`: how `lens review` runs its agents.
@@ -198,6 +210,16 @@ mod tests {
         assert_eq!(c.sweep.daily_budget_usd, Some(5.0));
         assert_eq!(c.sweep.max_lines, 1500);
         assert!(toml::from_str::<Config>("[sweep]\nevry = \"2h\"\n").is_err());
+    }
+
+    #[test]
+    fn floor_risky_defaults_to_nothing() {
+        let c: Config = toml::from_str("").unwrap();
+        assert!(c.floor.risky.is_empty());
+        let c: Config =
+            toml::from_str("[floor]\nrisky = [\"**/auth/**\", \"migrations/*\"]\n").unwrap();
+        assert_eq!(c.floor.risky, ["**/auth/**", "migrations/*"]);
+        assert!(toml::from_str::<Config>("[floor]\nrisk = []\n").is_err());
     }
 
     #[test]
