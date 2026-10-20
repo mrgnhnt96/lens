@@ -379,6 +379,50 @@ fn a_docs_only_change_runs_no_agents() {
 }
 
 #[test]
+fn the_floor_reviews_risky_paths_with_one_sonnet_and_nothing_else() {
+    let fx = Fixture::new(60);
+    // No [floor] risky globs: nothing is risky.
+    let out = fx.review(&["--floor"]);
+    assert!(out.contains("no risky paths"), "{out}");
+    assert!(fx.calls().is_empty());
+    assert!(!fx.repo().join(".review/feature.json").exists());
+
+    write(
+        &fx.repo(),
+        ".lens.toml",
+        "[floor]\nrisky = [\"src/payments/**\"]\n",
+    );
+    fx.review(&["--floor"]);
+    assert!(fx.calls().is_empty(), "src/a.rs and src/b.rs aren't risky");
+
+    write(
+        &fx.repo(),
+        ".lens.toml",
+        "[floor]\nrisky = [\"src/a.rs\"]\n",
+    );
+    fx.review(&["--floor"]);
+    let calls = fx.calls();
+    let reviewers: Vec<&Value> = calls.iter().filter(|c| c["role"] == "reviewer").collect();
+    assert_eq!(reviewers.len(), 1);
+    let args = reviewers[0]["args"].as_array().unwrap();
+    let model = args.iter().position(|a| a == "--model").unwrap();
+    assert_eq!(args[model + 1], "sonnet");
+    assert!(reviewers[0]["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("name=\"correctness\""));
+    assert!(reviewers[0]["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("this change caused"));
+    // Findings are verified, but the floor never starts the fix loop.
+    assert!(calls.iter().all(|c| c["role"] != "fixer"));
+    let report = fx.report();
+    assert_eq!(report["tier"], "floor");
+    assert_eq!(report["profiles"][0]["reason"], "risky path: src/a.rs");
+}
+
+#[test]
 fn the_fix_loop_fixes_a_blocker_and_marks_it_resolved() {
     let fx = Fixture::new(60);
     let out = fx.review(&[]);

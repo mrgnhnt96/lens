@@ -47,12 +47,32 @@ pub struct Options {
     pub pr: Option<u64>,
     /// PR pass: build the review but don't post it.
     pub dry_run: bool,
+    /// The per-PR floor: one Sonnet correctness reviewer, only when the change touches a
+    /// `[floor] risky` path.
+    pub floor: bool,
 }
 
 /// What `lens review` did, for the caller to print.
 pub struct Done {
     pub summary: String,
     pub report: Option<PathBuf>,
+}
+
+/// The floor's scope note: a cheap per-PR check reports only what this change caused.
+const FLOOR_SCOPE: &str = "\nThis is the per-PR floor check on paths the repo marked risky. Raise a finding only when this change caused it: code the diff adds or alters, or code it newly breaks. Leave problems that were already there.\n";
+
+/// The changed files that match a `[floor] risky` glob.
+pub fn risky_files<'a>(globs: &[String], files: &'a [String]) -> Result<Vec<&'a str>> {
+    let mut set = globset::GlobSetBuilder::new();
+    for g in globs {
+        set.add(globset::Glob::new(g).with_context(|| format!("[floor] risky glob {g:?}"))?);
+    }
+    let set = set.build()?;
+    Ok(files
+        .iter()
+        .map(String::as_str)
+        .filter(|f| set.is_match(f))
+        .collect())
 }
 
 const LOCAL_PROFILES: &[&str] = &["correctness", "testing", "intent-alignment"];
@@ -785,11 +805,30 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
             report: None,
         });
     }
+    let mut floor_reason = None;
+    if pass.opts.floor {
+        let changed_files: Vec<String> = fs::read_to_string(pass.work.join("profiles.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|p| p["changedFiles"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|f| f.as_str().map(String::from))
+            .collect();
+        let risky = risky_files(&pass.cfg.floor.risky, &changed_files)?;
+        if risky.is_empty() {
+            return Ok(Done {
+                summary: "lens: floor: no risky paths changed, nothing to review.".into(),
+                report: None,
+            });
+        }
+        floor_reason = Some(format!("risky path: {}", risky.join(", ")));
+    }
     let now = fix::snapshot(&pass.root)?;
     let previous: Option<Value> = fs::read_to_string(&pass.report_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .filter(|r: &Value| r["pass"] == "local");
+        .filter(|r: &Value| r["pass"] == "local" && !pass.opts.floor);
     let mode = match previous {
         // A report some reviewers failed on doesn't count: the next pass reviews everything.
         Some(prev)
@@ -900,7 +939,15 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     };
     let tier = tier(&files, lines, pass.cfg.review.small_lines);
     let has_intent = pass.work.join("task.json").is_file() || pass.work.join("intent.md").is_file();
-    let plans = plan_local(&profiles, tier, has_intent);
+    let mut plans = plan_local(&profiles, tier, has_intent);
+    if let Some(reason) = &floor_reason {
+        plans.retain(|p| p.name == "correctness");
+        for p in &mut plans {
+            p.model = "sonnet".into();
+            p.reason = reason.clone();
+            p.run = true;
+        }
+    }
     if let Some(d) = &delta_info {
         pass.log(&format!(
             "reviewing the {} changed lines since the last review ({} tier)",
@@ -924,7 +971,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
             format!("reviewer-{}", plan.name),
             "reviewer",
             &system,
-            pass.reviewer_prompt(plan, "")?,
+            pass.reviewer_prompt(plan, if pass.opts.floor { FLOOR_SCOPE } else { "" })?,
             &plan.model,
             &plan.effort,
             Access::ReadOnly,
@@ -1011,7 +1058,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
         "tree": now,
         "changedLines": changed,
         "mode": if delta_info.is_some() { "delta" } else { "full" },
-        "tier": tier.name(),
+        "tier": if pass.opts.floor { "floor" } else { tier.name() },
         "startedAt": pass.started_at,
         "map": map_status(&pass.work),
         "profiles": profile_rows,
@@ -1026,7 +1073,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     }
     finish(pass, &mut report)?;
 
-    if !pass.opts.no_fix {
+    if !pass.opts.no_fix && !pass.opts.floor {
         fix_loop(pass, &report, None)?;
         report = serde_json::from_str(&fs::read_to_string(&pass.report_path)?)?;
         finish(pass, &mut report)?;
