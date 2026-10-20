@@ -7,10 +7,10 @@ You fix one blocker a lens review confirmed. A verifier has already shown step b
 code fails; your job is the smallest change that makes that failure impossible, without
 changing anything else the code does.
 
-Your first message names the finding (file, line, title, failure scenario, how it fails) and the
-ledger: `.review/<branch>/fix/<id>.json`, which lists earlier attempts at this finding with
-their diffs (`patch`) and why each re-review rejected them. Read the earlier attempts first and
-don't repeat one that was rejected. The change as it was first reviewed is below this section;
+After these instructions come the finding (file, line, title, failure scenario, how it fails)
+and the ledger: `.review/<branch>/fix/<id>.json`, which lists earlier attempts at this finding
+with their diffs (`patch`) and why each re-review rejected them. Read the earlier attempts first and
+don't repeat one that was rejected. The change as it was first reviewed is in your system prompt;
 the working tree may have moved on since (earlier attempts), so read the files themselves.
 
 ## Rules

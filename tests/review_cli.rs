@@ -33,20 +33,32 @@ fn write(dir: &Path, path: &str, text: &str) {
     fs::write(path, text).unwrap();
 }
 
-/// A fake `claude -p`: logs how it was started and answers by role (the system prompt file's
-/// name) and prompt. The correctness reviewer raises a blocker and a minor in src/a.rs and a
+/// A fake `claude -p`: logs how it was started and answers by role (named in its first message)
+/// and prompt. It plays the prompt cache too: the first request with a given model, tools and
+/// system prompt reports the system prompt's length as cache creation, later ones as cache read. The correctness reviewer raises a blocker and a minor in src/a.rs and a
 /// major in src/b.rs; the verifier confirms the major, and the blocker until the fixer has marked
 /// src/a.rs FIXED. The reviewer whose profile `$FAKE_FAIL` names replies with no JSON. The PR
 /// pass's lead names one focus area.
 const FAKE: &str = r#"#!/usr/bin/env python3
-import json, os, sys
+import hashlib, json, os, re, sys, time
 args = sys.argv[1:]
 prompt = sys.stdin.read()
 system = args[args.index("--system-prompt-file") + 1]
-role = os.path.basename(system).split(".")[0]
+role = re.match(r'<role name="(\w+)">', prompt).group(1)
+system_text = open(system).read()
+key = hashlib.sha1("|".join([args[args.index("--model") + 1], args[args.index("--tools") + 1],
+                             system_text]).encode()).hexdigest()
+cached = os.environ["FAKE_LOG"] + ".cache." + key
+if os.path.exists(cached):
+    usage = {"cache_creation_input_tokens": 0, "cache_read_input_tokens": len(system_text)}
+else:
+    # Long enough for an agent started alongside to miss the cache too.
+    time.sleep(0.3)
+    open(cached, "w").close()
+    usage = {"cache_creation_input_tokens": len(system_text), "cache_read_input_tokens": 0}
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps({"role": role, "args": args, "ttl": os.environ.get("CLAUDE_CODE_PROMPT_CACHE_TTL"),
-                          "prompt": prompt, "system": open(system).read()}) + "\n")
+                          "prompt": prompt, "system": system_text, "usage": usage}) + "\n")
 code = open("src/a.rs").read()
 fail = os.environ.get("FAKE_FAIL")
 if role == "reviewer" and fail and f'name="{fail}"' in prompt:
@@ -61,7 +73,7 @@ elif role == "reviewer":
              "failureScenario": "confusing", "confidence": 0.5},
         ]
         # A delta review looks only at the delta, which never touches src/b.rs.
-        if "(delta.patch)" not in open(system).read():
+        if "(delta.patch)" not in system_text:
             findings.append({"file": "src/b.rs", "line": 1, "severity": "major", "title": "leaks a handle",
                              "failureScenario": "b() never closes it", "confidence": 0.7})
     reply = {"summary": "checked", "findings": findings}
@@ -83,7 +95,7 @@ else:
     reply = {"decision": "escalate", "needs": "other", "reason": "stuck"}
 text = "I couldn't finish." if reply is None else "Done.\n```json\n" + json.dumps(reply) + "\n```\n"
 print(json.dumps({"type": "system", "subtype": "init"}))
-print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}))
+print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": text}], "usage": usage}}))
 print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": text,
                   "total_cost_usd": 0.01, "num_turns": 1}))
 "#;
@@ -224,11 +236,61 @@ fn a_full_review_verifies_blockers_and_drops_the_rest() {
         assert_eq!(args[at + 1], "", "no user or project settings");
         assert!(args.contains(&"--strict-mcp-config"));
         assert_eq!(c["ttl"], "5m");
-        // The diff is in the shared system prompt, not something each agent reads itself.
+        // The diff is in the shared system prompt, not something each agent reads itself; the
+        // role's instructions are in the first message.
         assert!(c["system"].as_str().unwrap().contains("+// line 59"));
+        assert_eq!(
+            c["system"], calls[0]["system"],
+            "one system prompt for every agent"
+        );
+        assert!(!c["system"].as_str().unwrap().contains("<role"));
     }
-    assert_eq!(report["agents"], 4);
+    assert_eq!(report["totals"]["agents"], 4);
     assert_eq!(report["costUsd"], 0.04);
+    assert_eq!(report["totals"]["costUsd"], 0.04);
+
+    // One agent per model and tool set writes the change to the cache; every other agent of that
+    // group reads it, the verifiers included, though their role differs from the reviewer's.
+    let agents = report["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 4);
+    let mut groups: Vec<(String, String)> = agents
+        .iter()
+        .map(|a| {
+            (
+                a["model"].as_str().unwrap().into(),
+                a["tools"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    groups.sort();
+    groups.dedup();
+    let change = calls[0]["system"].as_str().unwrap().len() as u64;
+    for (model, tools) in &groups {
+        let group: Vec<&Value> = agents
+            .iter()
+            .filter(|a| a["model"] == *model.as_str() && a["tools"] == *tools.as_str())
+            .collect();
+        let writes = group
+            .iter()
+            .filter(|a| a["cacheCreationInputTokens"] == change)
+            .count();
+        assert_eq!(writes, 1, "{model} {tools}: {group:?}");
+        for a in &group {
+            if a["cacheCreationInputTokens"] == 0 {
+                assert_eq!(a["cacheReadInputTokens"], change, "{a}");
+            }
+        }
+    }
+    let opus: Vec<&Value> = agents.iter().filter(|a| a["model"] == "opus").collect();
+    assert!(opus.len() >= 2, "{agents:?}");
+    assert_eq!(
+        report["totals"]["cacheCreationInputTokens"],
+        change * groups.len() as u64
+    );
+    assert_eq!(
+        report["totals"]["cacheReadInputTokens"],
+        change * (4 - groups.len() as u64)
+    );
 }
 
 #[test]

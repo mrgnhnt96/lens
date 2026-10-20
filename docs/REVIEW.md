@@ -3,8 +3,9 @@
 `lens review` saves each pass to `.review/<branch>.json` in the reviewed repo (a detached HEAD is
 `detached-<short sha>`). The fix loop and the PR pass read it. `.review/` holds a `.gitignore`
 of `*`, so it never reaches a commit. The pass's inputs sit beside it in `.review/<branch>/`:
-`diff.patch`, `map.json`, `profiles.json`, `task.json`, `intent.md`; `agents/` holds each agent's
-system prompts and replies, and `prev/` the report (and fix ledgers) this one replaced.
+`diff.patch`, `map.json`, `profiles.json`, `task.json`, `intent.md`; `agents/` holds the shared
+system prompt (`change-<hash>.system.md`) and each agent's reply, and `prev/` the report (and
+fix ledgers) this one replaced.
 
 ```json
 {
@@ -23,7 +24,16 @@ system prompts and replies, and `prev/` the report (and fix ledgers) this one re
   "startedAt": "2026-10-14T19:40:02Z",
   "finishedAt": "2026-10-14T19:44:14Z",
   "seconds": { "total": 252, "reviewers": 118, "verify": 57, "fix": 0 },
-  "agents": 5,
+  "agents": [
+    { "label": "reviewer-correctness", "model": "opus", "tools": "Read,Grep,Glob,Bash",
+      "costUsd": 0.21, "turns": 9, "seconds": 104,
+      "cacheCreationInputTokens": 18233, "cacheReadInputTokens": 0 },
+    { "label": "reviewer-testing", "model": "opus", "tools": "Read,Grep,Glob,Bash",
+      "costUsd": 0.12, "turns": 7, "seconds": 96,
+      "cacheCreationInputTokens": 214, "cacheReadInputTokens": 18019 }
+  ],
+  "totals": { "agents": 5, "costUsd": 0.61,
+              "cacheCreationInputTokens": 41022, "cacheReadInputTokens": 54107 },
   "costUsd": 0.61,
   "map": { "provider": "grep", "error": null },
   "profiles": [
@@ -64,8 +74,18 @@ system prompts and replies, and `prev/` the report (and fix ledgers) this one re
   such a report and reviews the whole change.
 - `tier`: `skip` (only docs changed: no agents ran), `small` (at most `[review] small_lines`
   changed lines: correctness only) or `full`.
-- `agents`, `costUsd`: how many agent sessions the pass ran and what they cost, as Claude Code
-  reports it.
+- `agents`: one row per agent session: its `label`, `model`, `tools`, `costUsd` and `turns` as
+  Claude Code reports them, `seconds`, and an `error` when it failed. `cacheCreationInputTokens`
+  and `cacheReadInputTokens` are the usage of its first request, which is where the change gets
+  cached: every agent of a pass shares one system prompt (a short preamble plus the diff, change
+  map, task and guideline files) and gets its role's instructions as its first message, so agents
+  with the same model and tools share one cached prefix. A pass starts one agent per (model,
+  tools) group first and holds the rest of the group until it answers; after that, the group's
+  first agent shows the change under creation and every other one under read, with only its role
+  prompt (a few hundred tokens) as creation. A large creation on a later agent means the cache
+  missed: the prompt changed between them, or more than 5 minutes passed.
+- `totals`: `agents` (how many sessions ran), `costUsd`, and the two cache fields summed over
+  `agents`. The top-level `costUsd` is the same total, kept for older readers.
 - `findings`: blocker and major only, every one confirmed by a verifier. `severity` is the
   verifier's, `line` the verifier's when it moved it. Ids are `F1`, `F2`, … in report order
   (blockers first).

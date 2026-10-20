@@ -1,13 +1,16 @@
 //! Runs review agents as headless `claude -p` sessions, each as lean as a review allows: no user or
 //! project settings (so no CLAUDE.md, memory, hooks, plugins or skills), no MCP servers, only the
-//! tools its role needs, and the 5-minute prompt cache. Agents of one role share a system prompt
-//! that holds the change itself, so the first agent's request caches it and the rest read it at a
-//! tenth of the price: a batch starts one agent and holds the others until its first response.
+//! tools its role needs, and the 5-minute prompt cache. Every agent of a pass shares one system
+//! prompt that holds the change itself; its role's instructions come in its first message. Agents
+//! with the same model and tools then send the same cached prefix, so the first one's request
+//! caches it and the rest read it at a tenth of the price: a batch starts one agent per (model,
+//! tools) group and holds the rest of that group until its first response.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,8 +33,9 @@ pub enum Access {
 pub struct Spec {
     /// A short name for logs and the saved reply, e.g. `reviewer-correctness`.
     pub label: String,
-    /// The system prompt file, shared by every agent of a role in a pass.
+    /// The system prompt file, shared by every agent of a pass.
     pub system: PathBuf,
+    /// The first message: the role's instructions and this agent's job.
     pub prompt: String,
     pub model: String,
     pub effort: Option<String>,
@@ -46,11 +50,18 @@ pub struct Spec {
 #[derive(Debug, Clone, Default)]
 pub struct Outcome {
     pub label: String,
+    pub model: String,
+    /// The tools it had, e.g. `Read,Grep,Glob,Bash`: with the model, its cache group.
+    pub tools: String,
     /// The agent's final reply.
     pub text: String,
     pub cost_usd: f64,
     pub turns: u64,
     pub seconds: u64,
+    /// The first request's `cache_creation_input_tokens` and `cache_read_input_tokens`: the
+    /// shared prefix shows under one or the other, by whether its group was warm.
+    pub cache_creation: u64,
+    pub cache_read: u64,
     /// Why the run failed (the process died, timed out or reported an error).
     pub error: Option<String>,
 }
@@ -64,7 +75,12 @@ pub struct Runner {
     pub fixer_permission_mode: String,
     /// Where each agent's reply is saved, as `<label>.md`.
     pub log_dir: PathBuf,
+    /// When each cache group last sent a request, so a later batch knows its prefix is cached.
+    pub cached: Arc<Mutex<HashMap<String, Instant>>>,
 }
+
+/// How long after a group's last request its prefix counts as cached: under the 5-minute TTL.
+const CACHED_FOR: Duration = Duration::from_secs(4 * 60);
 
 const READ_ONLY_BASH: &[&str] = &[
     "Bash(git log:*)",
@@ -78,9 +94,19 @@ const READ_ONLY_BASH: &[&str] = &[
 ];
 
 enum Event {
-    /// The agent's first response is back, so the shared system prompt is cached.
-    Warm,
+    /// The agent's first response is back, so its group's prefix is cached.
+    Warm(usize),
     Done(usize, Outcome),
+}
+
+impl Access {
+    fn tools(self) -> &'static str {
+        match self {
+            Access::ReadOnly => "Read,Grep,Glob,Bash",
+            Access::ReadFiles => "Read,Grep,Glob",
+            Access::Edit => "Read,Grep,Glob,Bash,Edit,Write",
+        }
+    }
 }
 
 impl Runner {
@@ -106,25 +132,20 @@ impl Runner {
                 args.extend(["--effort".into(), effort.clone()]);
             }
         }
-        let (tools, mode, allowed): (&str, &str, Vec<&str>) = match spec.access {
+        let (mode, allowed): (&str, Vec<&str>) = match spec.access {
             Access::ReadOnly => (
-                "Read,Grep,Glob,Bash",
                 "dontAsk",
                 ["Read", "Grep", "Glob"]
                     .into_iter()
                     .chain(READ_ONLY_BASH.iter().copied())
                     .collect(),
             ),
-            Access::ReadFiles => ("Read,Grep,Glob", "dontAsk", vec!["Read", "Grep", "Glob"]),
-            Access::Edit => (
-                "Read,Grep,Glob,Bash,Edit,Write",
-                self.fixer_permission_mode.as_str(),
-                vec![],
-            ),
+            Access::ReadFiles => ("dontAsk", vec!["Read", "Grep", "Glob"]),
+            Access::Edit => (self.fixer_permission_mode.as_str(), vec![]),
         };
         args.extend([
             "--tools".into(),
-            tools.into(),
+            spec.access.tools().into(),
             "--permission-mode".into(),
             mode.into(),
         ]);
@@ -144,61 +165,84 @@ impl Runner {
         loop {
             match rx.recv() {
                 Ok(Event::Done(_, outcome)) => return outcome,
-                Ok(Event::Warm) => continue,
+                Ok(Event::Warm(_)) => continue,
                 Err(_) => return Outcome::default(),
             }
         }
     }
 
-    /// Runs every agent, at most `parallel` at once, and returns their outcomes in order. The
-    /// first one runs alone until its first response, so the others find their shared system
-    /// prompt cached.
+    /// Runs every agent, at most `parallel` at once, and returns their outcomes in order. In a
+    /// group whose prefix isn't cached yet, the first agent runs alone until its first response,
+    /// so the rest of the group finds it cached.
     pub fn run_all(&self, specs: Vec<Spec>) -> Vec<Outcome> {
         let n = specs.len();
         let mut out: Vec<Option<Outcome>> = vec![None; n];
+        let groups: Vec<String> = specs.iter().map(group).collect();
+        let mut queue: Vec<Option<Spec>> = specs.into_iter().map(Some).collect();
+        // Groups whose first agent is running and hasn't had a response yet.
+        let mut warming: HashSet<String> = HashSet::new();
         let (tx, rx) = mpsc::channel();
-        let mut queue = specs.into_iter().enumerate();
         let mut running = 0;
-        if let Some((i, spec)) = queue.next() {
-            self.spawn(i, spec, tx.clone());
-            running += 1;
-        }
-        // Any event (the first response, or a finished agent) means the prompt is cached.
-        while running > 0 {
+        loop {
+            for i in 0..n {
+                if running >= self.parallel.max(1) {
+                    break;
+                }
+                if queue[i].is_none() || warming.contains(&groups[i]) {
+                    continue;
+                }
+                if !self.is_cached(&groups[i]) {
+                    warming.insert(groups[i].clone());
+                }
+                self.spawn(i, queue[i].take().unwrap(), tx.clone());
+                running += 1;
+            }
+            if running == 0 {
+                break;
+            }
+            // The first response, or the agent ending without one: either way the group goes on.
             match rx.recv() {
-                Ok(Event::Warm) => {}
+                Ok(Event::Warm(i)) => {
+                    warming.remove(&groups[i]);
+                }
                 Ok(Event::Done(i, outcome)) => {
+                    warming.remove(&groups[i]);
                     out[i] = Some(outcome);
                     running -= 1;
                 }
                 Err(_) => break,
             }
-            while running < self.parallel.max(1) {
-                let Some((i, spec)) = queue.next() else { break };
-                self.spawn(i, spec, tx.clone());
-                running += 1;
-            }
         }
         out.into_iter().map(Option::unwrap_or_default).collect()
+    }
+
+    fn is_cached(&self, group: &str) -> bool {
+        self.cached
+            .lock()
+            .unwrap()
+            .get(group)
+            .is_some_and(|t| t.elapsed() < CACHED_FOR)
     }
 
     fn spawn(&self, i: usize, spec: Spec, tx: mpsc::Sender<Event>) {
         let runner = self.clone();
         thread::spawn(move || {
-            let label = spec.label.clone();
             let started = Instant::now();
-            let mut outcome = runner.exec(&spec, &tx).unwrap_or_else(|e| Outcome {
+            let mut outcome = runner.exec(i, &spec, &tx).unwrap_or_else(|e| Outcome {
                 error: Some(format!("{e:#}")),
                 ..Outcome::default()
             });
-            outcome.label = label;
+            outcome.label = spec.label.clone();
+            outcome.model = spec.model.clone();
+            outcome.tools = spec.access.tools().to_string();
             outcome.seconds = started.elapsed().as_secs();
             runner.save(&outcome);
             let _ = tx.send(Event::Done(i, outcome));
         });
     }
 
-    fn exec(&self, spec: &Spec, tx: &mpsc::Sender<Event>) -> Result<Outcome> {
+    fn exec(&self, i: usize, spec: &Spec, tx: &mpsc::Sender<Event>) -> Result<Outcome> {
+        let group = group(spec);
         let mut child = Command::new(&self.claude)
             .args(self.args(spec))
             .current_dir(&spec.cwd)
@@ -229,7 +273,7 @@ impl Runner {
             text
         });
         let deadline = Instant::now() + self.timeout;
-        let mut warmed = false;
+        let mut first_usage: Option<(u64, u64)> = None;
         let mut result: Option<Value> = None;
         let mut last_text = String::new();
         loop {
@@ -241,9 +285,18 @@ impl Runner {
                     };
                     match event["type"].as_str() {
                         Some("assistant") => {
-                            if !warmed {
-                                warmed = true;
-                                let _ = tx.send(Event::Warm);
+                            // Every request reads the prefix again, which keeps it cached.
+                            self.cached
+                                .lock()
+                                .unwrap()
+                                .insert(group.clone(), Instant::now());
+                            if first_usage.is_none() {
+                                let usage = &event["message"]["usage"];
+                                first_usage = Some((
+                                    usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+                                    usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
+                                ));
+                                let _ = tx.send(Event::Warm(i));
                             }
                             if let Some(text) = assistant_text(&event) {
                                 last_text = text;
@@ -260,7 +313,7 @@ impl Runner {
                     return Ok(Outcome {
                         text: last_text,
                         error: Some(format!("timed out after {}s", self.timeout.as_secs())),
-                        ..Outcome::default()
+                        ..usage_outcome(first_usage)
                     });
                 }
             }
@@ -274,7 +327,7 @@ impl Runner {
                     "claude exited ({status}) without a result: {}",
                     tail(&stderr)
                 )),
-                ..Outcome::default()
+                ..usage_outcome(first_usage)
             });
         };
         let text = result["result"]
@@ -288,18 +341,20 @@ impl Runner {
             cost_usd: result["total_cost_usd"].as_f64().unwrap_or(0.0),
             turns: result["num_turns"].as_u64().unwrap_or(0),
             error,
-            ..Outcome::default()
+            ..usage_outcome(first_usage)
         })
     }
 
     fn save(&self, outcome: &Outcome) {
         let _ = std::fs::create_dir_all(&self.log_dir);
         let mut text = format!(
-            "<!-- {} · ${:.4} · {} turns · {}s{} -->\n\n",
+            "<!-- {} · ${:.4} · {} turns · {}s · first turn: {} cache write, {} cache read{} -->\n\n",
             outcome.label,
             outcome.cost_usd,
             outcome.turns,
             outcome.seconds,
+            outcome.cache_creation,
+            outcome.cache_read,
             outcome
                 .error
                 .as_ref()
@@ -308,6 +363,26 @@ impl Runner {
         );
         text.push_str(&outcome.text);
         let _ = std::fs::write(self.log_dir.join(format!("{}.md", outcome.label)), text);
+    }
+}
+
+/// The agents whose requests start with the same cached prefix: same model, tools and system
+/// prompt.
+fn group(spec: &Spec) -> String {
+    format!(
+        "{}|{}|{}",
+        spec.model,
+        spec.access.tools(),
+        spec.system.display()
+    )
+}
+
+fn usage_outcome(first: Option<(u64, u64)>) -> Outcome {
+    let (cache_creation, cache_read) = first.unwrap_or_default();
+    Outcome {
+        cache_creation,
+        cache_read,
+        ..Outcome::default()
     }
 }
 
@@ -362,6 +437,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             fixer_permission_mode: "bypassPermissions".into(),
             log_dir: "/tmp".into(),
+            cached: Default::default(),
         }
     }
 
@@ -416,5 +492,95 @@ mod tests {
     fn strips_frontmatter() {
         assert_eq!(strip_frontmatter("---\na: 1\n---\nbody"), "\nbody");
         assert_eq!(strip_frontmatter("body"), "body");
+    }
+
+    /// Runs `specs` (labelled by their prompt) through a fake claude that logs when each agent
+    /// starts and when it answers, and returns that log.
+    fn batch(cached: &[(&Spec, Instant)], specs: Vec<Spec>) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let claude = dir.path().join("claude");
+        std::fs::write(
+            &claude,
+            format!(
+                r#"#!/bin/sh
+label=$(cat)
+echo "start $label" >> {log}
+sleep 0.4
+echo "first $label" >> {log}
+echo '{{"type":"assistant","message":{{"content":[]}}}}'
+sleep 0.2
+echo '{{"type":"result","result":"ok"}}'
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runner = Runner {
+            claude,
+            log_dir: dir.path().into(),
+            ..runner()
+        };
+        for (spec, at) in cached {
+            runner.cached.lock().unwrap().insert(group(spec), *at);
+        }
+        let specs = specs
+            .into_iter()
+            .map(|s| Spec {
+                cwd: dir.path().into(),
+                ..s
+            })
+            .collect();
+        for outcome in runner.run_all(specs) {
+            assert_eq!(outcome.error, None);
+        }
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn labelled(label: &str, model: &str) -> Spec {
+        Spec {
+            prompt: label.into(),
+            ..spec(Access::ReadOnly, model)
+        }
+    }
+
+    fn at(log: &[String], line: &str) -> usize {
+        log.iter()
+            .position(|l| l == line)
+            .unwrap_or_else(|| panic!("no {line:?} in {log:?}"))
+    }
+
+    #[test]
+    fn a_cold_group_starts_one_agent_and_holds_the_rest_until_it_answers() {
+        let log = batch(
+            &[],
+            vec![
+                labelled("a1", "opus"),
+                labelled("a2", "opus"),
+                labelled("b", "sonnet"),
+            ],
+        );
+        assert!(at(&log, "start a2") > at(&log, "first a1"), "{log:?}");
+        // Another group doesn't wait for it.
+        assert!(at(&log, "start b") < at(&log, "first a1"), "{log:?}");
+    }
+
+    #[test]
+    fn a_cached_group_starts_together_and_an_expired_one_is_held_again() {
+        let (a1, a2) = (labelled("a1", "opus"), labelled("a2", "opus"));
+        let log = batch(&[(&a1, Instant::now())], vec![a1.clone(), a2.clone()]);
+        assert!(at(&log, "start a2") < at(&log, "first a1"), "{log:?}");
+
+        let Some(expired) = Instant::now().checked_sub(CACHED_FOR + Duration::from_secs(1)) else {
+            return;
+        };
+        let log = batch(&[(&a1, expired)], vec![a1.clone(), a2]);
+        assert!(at(&log, "start a2") > at(&log, "first a1"), "{log:?}");
     }
 }

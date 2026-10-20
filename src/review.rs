@@ -11,9 +11,14 @@
 //! - **Deltas.** When the last report reviewed this branch from the same merge base, only what
 //!   changed since then is reviewed, and blockers it left unfixed are verified again.
 //! - **Fresh reports** aren't redone: an unchanged tree only resumes the fix loop.
+//!
+//! Every agent of a pass gets the same system prompt (a short preamble and the change), and its
+//! role's instructions in its first message, so agents with the same model and tools share one
+//! cached copy of the change.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -52,6 +57,7 @@ pub struct Done {
 
 const LOCAL_PROFILES: &[&str] = &["correctness", "testing", "intent-alignment"];
 const LEAD: &str = "impact-assessment";
+const ROLES: &[&str] = &["reviewer", "verifier", "fixer", "escalator"];
 /// Above this many bytes the diff isn't put in the prompt; agents read the file instead.
 const INLINE_DIFF_MAX: usize = 150_000;
 const INLINE_MAP_MAX: usize = 60_000;
@@ -348,10 +354,13 @@ struct Pass {
     prepared: Value,
     cfg: Config,
     runner: Runner,
+    /// Each role's instructions (`prompts/<role>.md`), sent as an agent's first message.
+    roles: HashMap<&'static str, String>,
     started: Instant,
     started_at: String,
     cost: f64,
-    agents: u32,
+    /// One row per agent run, for the report's `agents`.
+    agents: Vec<Value>,
     seconds: serde_json::Map<String, Value>,
 }
 
@@ -368,7 +377,20 @@ impl Pass {
     fn tally(&mut self, outcomes: &[Outcome]) {
         for o in outcomes {
             self.cost += o.cost_usd;
-            self.agents += 1;
+            let mut row = json!({
+                "label": o.label,
+                "model": o.model,
+                "tools": o.tools,
+                "costUsd": o.cost_usd,
+                "turns": o.turns,
+                "seconds": o.seconds,
+                "cacheCreationInputTokens": o.cache_creation,
+                "cacheReadInputTokens": o.cache_read,
+            });
+            if let Some(e) = &o.error {
+                row["error"] = json!(e);
+            }
+            self.agents.push(row);
         }
     }
 
@@ -380,8 +402,8 @@ impl Pass {
         self.prepared["mergeBase"].as_str().unwrap_or("")
     }
 
-    /// The shared part of every agent's system prompt: the change, its map, the task and the
-    /// repo's guidelines. It is the same for every agent of the pass, so it caches.
+    /// The change as every agent of the pass sees it: the diff, its map, the task and the repo's
+    /// guidelines.
     fn context(&self, delta: Option<&str>) -> Result<String> {
         let mut s = format!(
             "# The change under review\n\nRepo: {} (your working directory). Base: {}, merge base {}.\nWork folder: {}\n",
@@ -459,17 +481,32 @@ impl Pass {
         Ok(out)
     }
 
-    fn system_prompt(&self, role: &str, context: &str) -> Result<PathBuf> {
-        let path = self.work.join("agents").join(format!("{role}.system.md"));
+    /// Writes the system prompt every agent of the pass shares: the preamble and `context`. The
+    /// file is named after its text, so a different change gets a different file (and cache
+    /// group).
+    fn system_prompt(&self, context: &str) -> Result<PathBuf> {
+        let text = format!(
+            "{}\n\n{}",
+            agent::role_prompt(&self.assets, "preamble")?,
+            context
+        );
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        let path = self
+            .work
+            .join("agents")
+            .join(format!("change-{:08x}.system.md", hasher.finish() as u32));
         fs::create_dir_all(path.parent().unwrap())?;
-        let text = format!("{}\n\n{}", agent::role_prompt(&self.assets, role)?, context);
         fs::write(&path, text)?;
         Ok(path)
     }
 
+    /// An agent of `role`: its first message is the role's instructions, then `prompt`.
+    #[allow(clippy::too_many_arguments)]
     fn spec(
         &self,
         label: String,
+        role: &str,
         system: &Path,
         prompt: String,
         model: &str,
@@ -479,7 +516,10 @@ impl Pass {
         Spec {
             label,
             system: system.to_path_buf(),
-            prompt,
+            prompt: format!(
+                "<role name=\"{role}\">\n{}\n</role>\n\n{prompt}",
+                self.roles[role]
+            ),
             model: model.to_string(),
             effort: Some(effort.to_string()),
             access,
@@ -518,6 +558,7 @@ impl Pass {
             .map(|(i, f)| {
                 self.spec(
                     format!("verifier-{}", i + 1),
+                    "verifier",
                     system,
                     f.for_verifier(),
                     "opus",
@@ -599,7 +640,12 @@ pub fn run(opts: Options) -> Result<Done> {
         timeout: Duration::from_secs(cfg.review.timeout_mins.max(1) * 60),
         fixer_permission_mode: cfg.review.fixer_permission_mode.clone(),
         log_dir: work.join("agents"),
+        cached: Default::default(),
     };
+    let mut roles = HashMap::new();
+    for role in ROLES {
+        roles.insert(*role, agent::role_prompt(&assets, role)?);
+    }
     let mut pass = Pass {
         opts,
         assets,
@@ -610,10 +656,11 @@ pub fn run(opts: Options) -> Result<Done> {
         prepared,
         cfg,
         runner,
+        roles,
         started: Instant::now(),
         started_at: iso_now(),
         cost: 0.0,
-        agents: 0,
+        agents: Vec::new(),
         seconds: serde_json::Map::new(),
     };
     if let Some(intent) = &pass.opts.intent {
@@ -854,15 +901,15 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     }
 
     let context = pass.context(delta_patch.as_deref())?;
-    let reviewer_sys = pass.system_prompt("reviewer", &context)?;
-    let verifier_sys = pass.system_prompt("verifier", &context)?;
+    let system = pass.system_prompt(&context)?;
 
     let running: Vec<&Plan> = plans.iter().filter(|p| p.run).collect();
     let mut specs = Vec::new();
     for plan in &running {
         specs.push(pass.spec(
             format!("reviewer-{}", plan.name),
-            &reviewer_sys,
+            "reviewer",
+            &system,
             pass.reviewer_prompt(plan, "")?,
             &plan.model,
             &plan.effort,
@@ -935,7 +982,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
         }
         (keep, drop)
     };
-    let (mut confirmed, unverified) = pass.verify(&verifier_sys, &to_verify, |s| rank(s) <= 1);
+    let (mut confirmed, unverified) = pass.verify(&system, &to_verify, |s| rank(s) <= 1);
     dropped.extend(unverified);
     confirmed.extend(kept);
 
@@ -1016,8 +1063,16 @@ fn finish(pass: &mut Pass, report: &mut Value) -> Result<()> {
     seconds.insert("total".into(), json!(pass.started.elapsed().as_secs()));
     report["finishedAt"] = json!(iso_now());
     report["seconds"] = Value::Object(seconds);
+    let cost = (pass.cost * 10000.0).round() / 10000.0;
+    let sum = |key: &str| -> u64 { pass.agents.iter().filter_map(|a| a[key].as_u64()).sum() };
+    report["totals"] = json!({
+        "agents": pass.agents.len(),
+        "costUsd": cost,
+        "cacheCreationInputTokens": sum("cacheCreationInputTokens"),
+        "cacheReadInputTokens": sum("cacheReadInputTokens"),
+    });
     report["agents"] = json!(pass.agents);
-    report["costUsd"] = json!((pass.cost * 10000.0).round() / 10000.0);
+    report["costUsd"] = json!(cost);
     fs::write(
         &pass.report_path,
         serde_json::to_string_pretty(report)? + "\n",
@@ -1041,15 +1096,7 @@ fn fix_loop(pass: &mut Pass, report: &Value) -> Result<()> {
         return Ok(());
     }
     let t = Instant::now();
-    let context = pass.context(None)?;
-    let reviewer_sys = pass.system_prompt("reviewer", &context)?;
-    let verifier_sys = pass.system_prompt("verifier", &context)?;
-    let fixer_sys = pass.system_prompt("fixer", &context)?;
-    let escalator_sys = pass.work.join("agents").join("escalator.system.md");
-    fs::write(
-        &escalator_sys,
-        agent::role_prompt(&pass.assets, "escalator")?,
-    )?;
+    let system = pass.system_prompt(&pass.context(None)?)?;
     let profiles: Value =
         serde_json::from_str(&fs::read_to_string(pass.work.join("profiles.json"))?)?;
     let guidelines = pass.guidelines()?;
@@ -1090,7 +1137,8 @@ fn fix_loop(pass: &mut Pass, report: &Value) -> Result<()> {
                     );
                     let spec = pass.spec(
                         format!("fixer-{id}-{n}"),
-                        &fixer_sys,
+                        "fixer",
+                        &system,
                         prompt,
                         "opus",
                         "high",
@@ -1107,15 +1155,7 @@ fn fix_loop(pass: &mut Pass, report: &Value) -> Result<()> {
                     }
                     let patch = pass.work.join("fix").join(format!("{id}-pending.patch"));
                     fs::write(&patch, &pending)?;
-                    let review = rereview(
-                        pass,
-                        &reviewer_sys,
-                        &verifier_sys,
-                        &profiles,
-                        &finding,
-                        &id,
-                        &patch,
-                    )?;
+                    let review = rereview(pass, &system, &profiles, &finding, &id, &patch)?;
                     step = fix::record(&step.ledger, Some(fixer), Some(review))?;
                 }
                 fix::Next::Judge => {
@@ -1124,7 +1164,8 @@ fn fix_loop(pass: &mut Pass, report: &Value) -> Result<()> {
                     for attempt in 1..=2 {
                         let spec = pass.spec(
                             format!("escalator-{id}-{}-{attempt}", step.attempts),
-                            &escalator_sys,
+                            "escalator",
+                            &system,
                             prompt.clone(),
                             "haiku",
                             "",
@@ -1161,8 +1202,7 @@ fn fix_loop(pass: &mut Pass, report: &Value) -> Result<()> {
 /// that raised it looking only for what the fix breaks; their blockers and majors are verified.
 fn rereview(
     pass: &mut Pass,
-    reviewer_sys: &Path,
-    verifier_sys: &Path,
+    system: &Path,
     profiles: &Value,
     finding: &Finding,
     id: &str,
@@ -1176,7 +1216,8 @@ fn rereview(
     );
     let mut specs = vec![pass.spec(
         format!("fix-{id}-verifier"),
-        verifier_sys,
+        "verifier",
+        system,
         finding.for_verifier(),
         "opus",
         "high",
@@ -1188,7 +1229,8 @@ fn rereview(
             let plan = Plan::from_picked(p, true, String::new());
             specs.push(pass.spec(
                 format!("fix-{id}-reviewer-{name}"),
-                reviewer_sys,
+                "reviewer",
+                system,
                 pass.reviewer_prompt(&plan, &extra)?,
                 &plan.model,
                 &plan.effort,
@@ -1215,7 +1257,7 @@ fn rereview(
             );
         }
     }
-    let (confirmed, _) = pass.verify(verifier_sys, &merge(new), |s| rank(s) <= 1);
+    let (confirmed, _) = pass.verify(system, &merge(new), |s| rank(s) <= 1);
     Ok(fix::Review {
         original,
         new_findings: confirmed.into_iter().map(|(_, v)| v).collect(),
@@ -1247,9 +1289,7 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         pass.tree_dir.display(),
         pass.work.join("posted.json").display()
     );
-    let context = pass.context(None)?;
-    let reviewer_sys = pass.system_prompt("reviewer", &context)?;
-    let verifier_sys = pass.system_prompt("verifier", &context)?;
+    let system = pass.system_prompt(&pass.context(None)?)?;
 
     // The lead first: its assessment goes in the review body and its focus areas get reviewers.
     let mut raised = Vec::new();
@@ -1265,7 +1305,8 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         let prompt = pass.reviewer_prompt(lead, &format!("{extra}\nYou are the lead reviewer. Return the assessment, risk and focusAreas as well as findings.\n"))?;
         let o = pass.runner.run(pass.spec(
             format!("reviewer-{LEAD}"),
-            &reviewer_sys,
+            "reviewer",
+            &system,
             prompt,
             &lead.model,
             &lead.effort,
@@ -1343,7 +1384,8 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
     for (i, (name, plan, extra)) in runs.iter().enumerate() {
         specs.push(pass.spec(
             format!("reviewer-{}-{}", i + 1, slug(name)),
-            &reviewer_sys,
+            "reviewer",
+            &system,
             pass.reviewer_prompt(plan, extra)?,
             &plan.model,
             &plan.effort,
@@ -1381,7 +1423,7 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         rows.push(row);
     }
 
-    let (confirmed, dropped) = pass.verify(&verifier_sys, &merge(raised), |_| true);
+    let (confirmed, dropped) = pass.verify(&system, &merge(raised), |_| true);
     let pr_info: Value = serde_json::from_str(&fs::read_to_string(pass.work.join("pr.json"))?)
         .unwrap_or(Value::Null);
     let mut report = json!({
@@ -1514,7 +1556,10 @@ pub fn summarize(report: &Value, path: &Path, fresh: bool) -> String {
         }
         head.push_str(&format!(
             " · {} agents, ${:.2}",
-            report["agents"].as_u64().unwrap_or(0),
+            report["totals"]["agents"]
+                .as_u64()
+                .or(report["agents"].as_u64())
+                .unwrap_or(0),
             report["costUsd"].as_f64().unwrap_or(0.0)
         ));
     }
