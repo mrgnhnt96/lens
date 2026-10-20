@@ -83,19 +83,28 @@ pub fn entry(repo: &str, report: &Value) -> Option<Entry> {
     let started = report["startedAt"]
         .as_str()
         .or_else(|| report["finishedAt"].as_str())?;
-    let cache = |flat: &str, nested: &str| {
-        report[flat]
+    // `lens review` writes `totals`; the other spellings are older or hand-made reports.
+    let cache = |total: &str, flat: &str, nested: &str| {
+        report["totals"][total]
             .as_u64()
+            .or_else(|| report[flat].as_u64())
             .or_else(|| report["cache"][nested].as_u64())
     };
     Some(Entry {
         repo: repo.to_string(),
         day: started.get(..10)?.to_string(),
         cost,
-        agents: report["agents"].as_u64().unwrap_or(0),
+        agents: report["totals"]["agents"]
+            .as_u64()
+            .or_else(|| report["agents"].as_u64())
+            .unwrap_or(0),
         findings: report["findings"].as_array().map_or(0, |f| f.len() as u64),
-        cache_creation: cache("cacheCreationTokens", "creation"),
-        cache_read: cache("cacheReadTokens", "read"),
+        cache_creation: cache(
+            "cacheCreationInputTokens",
+            "cacheCreationTokens",
+            "creation",
+        ),
+        cache_read: cache("cacheReadInputTokens", "cacheReadTokens", "read"),
     })
 }
 
@@ -288,6 +297,20 @@ mod tests {
         assert_eq!((e.cache_creation, e.cache_read), (Some(10), Some(5)));
         let text = render(Path::new("/r"), None, &[e]);
         assert!(text.contains("cache read"));
+    }
+
+    #[test]
+    fn reads_the_totals_lens_review_writes() {
+        let e = entry(
+            "a",
+            &json!({"costUsd": 1.0, "startedAt": "2026-10-19T10:00:00Z",
+                    "agents": [{"label": "reviewer-correctness"}],
+                    "totals": {"agents": 4, "costUsd": 1.0,
+                               "cacheCreationInputTokens": 30, "cacheReadInputTokens": 20}}),
+        )
+        .unwrap();
+        assert_eq!(e.agents, 4);
+        assert_eq!((e.cache_creation, e.cache_read), (Some(30), Some(20)));
     }
 
     #[test]
