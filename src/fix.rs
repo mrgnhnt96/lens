@@ -223,13 +223,17 @@ pub fn start(report: &Path, id: &str, cap: u32) -> Result<Step> {
             return Ok(ledger.step(&path));
         }
     }
-    let root = PathBuf::from(
-        git(
-            report.parent().unwrap_or(Path::new(".")),
-            &["rev-parse", "--show-toplevel"],
-        )?
-        .trim(),
-    );
+    // A sweep fixes in its own worktree; other reports fix the repo they sit in.
+    let root = match doc.get("worktree").and_then(Value::as_str) {
+        Some(tree) => PathBuf::from(tree),
+        None => PathBuf::from(
+            git(
+                report.parent().unwrap_or(Path::new(".")),
+                &["rev-parse", "--show-toplevel"],
+            )?
+            .trim(),
+        ),
+    };
     fs::create_dir_all(path.parent().unwrap())?;
     let ledger = Ledger {
         version: 1,
