@@ -109,6 +109,14 @@ provider = ["tools/lens-map", "--fast"]
 
 The contract and the output format are in [docs/PROVIDERS.md](docs/PROVIDERS.md).
 
+## `lens cost [--since 1d|<date>] [--root <dir>]`
+
+What reviews spent. lens's `claude -p` agents never show in session transcripts, so this adds up
+the reports under `<root>/**/.review/` (default `~/Development`): `costUsd`, agents and findings
+per repo and per day, plus cache creation/read tokens when the reports carry them. `--since`
+takes a span (`1d`) or a date (`2026-10-19`). Archived earlier passes (`prev/`) are left out
+unless you pass `--with-prev`.
+
 ## `lens fix`
 
 The blocker fix loop's ledger. `lens review` runs a fixer agent on each blocker, re-reviews the

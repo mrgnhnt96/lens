@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod assets;
 pub mod config;
+pub mod cost;
 pub mod diff;
 pub mod fix;
 pub mod lang;

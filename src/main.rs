@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use lens::{config, diff, fix, map, pr, profile, review, select};
+use lens::{config, cost, diff, fix, map, pr, profile, review, select};
 
 /// Agent code review for Claude Code.
 #[derive(Parser)]
@@ -70,6 +70,19 @@ enum Command {
     Fix {
         #[command(subcommand)]
         command: FixCommand,
+    },
+    /// What reviews spent: totals of cost, agents and findings per repo and per day, from the
+    /// `.review/**/*.json` reports under <root> (cache tokens too, when reports carry them).
+    Cost {
+        /// Only reports started since a span like 1d, or a date like 2026-10-19.
+        #[arg(long)]
+        since: Option<String>,
+        /// Where to look for repos. Defaults to ~/Development.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Count the `prev/` archives of earlier passes too.
+        #[arg(long)]
+        with_prev: bool,
     },
     /// The PR pass's GitHub side, through `gh` (posting as .lens.toml's `[pr] post_as`).
     Pr {
@@ -219,6 +232,18 @@ fn main() -> Result<()> {
                 dry_run,
             })?;
             println!("{}", done.summary);
+        }
+        Command::Cost {
+            since,
+            root,
+            with_prev,
+        } => {
+            let root = match root {
+                Some(r) => r,
+                None => PathBuf::from(env::var_os("HOME").context("HOME is not set")?)
+                    .join("Development"),
+            };
+            println!("{}", cost::run(&root, since.as_deref(), with_prev)?);
         }
         Command::Fix { command } => run_fix(command)?,
         Command::Pr { command } => run_pr(command)?,
