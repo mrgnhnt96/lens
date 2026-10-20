@@ -56,7 +56,7 @@ pub struct Done {
 }
 
 const LOCAL_PROFILES: &[&str] = &["correctness", "testing", "intent-alignment"];
-const LEAD: &str = "impact-assessment";
+pub(crate) const LEAD: &str = "impact-assessment";
 const ROLES: &[&str] = &["reviewer", "verifier", "fixer", "escalator"];
 /// Above this many bytes the diff isn't put in the prompt; agents read the file instead.
 const INLINE_DIFF_MAX: usize = 150_000;
@@ -65,20 +65,20 @@ const INLINE_GUIDELINE_MAX: usize = 20_000;
 
 /// A finding as a reviewer raised it, after merging duplicates.
 #[derive(Debug, Clone)]
-struct Finding {
-    profiles: Vec<String>,
-    file: String,
-    line: u64,
-    severity: String,
-    title: String,
-    failure_scenario: String,
-    confidence: f64,
+pub(crate) struct Finding {
+    pub(crate) profiles: Vec<String>,
+    pub(crate) file: String,
+    pub(crate) line: u64,
+    pub(crate) severity: String,
+    pub(crate) title: String,
+    pub(crate) failure_scenario: String,
+    pub(crate) confidence: f64,
     /// A blocker the last report left unfixed, verified again in a delta review.
-    carried: bool,
+    pub(crate) carried: bool,
 }
 
 impl Finding {
-    fn from_reply(profile: &str, v: &Value) -> Option<Finding> {
+    pub(crate) fn from_reply(profile: &str, v: &Value) -> Option<Finding> {
         Some(Finding {
             profiles: vec![profile.to_string()],
             file: v["file"].as_str()?.to_string(),
@@ -91,7 +91,7 @@ impl Finding {
         })
     }
 
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         json!({
             "profiles": self.profiles,
             "file": self.file,
@@ -132,7 +132,7 @@ pub fn rank(severity: &str) -> u8 {
 
 /// Merges findings several reviewers raised: same file, lines within 3 and the same line or a
 /// title in common. Keeps the highest severity and confidence and every profile that raised it.
-fn merge(findings: Vec<Finding>) -> Vec<Finding> {
+pub(crate) fn merge(findings: Vec<Finding>) -> Vec<Finding> {
     let mut out: Vec<Finding> = Vec::new();
     for f in findings {
         let dup = out.iter_mut().find(|o| same(o, &f));
@@ -252,14 +252,14 @@ pub fn changed_lines(diff: &str) -> u32 {
 
 /// One profile's place in the pass: run, with its file and model, or skipped with why.
 #[derive(Debug, Clone)]
-struct Plan {
-    name: String,
-    path: PathBuf,
-    model: String,
-    effort: String,
-    reason: String,
-    run: bool,
-    max_minions: u32,
+pub(crate) struct Plan {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) model: String,
+    pub(crate) effort: String,
+    pub(crate) reason: String,
+    pub(crate) run: bool,
+    pub(crate) max_minions: u32,
 }
 
 impl Plan {
@@ -275,7 +275,7 @@ impl Plan {
         }
     }
 
-    fn json(&self, findings: Option<usize>) -> Value {
+    pub(crate) fn json(&self, findings: Option<usize>) -> Value {
         let mut v = json!({ "name": self.name, "ran": self.run, "reason": self.reason });
         if self.run {
             v["model"] = json!(self.model);
@@ -310,7 +310,7 @@ fn plan_local(profiles: &Value, tier: Tier, has_intent: bool) -> Vec<Plan> {
 
 /// The PR pass's profiles: every one lens picked. An `infer` profile runs too (testing only when
 /// the change has code), since nothing here asks a model to judge its rules.
-fn plan_pr(profiles: &Value, files: &[String]) -> Vec<Plan> {
+pub(crate) fn plan_pr(profiles: &Value, files: &[String]) -> Vec<Plan> {
     let has_code = files.iter().any(|f| !is_doc(f));
     profiles["picked"]
         .as_array()
@@ -342,22 +342,23 @@ fn reason_of(p: &Value) -> String {
 }
 
 /// Everything one pass works from.
-struct Pass {
-    opts: Options,
+pub(crate) struct Pass {
+    pub(crate) opts: Options,
     /// lens's own files (`assets::root`).
-    assets: PathBuf,
-    root: PathBuf,
-    /// Where agents read the code: the repo, or the PR's tree.
-    tree_dir: PathBuf,
-    work: PathBuf,
-    report_path: PathBuf,
-    prepared: Value,
-    cfg: Config,
-    runner: Runner,
+    pub(crate) assets: PathBuf,
+    pub(crate) root: PathBuf,
+    /// Where agents read the code: the repo, the PR's tree or the sweep's.
+    pub(crate) tree_dir: PathBuf,
+    /// The folder `context` reads the change from (diff.patch, map.json, profiles.json).
+    pub(crate) work: PathBuf,
+    pub(crate) report_path: PathBuf,
+    pub(crate) prepared: Value,
+    pub(crate) cfg: Config,
+    pub(crate) runner: Runner,
     /// Each role's instructions (`prompts/<role>.md`), sent as an agent's first message.
     roles: HashMap<&'static str, String>,
     started: Instant,
-    started_at: String,
+    pub(crate) started_at: String,
     cost: f64,
     /// One row per agent run, for the report's `agents`.
     agents: Vec<Value>,
@@ -365,16 +366,58 @@ struct Pass {
 }
 
 impl Pass {
-    fn log(&self, msg: &str) {
+    /// A pass over the change `prepared` describes, its agents logged under `work/agents`.
+    pub(crate) fn new(
+        opts: Options,
+        root: PathBuf,
+        tree_dir: PathBuf,
+        work: PathBuf,
+        report_path: PathBuf,
+        prepared: Value,
+    ) -> Result<Pass> {
+        let assets = crate::assets::root()?;
+        let cfg = config::load(&root)?;
+        let runner = Runner {
+            claude: agent::claude_program(),
+            parallel: cfg.review.parallel,
+            timeout: Duration::from_secs(cfg.review.timeout_mins.max(1) * 60),
+            fixer_permission_mode: cfg.review.fixer_permission_mode.clone(),
+            log_dir: work.join("agents"),
+            cached: Default::default(),
+        };
+        let mut roles = HashMap::new();
+        for role in ROLES {
+            roles.insert(*role, agent::role_prompt(&assets, role)?);
+        }
+        Ok(Pass {
+            opts,
+            assets,
+            root,
+            tree_dir,
+            work,
+            report_path,
+            prepared,
+            cfg,
+            runner,
+            roles,
+            started: Instant::now(),
+            started_at: iso_now(),
+            cost: 0.0,
+            agents: Vec::new(),
+            seconds: serde_json::Map::new(),
+        })
+    }
+
+    pub(crate) fn log(&self, msg: &str) {
         eprintln!("lens: {msg}");
     }
 
-    fn lap(&mut self, name: &str, since: Instant) {
+    pub(crate) fn lap(&mut self, name: &str, since: Instant) {
         self.seconds
             .insert(name.into(), json!(since.elapsed().as_secs()));
     }
 
-    fn tally(&mut self, outcomes: &[Outcome]) {
+    pub(crate) fn tally(&mut self, outcomes: &[Outcome]) {
         for o in outcomes {
             self.cost += o.cost_usd;
             let mut row = json!({
@@ -404,7 +447,7 @@ impl Pass {
 
     /// The change as every agent of the pass sees it: the diff, its map, the task and the repo's
     /// guidelines.
-    fn context(&self, delta: Option<&str>) -> Result<String> {
+    pub(crate) fn context(&self, delta: Option<&str>) -> Result<String> {
         let mut s = format!(
             "# The change under review\n\nRepo: {} (your working directory). Base: {}, merge base {}.\nWork folder: {}\n",
             self.tree_dir.display(),
@@ -484,7 +527,7 @@ impl Pass {
     /// Writes the system prompt every agent of the pass shares: the preamble and `context`. The
     /// file is named after its text, so a different change gets a different file (and cache
     /// group).
-    fn system_prompt(&self, context: &str) -> Result<PathBuf> {
+    pub(crate) fn system_prompt(&self, context: &str) -> Result<PathBuf> {
         let text = format!(
             "{}\n\n{}",
             agent::role_prompt(&self.assets, "preamble")?,
@@ -503,7 +546,7 @@ impl Pass {
 
     /// An agent of `role`: its first message is the role's instructions, then `prompt`.
     #[allow(clippy::too_many_arguments)]
-    fn spec(
+    pub(crate) fn spec(
         &self,
         label: String,
         role: &str,
@@ -532,7 +575,7 @@ impl Pass {
         }
     }
 
-    fn reviewer_prompt(&self, plan: &Plan, extra: &str) -> Result<String> {
+    pub(crate) fn reviewer_prompt(&self, plan: &Plan, extra: &str) -> Result<String> {
         let profile = fs::read_to_string(&plan.path)
             .with_context(|| format!("reading {}", plan.path.display()))?;
         Ok(format!(
@@ -543,7 +586,7 @@ impl Pass {
     }
 
     /// Verifies `findings`; returns `(confirmed, dropped)`, each as report JSON.
-    fn verify(
+    pub(crate) fn verify(
         &mut self,
         system: &Path,
         findings: &[Finding],
@@ -618,7 +661,6 @@ impl Pass {
 pub fn run(opts: Options) -> Result<Done> {
     let assets = crate::assets::root()?;
     let root = PathBuf::from(git(&opts.repo, &["rev-parse", "--show-toplevel"])?.trim());
-    let cfg = config::load(&root)?;
     let prepared = prepare(&assets, &root, &opts)?;
     let work = PathBuf::from(
         prepared["work"]
@@ -634,35 +676,7 @@ pub fn run(opts: Options) -> Result<Done> {
         .as_str()
         .map(PathBuf::from)
         .unwrap_or_else(|| root.clone());
-    let runner = Runner {
-        claude: agent::claude_program(),
-        parallel: cfg.review.parallel,
-        timeout: Duration::from_secs(cfg.review.timeout_mins.max(1) * 60),
-        fixer_permission_mode: cfg.review.fixer_permission_mode.clone(),
-        log_dir: work.join("agents"),
-        cached: Default::default(),
-    };
-    let mut roles = HashMap::new();
-    for role in ROLES {
-        roles.insert(*role, agent::role_prompt(&assets, role)?);
-    }
-    let mut pass = Pass {
-        opts,
-        assets,
-        root,
-        tree_dir,
-        work,
-        report_path,
-        prepared,
-        cfg,
-        runner,
-        roles,
-        started: Instant::now(),
-        started_at: iso_now(),
-        cost: 0.0,
-        agents: Vec::new(),
-        seconds: serde_json::Map::new(),
-    };
+    let mut pass = Pass::new(opts, root, tree_dir, work, report_path, prepared)?;
     if let Some(intent) = &pass.opts.intent {
         fs::copy(intent, pass.work.join("intent.md"))
             .with_context(|| format!("copying {}", intent.display()))?;
@@ -815,7 +829,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     if let Mode::Fresh(prev) = mode {
         pass.log("the last review still matches the tree; resuming its fix loop if it has one");
         if !pass.opts.no_fix {
-            fix_loop(pass, &prev)?;
+            fix_loop(pass, &prev, None)?;
         }
         let report: Value = serde_json::from_str(&fs::read_to_string(&pass.report_path)?)?;
         return Ok(Done {
@@ -1013,7 +1027,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     finish(pass, &mut report)?;
 
     if !pass.opts.no_fix {
-        fix_loop(pass, &report)?;
+        fix_loop(pass, &report, None)?;
         report = serde_json::from_str(&fs::read_to_string(&pass.report_path)?)?;
         finish(pass, &mut report)?;
     }
@@ -1046,7 +1060,7 @@ fn number(mut confirmed: Vec<(Finding, Value)>) -> Vec<Value> {
         .collect()
 }
 
-fn map_status(work: &Path) -> Value {
+pub(crate) fn map_status(work: &Path) -> Value {
     let provider = fs::read_to_string(work.join("map.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -1058,7 +1072,7 @@ fn map_status(work: &Path) -> Value {
 }
 
 /// Stamps the end time, timings and cost, and writes the report.
-fn finish(pass: &mut Pass, report: &mut Value) -> Result<()> {
+pub(crate) fn finish(pass: &mut Pass, report: &mut Value) -> Result<()> {
     let mut seconds = pass.seconds.clone();
     seconds.insert("total".into(), json!(pass.started.elapsed().as_secs()));
     report["finishedAt"] = json!(iso_now());
@@ -1080,8 +1094,9 @@ fn finish(pass: &mut Pass, report: &mut Value) -> Result<()> {
     .with_context(|| format!("writing {}", pass.report_path.display()))
 }
 
-/// Takes every blocker of `report` without a settled fix through the fix loop, one at a time.
-fn fix_loop(pass: &mut Pass, report: &Value) -> Result<()> {
+/// Takes every blocker of `report` without a settled fix through the fix loop, one at a time;
+/// with `only`, just that one.
+pub(crate) fn fix_loop(pass: &mut Pass, report: &Value, only: Option<&str>) -> Result<()> {
     let blockers: Vec<Value> = report["findings"]
         .as_array()
         .cloned()
@@ -1089,6 +1104,7 @@ fn fix_loop(pass: &mut Pass, report: &Value) -> Result<()> {
         .into_iter()
         .filter(|f| {
             f["severity"] == "blocker"
+                && only.is_none_or(|id| f["id"] == id)
                 && !matches!(f["fix"]["status"].as_str(), Some("resolved" | "escalated"))
         })
         .collect();
@@ -1154,6 +1170,7 @@ fn fix_loop(pass: &mut Pass, report: &Value) -> Result<()> {
                         continue;
                     }
                     let patch = pass.work.join("fix").join(format!("{id}-pending.patch"));
+                    fs::create_dir_all(patch.parent().unwrap())?;
                     fs::write(&patch, &pending)?;
                     let review = rereview(pass, &system, &profiles, &finding, &id, &patch)?;
                     step = fix::record(&step.ledger, Some(fixer), Some(review))?;
@@ -1492,11 +1509,11 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
     })
 }
 
-fn number_all(confirmed: Vec<(Finding, Value)>) -> Vec<Value> {
+pub(crate) fn number_all(confirmed: Vec<(Finding, Value)>) -> Vec<Value> {
     number(confirmed)
 }
 
-fn slug(s: &str) -> String {
+pub(crate) fn slug(s: &str) -> String {
     let s: String = s
         .chars()
         .map(|c| {
@@ -1655,7 +1672,7 @@ pub fn summarize(report: &Value, path: &Path, fresh: bool) -> String {
     out.join("\n")
 }
 
-fn iso_now() -> String {
+pub(crate) fn iso_now() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

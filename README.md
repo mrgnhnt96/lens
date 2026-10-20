@@ -109,6 +109,38 @@ provider = ["tools/lens-map", "--fast"]
 
 The contract and the output format are in [docs/PROVIDERS.md](docs/PROVIDERS.md).
 
+## `lens sweep [--since <ref>] [--dry-run] [--now]`
+
+Reviews everything pushed to origin's default branch since the last sweep, in one batch per repo
+instead of inside every task. The range runs from the watermark ref `refs/lens/swept` to
+`origin/main` (origin's default branch). The first sweep only sets the watermark; a range with
+no new commits does nothing.
+
+- The `impact-assessment` lead reads the whole range and splits it into areas of at most
+  `area_lines` changed lines. lens enforces the cap, and files the lead left out are packed by
+  path. Each area gets its own change block (one prompt-cache group) and its own reviewers.
+  Areas that only touch docs are skipped.
+- Reviewers are asked only for problems these commits caused. Findings an earlier sweep already
+  reported (the same file and title, or the same file within 3 lines) are skipped.
+- Blockers and majors go to the verifier. Confirmed blockers go through the fix loop in a
+  worktree on `lens/sweep-<stamp>`, one commit per fix. The branch is pushed and opened as one
+  PR, and its body is the digest (`.review/sweep-<stamp>.md`). Minors are listed in the digest
+  only.
+- The watermark moves to the reviewed head only when no reviewer failed.
+
+The report goes to `.review/sweep-<stamp>.json` (`<stamp>` is UTC `YYYY-MM-DD-HHMM`).
+`--dry-run` reviews and reports, but fixes nothing, opens no PR and leaves the watermark.
+`--since` reviews from another ref. `--now` runs even when the sweep isn't due.
+
+```toml
+# .lens.toml
+[sweep]
+every = "6h"            # a sweep is due this long after the last one (90m, 6h, 1d)...
+max_lines = 1500        # ...or sooner, once this many changed lines are waiting
+area_lines = 800        # the most changed lines in one area
+daily_budget_usd = 20.0 # once today's sweeps spent this, wait for the next sweep (default: none)
+```
+
 ## `lens cost [--since 1d|<date>] [--root <dir>]`
 
 What reviews spent. lens's `claude -p` agents never show in session transcripts, so this adds up

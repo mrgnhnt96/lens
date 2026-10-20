@@ -128,9 +128,12 @@ impl Gh {
     }
 
     fn api(&self, args: &[&str], stdin: Option<&str>) -> Result<String> {
+        self.run(&[&["api"], args].concat(), stdin)
+    }
+
+    fn run(&self, args: &[&str], stdin: Option<&str>) -> Result<String> {
         let mut cmd = Command::new(&self.program);
-        cmd.arg("api")
-            .args(args)
+        cmd.args(args)
             .current_dir(&self.repo)
             .stdin(if stdin.is_some() {
                 Stdio::piped()
@@ -155,12 +158,33 @@ impl Gh {
         let out = child.wait_with_output()?;
         if !out.status.success() {
             bail!(
-                "gh api {}: {}",
+                "gh {}: {}",
                 args.join(" "),
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
         String::from_utf8(out.stdout).context("gh printed non-UTF-8")
+    }
+
+    /// Opens a PR from `head` into `base` and returns its URL.
+    pub fn create_pr(&self, base: &str, head: &str, title: &str, body: &Path) -> Result<String> {
+        let body = body.display().to_string();
+        let out = self.run(
+            &[
+                "pr",
+                "create",
+                "--base",
+                base,
+                "--head",
+                head,
+                "--title",
+                title,
+                "--body-file",
+                &body,
+            ],
+            None,
+        )?;
+        Ok(out.trim().lines().last().unwrap_or("").to_string())
     }
 
     /// Every page of a list endpoint.
