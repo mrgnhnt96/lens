@@ -493,4 +493,94 @@ mod tests {
         assert_eq!(strip_frontmatter("---\na: 1\n---\nbody"), "\nbody");
         assert_eq!(strip_frontmatter("body"), "body");
     }
+
+    /// Runs `specs` (labelled by their prompt) through a fake claude that logs when each agent
+    /// starts and when it answers, and returns that log.
+    fn batch(cached: &[(&Spec, Instant)], specs: Vec<Spec>) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let claude = dir.path().join("claude");
+        std::fs::write(
+            &claude,
+            format!(
+                r#"#!/bin/sh
+label=$(cat)
+echo "start $label" >> {log}
+sleep 0.4
+echo "first $label" >> {log}
+echo '{{"type":"assistant","message":{{"content":[]}}}}'
+sleep 0.2
+echo '{{"type":"result","result":"ok"}}'
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runner = Runner {
+            claude,
+            log_dir: dir.path().into(),
+            ..runner()
+        };
+        for (spec, at) in cached {
+            runner.cached.lock().unwrap().insert(group(spec), *at);
+        }
+        let specs = specs
+            .into_iter()
+            .map(|s| Spec {
+                cwd: dir.path().into(),
+                ..s
+            })
+            .collect();
+        for outcome in runner.run_all(specs) {
+            assert_eq!(outcome.error, None);
+        }
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn labelled(label: &str, model: &str) -> Spec {
+        Spec {
+            prompt: label.into(),
+            ..spec(Access::ReadOnly, model)
+        }
+    }
+
+    fn at(log: &[String], line: &str) -> usize {
+        log.iter()
+            .position(|l| l == line)
+            .unwrap_or_else(|| panic!("no {line:?} in {log:?}"))
+    }
+
+    #[test]
+    fn a_cold_group_starts_one_agent_and_holds_the_rest_until_it_answers() {
+        let log = batch(
+            &[],
+            vec![
+                labelled("a1", "opus"),
+                labelled("a2", "opus"),
+                labelled("b", "sonnet"),
+            ],
+        );
+        assert!(at(&log, "start a2") > at(&log, "first a1"), "{log:?}");
+        // Another group doesn't wait for it.
+        assert!(at(&log, "start b") < at(&log, "first a1"), "{log:?}");
+    }
+
+    #[test]
+    fn a_cached_group_starts_together_and_an_expired_one_is_held_again() {
+        let (a1, a2) = (labelled("a1", "opus"), labelled("a2", "opus"));
+        let log = batch(&[(&a1, Instant::now())], vec![a1.clone(), a2.clone()]);
+        assert!(at(&log, "start a2") < at(&log, "first a1"), "{log:?}");
+
+        let Some(expired) = Instant::now().checked_sub(CACHED_FOR + Duration::from_secs(1)) else {
+            return;
+        };
+        let log = batch(&[(&a1, expired)], vec![a1.clone(), a2]);
+        assert!(at(&log, "start a2") > at(&log, "first a1"), "{log:?}");
+    }
 }

@@ -239,7 +239,10 @@ fn a_full_review_verifies_blockers_and_drops_the_rest() {
         // The diff is in the shared system prompt, not something each agent reads itself; the
         // role's instructions are in the first message.
         assert!(c["system"].as_str().unwrap().contains("+// line 59"));
-        assert_eq!(c["system"], calls[0]["system"], "one system prompt for every agent");
+        assert_eq!(
+            c["system"], calls[0]["system"],
+            "one system prompt for every agent"
+        );
         assert!(!c["system"].as_str().unwrap().contains("<role"));
     }
     assert_eq!(report["totals"]["agents"], 4);
@@ -252,7 +255,12 @@ fn a_full_review_verifies_blockers_and_drops_the_rest() {
     assert_eq!(agents.len(), 4);
     let mut groups: Vec<(String, String)> = agents
         .iter()
-        .map(|a| (a["model"].as_str().unwrap().into(), a["tools"].as_str().unwrap().into()))
+        .map(|a| {
+            (
+                a["model"].as_str().unwrap().into(),
+                a["tools"].as_str().unwrap().into(),
+            )
+        })
         .collect();
     groups.sort();
     groups.dedup();

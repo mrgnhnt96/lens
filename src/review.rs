@@ -1155,14 +1155,7 @@ fn fix_loop(pass: &mut Pass, report: &Value) -> Result<()> {
                     }
                     let patch = pass.work.join("fix").join(format!("{id}-pending.patch"));
                     fs::write(&patch, &pending)?;
-                    let review = rereview(
-                        pass,
-                        &system,
-                        &profiles,
-                        &finding,
-                        &id,
-                        &patch,
-                    )?;
+                    let review = rereview(pass, &system, &profiles, &finding, &id, &patch)?;
                     step = fix::record(&step.ledger, Some(fixer), Some(review))?;
                 }
                 fix::Next::Judge => {
