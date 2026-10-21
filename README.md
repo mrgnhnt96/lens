@@ -42,11 +42,12 @@ docs/REVIEW.md               the .review/<branch>.json and .review/pr-<n>.json f
 Runs a pass and prints its summary; the report goes to `.review/<branch>.json` (format in
 [docs/REVIEW.md](docs/REVIEW.md)).
 
-**What runs.** The local pass runs `correctness` (Opus) always, plus `testing` and, with a task
+**What runs.** The local pass runs `correctness` (Sonnet) always, plus `testing` and, with a task
 or `--intent`, `intent-alignment` (Sonnet) when the change is over `small_lines`. A change that
-only touches docs runs nothing. Blockers and majors go to an Opus verifier each; confirmed
+only touches docs runs nothing. Blockers and majors go to a Sonnet verifier each; confirmed
 blockers go through the fix loop unless `--no-fix`. The PR pass runs every profile lens picks,
-the `impact-assessment` lead first and a correctness reviewer per focus area it names.
+the `impact-assessment` lead first and a correctness reviewer per focus area it names. Reviewers
+run on their profile's `model` (Sonnet for every built-in one); verifiers and fixers run on Sonnet.
 
 **Reviewing again.** When the last report reviewed this branch from the same merge base, an
 unchanged tree isn't reviewed again (an open fix loop resumes), and a changed tree is reviewed

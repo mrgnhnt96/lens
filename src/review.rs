@@ -287,7 +287,7 @@ impl Plan {
         Plan {
             name: p["name"].as_str().unwrap_or("").to_string(),
             path: PathBuf::from(p["path"].as_str().unwrap_or("")),
-            model: p["model"].as_str().unwrap_or("opus").to_string(),
+            model: p["model"].as_str().unwrap_or("sonnet").to_string(),
             effort: p["effort"].as_str().unwrap_or("high").to_string(),
             reason,
             run,
@@ -624,7 +624,7 @@ impl Pass {
                     "verifier",
                     system,
                     f.for_verifier(),
-                    "opus",
+                    "sonnet",
                     "high",
                     Access::ReadOnly,
                 )
@@ -1215,7 +1215,7 @@ pub(crate) fn fix_loop(pass: &mut Pass, report: &Value, only: Option<&str>) -> R
                         "fixer",
                         &system,
                         prompt,
-                        "opus",
+                        "sonnet",
                         "high",
                         Access::Edit,
                     );
@@ -1295,7 +1295,7 @@ fn rereview(
         "verifier",
         system,
         finding.for_verifier(),
-        "opus",
+        "sonnet",
         "high",
         Access::ReadOnly,
     )];
@@ -1443,7 +1443,6 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
                 })
                 .unwrap_or_default();
             let mut plan = c.clone();
-            plan.model = "opus".into();
             plan.effort = "high".into();
             plan.reason = "lead focus area".into();
             runs.push((
@@ -1823,8 +1822,8 @@ mod tests {
     #[test]
     fn local_plan_keeps_three_profiles_and_skips_by_tier() {
         let profiles = json!({ "picked": [
-            { "name": "impact-assessment", "path": "/p/i.md", "model": "opus", "effort": "high", "decision": "selected", "reasons": ["always"] },
-            { "name": "correctness", "path": "/p/c.md", "model": "opus", "effort": "high", "decision": "selected", "reasons": ["always"] },
+            { "name": "impact-assessment", "path": "/p/i.md", "model": "sonnet", "effort": "high", "decision": "selected", "reasons": ["always"] },
+            { "name": "correctness", "path": "/p/c.md", "model": "sonnet", "effort": "high", "decision": "selected", "reasons": ["always"] },
             { "name": "testing", "path": "/p/t.md", "model": "sonnet", "effort": "high", "decision": "infer" },
             { "name": "intent-alignment", "path": "/p/a.md", "model": "sonnet", "effort": "high", "decision": "infer" },
         ]});
@@ -1842,6 +1841,18 @@ mod tests {
         assert_eq!(run(Tier::Full, false), vec!["correctness", "testing"]);
         assert_eq!(run(Tier::Small, true), vec!["correctness"]);
         assert!(run(Tier::Skip, true).is_empty());
+    }
+
+    #[test]
+    fn plans_default_to_sonnet_and_a_profile_can_opt_into_opus() {
+        let plan = Plan::from_picked(&json!({ "name": "c" }), true, String::new());
+        assert_eq!(plan.model, "sonnet");
+        let plan = Plan::from_picked(
+            &json!({ "name": "c", "model": "opus" }),
+            true,
+            String::new(),
+        );
+        assert_eq!(plan.model, "opus");
     }
 
     #[test]

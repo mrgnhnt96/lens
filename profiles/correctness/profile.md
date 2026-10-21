@@ -1,6 +1,6 @@
 ---
 name: correctness
-model: opus
+model: sonnet
 effort: high
 description: Logic errors, race conditions, resource leaks, null handling, async mistakes — bugs that will bite at runtime.
 severityGuidance: >
