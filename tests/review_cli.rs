@@ -281,8 +281,8 @@ fn a_full_review_verifies_blockers_and_drops_the_rest() {
             }
         }
     }
-    let opus: Vec<&Value> = agents.iter().filter(|a| a["model"] == "opus").collect();
-    assert!(opus.len() >= 2, "{agents:?}");
+    // Every agent, verifiers included, runs on Sonnet by default.
+    assert!(agents.iter().all(|a| a["model"] == "sonnet"), "{agents:?}");
     assert_eq!(
         report["totals"]["cacheCreationInputTokens"],
         change * groups.len() as u64

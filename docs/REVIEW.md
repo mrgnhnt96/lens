@@ -25,10 +25,10 @@ fix ledgers) this one replaced.
   "finishedAt": "2026-10-14T19:44:14Z",
   "seconds": { "total": 252, "reviewers": 118, "verify": 57, "fix": 0 },
   "agents": [
-    { "label": "reviewer-correctness", "model": "opus", "tools": "Read,Grep,Glob,Bash",
+    { "label": "reviewer-correctness", "model": "sonnet", "tools": "Read,Grep,Glob,Bash",
       "costUsd": 0.21, "turns": 9, "seconds": 104,
       "cacheCreationInputTokens": 18233, "cacheReadInputTokens": 0 },
-    { "label": "reviewer-testing", "model": "opus", "tools": "Read,Grep,Glob,Bash",
+    { "label": "reviewer-testing", "model": "sonnet", "tools": "Read,Grep,Glob,Bash",
       "costUsd": 0.12, "turns": 7, "seconds": 96,
       "cacheCreationInputTokens": 214, "cacheReadInputTokens": 18019 }
   ],
@@ -37,7 +37,7 @@ fix ledgers) this one replaced.
   "costUsd": 0.61,
   "map": { "provider": "grep", "error": null },
   "profiles": [
-    { "name": "correctness", "ran": true, "model": "opus", "reason": "always", "findings": 3 },
+    { "name": "correctness", "ran": true, "model": "sonnet", "reason": "always", "findings": 3 },
     { "name": "testing", "ran": true, "model": "sonnet", "reason": "inferred", "findings": 2 },
     { "name": "intent-alignment", "ran": false, "reason": "no task context" }
   ],

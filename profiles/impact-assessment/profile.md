@@ -1,6 +1,6 @@
 ---
 name: impact-assessment
-model: opus
+model: sonnet
 effort: high
 description: Lead assessment — impact, blast radius, inherent risk, areas needing human judgment, and whether the PR description conveys them. Runs first; its output guides the other reviewers and dispatches targeted minion reviews for the riskiest areas.
 dispatch: true

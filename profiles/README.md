@@ -18,7 +18,7 @@ Each profile is a folder:
 |---|---|---|
 | `name` | yes | Profile id; matches the folder and `item.json`. |
 | `description` | yes | One line on what the reviewer looks for. |
-| `model` | yes | Model to run it on (`opus`, `sonnet`, ...). |
+| `model` | yes | Model to run it on. Every built-in profile uses `sonnet`; set `opus` to opt one back in (focus-area reviewers follow `correctness`). |
 | `effort` | yes | Reasoning effort (`low` … `max`). |
 | `severityGuidance` | yes | What counts as `blocker` / `major` / `minor` / `nit` for this reviewer. |
 | `enabled` | yes | `false` keeps the profile but never runs it. |
