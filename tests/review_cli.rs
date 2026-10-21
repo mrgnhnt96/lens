@@ -506,6 +506,8 @@ fn the_pr_pass_runs_the_lead_and_its_focus_areas_and_posts() {
         fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    // Every PR is in the sample, so PR 7 is reviewed whatever its hash.
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
     let out = fx.review_with(&[], &["--pr", "7"], &[("LENS_GH", &gh), ("FAKE", &fake)]);
     let report: Value =
         serde_json::from_str(&fs::read_to_string(d.join(".review/pr-7.json")).unwrap()).unwrap();
@@ -560,4 +562,19 @@ fn the_pr_pass_runs_the_lead_and_its_focus_areas_and_posts() {
     );
     let roles = roles(&fx.calls());
     assert!(!roles.contains(&"fixer".to_string()));
+}
+
+#[test]
+fn a_pr_outside_the_sample_runs_nothing() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    write(&d, ".lens.toml", "[pr]\nsample = 0\n");
+    // No gh and no origin: a PR outside the sample is skipped before either is needed.
+    let out = fx.review_with(&[], &["--pr", "7"], &[]);
+    assert!(
+        out.contains("PR #7 isn't in the sample ([pr] sample = 0)"),
+        "{out}"
+    );
+    assert!(fx.calls().is_empty());
+    assert!(!d.join(".review/pr-7.json").exists());
 }

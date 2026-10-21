@@ -681,6 +681,18 @@ impl Pass {
 pub fn run(opts: Options) -> Result<Done> {
     let assets = crate::assets::root()?;
     let root = PathBuf::from(git(&opts.repo, &["rev-parse", "--show-toplevel"])?.trim());
+    if let Some(n) = opts.pr {
+        let cfg = config::load(&root)?.pr;
+        if !cfg.samples(n) {
+            return Ok(Done {
+                summary: format!(
+                    "lens: PR #{n} isn't in the sample ([pr] sample = {}), nothing to review.",
+                    cfg.sample
+                ),
+                report: None,
+            });
+        }
+    }
     let prepared = prepare(&assets, &root, &opts)?;
     let work = PathBuf::from(
         prepared["work"]

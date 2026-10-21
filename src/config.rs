@@ -110,10 +110,14 @@ pub enum Input {
     Args,
 }
 
-/// `[pr]`: how the PR pass posts its findings.
-#[derive(Debug, Default, Deserialize)]
+/// `[pr]`: which PRs the PR pass reviews and how it posts its findings.
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrConfig {
+    /// The share of PRs `lens review --pr` reviews, 0 to 1. Which ones is a hash of the PR
+    /// number, so a rerun makes the same choice.
+    #[serde(default = "PrConfig::default_sample")]
+    pub sample: f64,
     /// Whose account the comments come from.
     #[serde(default)]
     pub post_as: PostAs,
@@ -132,8 +136,32 @@ pub enum PostAs {
     Bot,
 }
 
+impl Default for PrConfig {
+    fn default() -> Self {
+        PrConfig {
+            sample: Self::default_sample(),
+            post_as: PostAs::default(),
+            bot_token_env: None,
+        }
+    }
+}
+
 impl PrConfig {
     pub const DEFAULT_BOT_TOKEN_ENV: &'static str = "LENS_BOT_TOKEN";
+
+    fn default_sample() -> f64 {
+        0.5
+    }
+
+    /// Whether PR `number` is in the sample.
+    pub fn samples(&self, number: u64) -> bool {
+        // splitmix64: spreads consecutive PR numbers evenly over the range.
+        let mut z = number.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        (z as f64) / (u64::MAX as f64) < self.sample
+    }
 
     pub fn bot_token_env(&self) -> &str {
         self.bot_token_env
@@ -150,7 +178,16 @@ pub fn load(root: &Path) -> Result<Config> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    let cfg: Config =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    if !(0.0..=1.0).contains(&cfg.pr.sample) {
+        anyhow::bail!(
+            "{}: [pr] sample is {}, it must be from 0 to 1",
+            path.display(),
+            cfg.pr.sample
+        );
+    }
+    Ok(cfg)
 }
 
 #[cfg(test)]
@@ -185,6 +222,30 @@ mod tests {
         assert_eq!(c.pr.post_as, PostAs::Bot);
         assert_eq!(c.pr.bot_token_env(), "REVIEW_BOT");
         assert!(toml::from_str::<Config>("[pr]\npost_as = \"me\"\n").is_err());
+    }
+
+    #[test]
+    fn pr_samples_half_by_default_and_the_same_prs_each_time() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.pr.sample, 0.5);
+        let picked: Vec<u64> = (1..=1000).filter(|&n| c.pr.samples(n)).collect();
+        assert!((450..=550).contains(&picked.len()), "{}", picked.len());
+        assert_eq!(
+            picked,
+            (1..=1000).filter(|&n| c.pr.samples(n)).collect::<Vec<_>>()
+        );
+        let all: Config = toml::from_str("[pr]\nsample = 1.0\n").unwrap();
+        assert!((1..=1000).all(|n| all.pr.samples(n)));
+        let none: Config = toml::from_str("[pr]\nsample = 0\n").unwrap();
+        assert!((1..=1000).all(|n| !none.pr.samples(n)));
+    }
+
+    #[test]
+    fn a_sample_outside_0_to_1_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE), "[pr]\nsample = 1.5\n").unwrap();
+        let e = load(dir.path()).unwrap_err().to_string();
+        assert!(e.contains("[pr] sample is 1.5"), "{e}");
     }
 
     #[test]
