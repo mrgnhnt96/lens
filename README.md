@@ -206,4 +206,6 @@ PR outside the sample runs nothing and prints so; `sample = 1` reviews every PR.
 
 With `post_as = "bot"`, `lens pr` fails rather than post as the owner when the variable is unset.
 
-Plan: https://claude.ai/code/artifact/a12f42b8-ee3b-41ee-953b-94b9091d47b1
+## License
+
+MIT. See [LICENSE](LICENSE).
