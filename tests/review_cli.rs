@@ -995,6 +995,37 @@ fn a_review_the_backoff_lightened_is_incomplete_so_the_next_one_runs_everything(
 }
 
 #[test]
+fn a_held_plan_window_still_shows_a_review_that_matches_the_tree() {
+    let fx = Fixture::new(60);
+    fx.review(&[]);
+    // A turned-away run holds the window and puts the last review back.
+    let out = fx.review_with(
+        &["main"],
+        &["--full"],
+        &[("FAKE_REJECT", Path::new("reviewer"))],
+    );
+    assert!(out.contains("lens: paused: "), "{out}");
+    assert!(fx.usage().join("full.json").is_file());
+    fx.calls();
+
+    // The window is still held, but nothing changed, so no agent is needed.
+    let out = fx.review(&[]);
+    assert!(out.contains("unchanged since the last review"), "{out}");
+    assert!(!out.contains("paused"), "{out}");
+    assert!(fx.calls().is_empty());
+
+    // A change needs agents, and the held window turns them away before any starts.
+    write(
+        &fx.repo(),
+        "src/a.rs",
+        &(fs::read_to_string(fx.repo().join("src/a.rs")).unwrap() + "// one more\n"),
+    );
+    let out = fx.review(&[]);
+    assert!(out.contains("lens: paused: "), "{out}");
+    assert!(fx.calls().is_empty());
+}
+
+#[test]
 fn a_local_review_the_plan_turns_away_mid_pass_keeps_the_last_report() {
     let fx = Fixture::new(60);
     fx.review(&[]);
