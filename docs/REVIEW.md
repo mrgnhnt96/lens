@@ -1,16 +1,24 @@
 # The review file
 
-`lens review` saves each pass to `.review/<branch>.json` in the reviewed repo (a detached HEAD is
-`detached-<short sha>`). The fix loop and the PR pass read it. `.review/` holds a `.gitignore`
-of `*`, so it never reaches a commit. The pass's inputs sit beside it in `.review/<branch>/`:
-`diff.patch`, `map.json`, `profiles.json`, `task.json`, `intent.md`; `agents/` holds the shared
-system prompt (`change-<hash>.system.md`) and each agent's reply, and `prev/` the report (and
-fix ledgers) this one replaced.
+`lens review` saves each pass to `<state>/<branch>.json` (a detached HEAD is
+`detached-<short sha>`). The fix loop and the PR pass read it. `<state>` is never inside the repo,
+so a review writes nothing to the checkout:
+
+- under the review protocol, `TASKBOARD_STATE_DIR`, which the task board keeps per task;
+- run by hand, `$XDG_CACHE_HOME/lens/state/<repo>-<hash>` (`~/.cache` when `XDG_CACHE_HOME` isn't
+  set), where `<repo>` is the checkout's folder name and `<hash>` an FNV-1a hash of its path, so two
+  checkouts of one repo keep apart.
+
+The pass's inputs sit beside the report in `<state>/<branch>/`: `diff.patch`, `map.json`,
+`profiles.json`, `task.json`, `intent.md`; `agents/` holds the shared system prompt
+(`change-<hash>.system.md`) and each agent's reply, and `prev/` the report (and fix ledgers) this
+one replaced.
 
 ```json
 {
   "version": 1,
   "pass": "local",
+  "root": "/repo",
   "branch": "feat/x",
   "base": "origin/main",
   "mergeBase": "71fae7c…",
@@ -64,6 +72,7 @@ fix ledgers) this one replaced.
 ```
 
 - `pass`: `local` for `lens review`, `pr` for `lens review --pr <n>`.
+- `root`: the checkout reviewed; the fix loop works there.
 - `dirty`: the working tree had uncommitted or untracked changes; they were reviewed too.
 - `tree`: the working tree the pass reviewed, as a git tree object (untracked files in). The
   next pass compares against it (or against the last fix attempt's `after`).
@@ -87,8 +96,14 @@ fix ledgers) this one replaced.
 - `totals`: `agents` (how many sessions ran), `costUsd`, and the two cache fields summed over
   `agents`. The top-level `costUsd` is the same total, kept for older readers.
 - `findings`: blocker and major only, every one confirmed by a verifier. `severity` is the
-  verifier's, `line` the verifier's when it moved it. Ids are `F1`, `F2`, … in report order
-  (blockers first).
+  verifier's, `line` the verifier's when it moved it. Ids are `F1`, `F2`, … (blockers first). A
+  finding carried over from the last report keeps its id, and a new one takes the next number
+  after any id the branch's reports have used (`lastId`), so an id never changes meaning.
+- `settled`: findings the task board's triage dismissed or backlogged (see the protocol below),
+  with `id`, `file`, `line`, `severity`, `title`, `outcome` and `reason`. Kept from report to
+  report; a finding that raises one of them again is dropped as `dismissed in triage: <reason>`
+  or `backlogged in triage: <reason>`.
+- `lastId`: the highest finding number the branch's reports have used.
 - `dropped`: everything else, with why: `below major` or `unverified: <the verifier's reason>`.
   Duplicates raised by several profiles are merged into one entry listing them all.
 - `map.error`: the provider's error when `lens map` failed; the pass ran without a map.
@@ -97,33 +112,84 @@ fix ledgers) this one replaced.
 - `findings[].fix`: set on a blocker once the fix loop takes it up:
   `{"status": "open" | "resolved" | "escalated", "attempts": 2, "ledger": "<path>"}`.
 
-## Freshness: what `tb submit` checks
+## diff.patch
 
-The task board takes a local report as current when the change it reviewed is the change the
-checkout holds now. It reads `.review/<branch>.json` (the branch `git symbolic-ref` gives, or
-`detached-<short sha>`) and compares two patch ids (`git patch-id --stable` of a `git diff
---binary`):
+`prepare.sh` writes `diff.patch` as one `git diff --full-index` from `mergeBase` to a snapshot of
+the working tree, made with `git add -A` into a throwaway index (the checkout's own index isn't
+touched). `git apply --cached` of it onto `mergeBase` rebuilds the reviewed tree exactly, binary
+files included: they show as `Binary files … differ`, which keeps the patch readable for
+reviewers, and still apply, since the full index line names a blob `git add` already stored.
 
-- **Reviewed**: from `mergeBase` to the reviewed tree. That tree is the last fix attempt's `after`
-  when a finding has a ledger; otherwise `head^{tree}` when `dirty` is false; otherwise the tree
-  `git apply --cached .review/<branch>/diff.patch` builds on top of `mergeBase`.
-- **Now**: from `git merge-base <base> HEAD` to the working tree as a tree object (untracked files
-  in, ignored ones out).
+## The review protocol
 
-Only `base`, `mergeBase`, `head`, `dirty`, `branch`, `findings[].fix.ledger` and `diff.patch` count.
-Timestamps, `changedLines` and file mtimes don't, so a commit or a clean rebase of the same change
-keeps the report fresh and any edit to the tree, untracked files included, makes it stale.
+The task board's pre-PR review runs a reviewer command in a task's worktree and reads back one
+JSON result. `lens review` is such a reviewer: it runs as one whenever `TASKBOARD_RESULT` is set,
+and only reads the rest of the protocol's variables then.
 
-So `diff.patch` has to replay exactly. `prepare.sh` writes it as one `git diff --full-index` from
-`mergeBase` to a snapshot of the working tree, made with `git add -A` into a throwaway index. Binary
-files show as `Binary files … differ`, which keeps the patch readable for reviewers, and still
-apply: the full index line names a blob `git add` already stored. A patch built from `git diff
---no-index` per untracked file had short index lines, so any untracked binary (screenshots, media)
-made `git apply` fail and every review read as older than the change.
+| Variable | lens uses it as |
+| --- | --- |
+| `TASKBOARD_RESULT` | where the result goes; set means protocol mode |
+| `TASKBOARD_REPO` | the repo to review, unless a path is passed (lens runs in the worktree anyway) |
+| `TASKBOARD_BASE` | the base, unless one is passed |
+| `TASKBOARD_INTENT` | the task's intent (markdown) for `intent-alignment`, unless `--intent` is passed |
+| `TASKBOARD_STATE_DIR` | `<state>`: kept from round to round, so round 2 finds round 1's report |
+| `TASKBOARD_PREVIOUS` | the last round's result with triage's `outcome` and `reason` on each finding; unset in round 1 |
+
+In protocol mode lens never touches the worktree: no fix loop (as with `--no-fix`), no files in
+the repo, no commits. It doesn't ask `tb peek` for a task either; the intent file is the task.
+
+**Rounds.** Round 1 reviews the whole change. A later round finds the last report in `<state>`
+and reviews only what changed since (`mode: "delta"`), as any pass does. From
+`TASKBOARD_PREVIOUS`:
+
+- `fix`: the finding is verified again whatever files the delta touched, and keeps its id while
+  it still holds. One the fix dealt with is dropped and leaves the result.
+- `dismiss` and `backlog`: the finding moves to the report's `settled` list and isn't reported
+  again, in this round or any later one, even when a reviewer raises it afresh (same id, or the
+  same file, nearby line and title).
+
+A tree unchanged since the last round isn't reviewed again: the result repeats the last report's
+findings, less those triage settled, at no cost.
+
+**The result**, written to `TASKBOARD_RESULT`:
+
+```json
+{
+  "protocol": 1,
+  "reviewer": "lens",
+  "verdict": "fail",
+  "headline": "1 finding (1 blocker) in 12s",
+  "findings": [
+    {
+      "id": "F1",
+      "title": "empty input parses as a valid token",
+      "severity": "blocker",
+      "file": "src/parser.rs",
+      "line": 42,
+      "detail": "parse(\"\") returns Ok(Token::empty()), so login() accepts a blank password\n\n1. login() …",
+      "url": null
+    }
+  ],
+  "cost": { "usd": 0.61 }
+}
+```
+
+- `verdict`: `fail` when there are findings, `pass` when reviewers ran and confirmed none, `skip`
+  when nothing needed review (no change against the base, only docs changed, or the floor found
+  no risky path).
+- `headline`: the first line of the summary `lens review` prints.
+- `findings`: the report's `findings` (blocker and major, verified), ids as in the report.
+  `detail` is the failure scenario, then the steps of how it fails.
+- `cost.usd`: what this round's agents cost.
+
+**Exit status.** lens exits 0 once the result is written. It exits non-zero without writing one,
+which the board counts as a reviewer error, when a reviewer gave no readable reply (the review is
+incomplete; the report is still saved and the next round reviews everything), when the usage
+gate holds the review, or when anything else fails. Progress goes to stderr.
 
 ## The fix ledger
 
-The fix loop keeps one ledger per blocker at `.review/<branch>/fix/<id>.json`, written only by
+The fix loop keeps one ledger per blocker at `<state>/<branch>/fix/<id>.json`, written only by
 `lens fix`, with each attempt's diff beside it as `<id>-attempt-<n>.patch`.
 
 ```json
@@ -131,7 +197,7 @@ The fix loop keeps one ledger per blocker at `.review/<branch>/fix/<id>.json`, w
   "version": 1,
   "findingId": "F1",
   "finding": { "id": "F1", "file": "src/parser.rs", "line": 42, "severity": "blocker", "…": "…" },
-  "report": "/repo/.review/feat/x.json",
+  "report": "<state>/feat/x.json",
   "root": "/repo",
   "baseTree": "72557a01ef…",
   "cap": 5,
@@ -141,7 +207,7 @@ The fix loop keeps one ledger per blocker at `.review/<branch>/fix/<id>.json`, w
       "n": 1,
       "before": "72557a01ef…",
       "after": "9c1e04b7d2…",
-      "patch": "/repo/.review/feat/x/fix/F1-attempt-1.patch",
+      "patch": "<state>/feat/x/fix/F1-attempt-1.patch",
       "changedLines": 6,
       "fixer": { "summary": "reject empty input in parse()", "needsDecision": null },
       "review": {
@@ -157,7 +223,7 @@ The fix loop keeps one ledger per blocker at `.review/<branch>/fix/<id>.json`, w
 ```
 
 - `baseTree`, `before`, `after`: the working tree as git tree objects (untracked files
-  included, `.review/` and ignored files left out). `git diff <baseTree>` shows every attempt.
+  included, ignored files left out). `git diff <baseTree>` shows every attempt.
 - An attempt is `resolved` when its diff isn't empty, the verifier drops the original finding
   and the re-review confirms nothing new. An attempt that changed nothing has no `review`.
 - `escalation.by`: `judge` (the Haiku escalation judge called it) or `cap` (the attempt that
@@ -165,7 +231,7 @@ The fix loop keeps one ledger per blocker at `.review/<branch>/fix/<id>.json`, w
 
 ## The PR pass
 
-`lens review --pr <n>` saves to `.review/pr-<n>.json`, with its inputs in `.review/pr-<n>/` (plus
+`lens review --pr <n>` saves to `<state>/pr-<n>.json`, with its inputs in `<state>/pr-<n>/` (plus
 `pr.json`, `intent.md`, `posted.json` and, when the checkout isn't at the PR's head, `tree/`).
 The format is the same, except:
 

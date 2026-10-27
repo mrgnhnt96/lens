@@ -26,7 +26,7 @@ pub const NEAR_LINES: u32 = 3;
 const FINDING_MARK: &str = "<!-- lens:finding key=";
 const REVIEW_MARK: &str = "<!-- lens:review";
 
-/// The parts of `.review/pr-<n>.json` posting needs (the format is in docs/REVIEW.md).
+/// The parts of a PR pass's report (`<state>/pr-<n>.json`) posting needs (the format is in docs/REVIEW.md).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Report {

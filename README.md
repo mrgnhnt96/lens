@@ -34,13 +34,25 @@ scripts/                     prepare.sh and prepare-pr.sh, which gather a pass's
 build.rs                     compiles prompts/, profiles/ and scripts/ into the binary
 src/                         the lens CLI (Rust)
 docs/PROVIDERS.md            the change-map provider contract
-docs/REVIEW.md               the .review/<branch>.json and .review/pr-<n>.json format
+docs/REVIEW.md               the report and protocol result formats, and where state is kept
 ```
 
 ## `lens review [<base>] [--intent <file>] [--no-fix] [--full]`, `lens review --floor`, `lens review --pr <n>`
 
-Runs a pass and prints its summary; the report goes to `.review/<branch>.json` (format in
-[docs/REVIEW.md](docs/REVIEW.md)).
+Runs a pass and prints its summary; the report goes to `<state>/<branch>.json` (format in
+[docs/REVIEW.md](docs/REVIEW.md)). Nothing is written to the repo: `<state>` is
+`$XDG_CACHE_HOME/lens/state/<repo>-<hash>` (`~/.cache` without it), one folder per checkout.
+
+**Under the review protocol.** This is how lens is meant to run: the task board runs
+`lens review` before a task's PR, with `TASKBOARD_RESULT` and the other `TASKBOARD_*` variables
+set. lens then reviews the worktree against `TASKBOARD_BASE`, checks intent against
+`TASKBOARD_INTENT`, keeps its state in `TASKBOARD_STATE_DIR`, fixes nothing, writes the result
+JSON to `TASKBOARD_RESULT` and exits 0. From the second round, `TASKBOARD_PREVIOUS` holds the last
+round's findings with how triage settled each: only the delta is reviewed, findings marked `fix`
+are verified again, and ones dismissed or backlogged aren't raised again. Finding ids stay the
+same from round to round. A review a reviewer failed on, or one that can't run (the usage gate),
+exits non-zero without a result, which the board counts as a reviewer error. The details are in
+[docs/REVIEW.md](docs/REVIEW.md).
 
 **What runs.** The local pass runs `correctness` (Sonnet) always, plus `testing` and, with a task
 or `--intent`, `intent-alignment` (Sonnet) when the change is over `small_lines`. A change that
@@ -68,7 +80,7 @@ failed on doesn't count, so the next pass reviews everything; `--full` does too.
 - Only the tools the role needs: reviewers and verifiers read files and run read-only git
   commands (`--permission-mode dontAsk`), the judge only reads, the fixer edits and runs tests.
 
-Each agent's reply is saved in `.review/<branch>/agents/`, and the report records `agents` and
+Each agent's reply is saved in `<state>/<branch>/agents/`, and the report records `agents` and
 `costUsd`.
 
 ```toml
@@ -160,7 +172,8 @@ daily_budget_usd = 20.0 # once today's sweeps spent this, wait for the next swee
 ## `lens cost [--since 1d|<date>] [--root <dir>]`
 
 What reviews spent. lens's `claude -p` agents never show in session transcripts, so this adds up
-the reports under `<root>/**/.review/` (default `~/Development`): `costUsd`, agents and findings
+the reports in lens's state folders and any an older lens left under `<root>/**/.review/`
+(default `~/Development`): `costUsd`, agents and findings
 per repo and per day, plus cache creation/read tokens when the reports carry them. `--since`
 takes a span (`1d`) or a date (`2026-10-19`). Archived earlier passes (`prev/`) are left out
 unless you pass `--with-prev`.
@@ -200,7 +213,7 @@ fix, and asks a Haiku judge after every failed re-review whether to try again or
 confirmed.
 
 ```sh
-lens fix start   --report .review/feat/x.json --finding F1   # prints the next step
+lens fix start   --report <state>/feat/x.json --finding F1   # prints the next step
 lens fix diff    --ledger <ledger>                            # the attempt in progress
 lens fix record  --ledger <ledger> --fixer <reply> --review <re-review>
 lens fix judge   --ledger <ledger> --decision <judge reply>
