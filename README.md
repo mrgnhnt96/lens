@@ -196,13 +196,13 @@ Which PRs `lens review --pr` reviews, and who posts, are set in `.lens.toml`:
 
 ```toml
 [pr]
-sample = 0.5                      # the share of PRs reviewed, 0 to 1 (default 0.5)
+sample = 0.5                      # the share of PRs reviewed, 0 to 1 (default 1, every PR)
 post_as = "bot"                   # "owner" (default): whoever `gh` is logged in as
 bot_token_env = "LENS_BOT_TOKEN"  # the env var holding the bot's token (this is the default)
 ```
 
 `sample` picks PRs by a hash of the PR number, so a rerun on the same PR makes the same choice. A
-PR outside the sample runs nothing and prints so; `sample = 1` reviews every PR.
+PR outside the sample runs nothing and prints so; `sample = 0.5` reviews about half.
 
 With `post_as = "bot"`, `lens pr` fails rather than post as the owner when the variable is unset.
 

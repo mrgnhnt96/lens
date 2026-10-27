@@ -150,7 +150,7 @@ impl PrConfig {
     pub const DEFAULT_BOT_TOKEN_ENV: &'static str = "LENS_BOT_TOKEN";
 
     fn default_sample() -> f64 {
-        0.5
+        1.0
     }
 
     /// Whether PR `number` is in the sample.
@@ -225,17 +225,21 @@ mod tests {
     }
 
     #[test]
-    fn pr_samples_half_by_default_and_the_same_prs_each_time() {
+    fn pr_samples_every_pr_by_default() {
         let c: Config = toml::from_str("").unwrap();
-        assert_eq!(c.pr.sample, 0.5);
+        assert_eq!(c.pr.sample, 1.0);
+        assert!((1..=1000).all(|n| c.pr.samples(n)));
+    }
+
+    #[test]
+    fn pr_samples_a_share_and_the_same_prs_each_time() {
+        let c: Config = toml::from_str("[pr]\nsample = 0.5\n").unwrap();
         let picked: Vec<u64> = (1..=1000).filter(|&n| c.pr.samples(n)).collect();
         assert!((450..=550).contains(&picked.len()), "{}", picked.len());
         assert_eq!(
             picked,
             (1..=1000).filter(|&n| c.pr.samples(n)).collect::<Vec<_>>()
         );
-        let all: Config = toml::from_str("[pr]\nsample = 1.0\n").unwrap();
-        assert!((1..=1000).all(|n| all.pr.samples(n)));
         let none: Config = toml::from_str("[pr]\nsample = 0\n").unwrap();
         assert!((1..=1000).all(|n| !none.pr.samples(n)));
     }
