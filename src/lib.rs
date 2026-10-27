@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod assets;
+pub mod backoff;
 pub mod config;
 pub mod cost;
 pub mod diff;

@@ -20,6 +20,51 @@ pub struct Config {
     pub floor: FloorConfig,
     #[serde(default)]
     pub sweep: SweepConfig,
+    #[serde(default)]
+    pub backoff: BackoffConfig,
+}
+
+/// `[backoff]`: lens reviewing less as the plan's usage windows fill. Off unless a window's
+/// table sets a limit.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackoffConfig {
+    #[serde(default)]
+    pub five_hour: WindowBackoff,
+    #[serde(default)]
+    pub seven_day: WindowBackoff,
+}
+
+/// One window's limits, each a share of the window from 0 to 1.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowBackoff {
+    /// From this much used, a review runs the correctness reviewer only.
+    pub lighter_at: Option<f64>,
+    /// From this much used, lens starts no review until the window resets.
+    pub pause_at: Option<f64>,
+    /// When the window is used this much ahead of an even pace through it, `lens review --pr`
+    /// reviews only `sample` of the PRs it would.
+    pub ahead_by: Option<f64>,
+    /// The share of PRs reviewed while `ahead_by` holds. Defaults to half.
+    pub sample: Option<f64>,
+}
+
+impl WindowBackoff {
+    const DEFAULT_SAMPLE: f64 = 0.5;
+
+    pub fn sample(&self) -> f64 {
+        self.sample.unwrap_or(Self::DEFAULT_SAMPLE)
+    }
+
+    fn limits(&self) -> [(&'static str, Option<f64>); 4] {
+        [
+            ("lighter_at", self.lighter_at),
+            ("pause_at", self.pause_at),
+            ("ahead_by", self.ahead_by),
+            ("sample", self.sample),
+        ]
+    }
 }
 
 /// `[sweep]`: when `lens sweep` runs and how it splits what it reviews.
@@ -155,12 +200,7 @@ impl PrConfig {
 
     /// Whether PR `number` is in the sample.
     pub fn samples(&self, number: u64) -> bool {
-        // splitmix64: spreads consecutive PR numbers evenly over the range.
-        let mut z = number.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        (z as f64) / (u64::MAX as f64) < self.sample
+        in_share(number, self.sample)
     }
 
     pub fn bot_token_env(&self) -> &str {
@@ -168,6 +208,17 @@ impl PrConfig {
             .as_deref()
             .unwrap_or(Self::DEFAULT_BOT_TOKEN_ENV)
     }
+}
+
+/// Whether PR `number` falls in the first `share` of PRs. Which ones is a hash of the number, so
+/// a rerun makes the same choice, and a smaller share picks from those a larger one does.
+pub fn in_share(number: u64, share: f64) -> bool {
+    // splitmix64: spreads consecutive PR numbers evenly over the range.
+    let mut z = number.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    (z as f64) / (u64::MAX as f64) < share
 }
 
 /// Reads `<root>/.lens.toml`; a repo without one gets the defaults.
@@ -186,6 +237,19 @@ pub fn load(root: &Path) -> Result<Config> {
             path.display(),
             cfg.pr.sample
         );
+    }
+    for (window, limits) in [
+        ("five_hour", &cfg.backoff.five_hour),
+        ("seven_day", &cfg.backoff.seven_day),
+    ] {
+        for (key, value) in limits.limits() {
+            if let Some(x) = value.filter(|x| !(0.0..=1.0).contains(x)) {
+                anyhow::bail!(
+                    "{}: [backoff.{window}] {key} is {x}, it must be from 0 to 1",
+                    path.display()
+                );
+            }
+        }
     }
     Ok(cfg)
 }
@@ -250,6 +314,45 @@ mod tests {
         std::fs::write(dir.path().join(FILE), "[pr]\nsample = 1.5\n").unwrap();
         let e = load(dir.path()).unwrap_err().to_string();
         assert!(e.contains("[pr] sample is 1.5"), "{e}");
+    }
+
+    #[test]
+    fn backoff_is_off_by_default() {
+        let c: Config = toml::from_str("").unwrap();
+        for w in [&c.backoff.five_hour, &c.backoff.seven_day] {
+            assert_eq!((w.lighter_at, w.pause_at, w.ahead_by), (None, None, None));
+            assert_eq!(w.sample(), 0.5);
+        }
+    }
+
+    #[test]
+    fn backoff_reads_each_window_and_rejects_a_limit_outside_0_to_1() {
+        let c: Config = toml::from_str(
+            "[backoff.five_hour]\nlighter_at = 0.7\npause_at = 0.85\n[backoff.seven_day]\nahead_by = 0.1\nsample = 0.25\n",
+        )
+        .unwrap();
+        assert_eq!(c.backoff.five_hour.lighter_at, Some(0.7));
+        assert_eq!(c.backoff.five_hour.pause_at, Some(0.85));
+        assert_eq!(c.backoff.seven_day.ahead_by, Some(0.1));
+        assert_eq!(c.backoff.seven_day.sample(), 0.25);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE),
+            "[backoff.five_hour]\npause_at = 85\n",
+        )
+        .unwrap();
+        let e = load(dir.path()).unwrap_err().to_string();
+        assert!(e.contains("[backoff.five_hour] pause_at is 85"), "{e}");
+        assert!(toml::from_str::<Config>("[backoff.five_hour]\npause = 0.8\n").is_err());
+    }
+
+    #[test]
+    fn a_smaller_share_picks_from_a_larger_ones_prs() {
+        let half: Vec<u64> = (1..=1000).filter(|&n| in_share(n, 0.5)).collect();
+        let quarter: Vec<u64> = (1..=1000).filter(|&n| in_share(n, 0.25)).collect();
+        assert!(quarter.iter().all(|n| half.contains(n)));
+        assert!((150..350).contains(&quarter.len()), "{}", quarter.len());
     }
 
     #[test]

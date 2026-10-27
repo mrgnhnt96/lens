@@ -174,14 +174,11 @@ impl Full {
 
     /// E.g. `the plan's five_hour window is full; resumes at 18:30Z`.
     pub fn message(&self, now: u64) -> String {
-        let at = iso(self.resets_at);
-        // The time alone on the same day, the date too on another.
-        let at = if at[..10] == iso(now)[..10] {
-            format!("{}Z", &at[11..16])
-        } else {
-            format!("{}Z", &at[..16])
-        };
-        format!("the plan's {} window is full; resumes at {at}", self.window)
+        format!(
+            "the plan's {} window is full; resumes at {}",
+            self.window,
+            clock(self.resets_at, now)
+        )
     }
 }
 
@@ -568,6 +565,16 @@ fn refused(spec: &Spec, full: Full) -> Outcome {
         error: Some(full.message(now_secs())),
         full: Some(full),
         ..Outcome::default()
+    }
+}
+
+/// `secs` as `18:30Z` on the same day as `now`, else `2026-10-28T18:30Z`.
+pub fn clock(secs: u64, now: u64) -> String {
+    let at = iso(secs);
+    if at[..10] == iso(now)[..10] {
+        format!("{}Z", &at[11..16])
+    } else {
+        format!("{}Z", &at[..16])
     }
 }
 

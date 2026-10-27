@@ -22,6 +22,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::agent::{now_secs, Access, Gate};
+use crate::backoff;
 use crate::config::{self, SweepConfig};
 use crate::diff::git;
 use crate::review::{self, Finding, Pass, LEAD};
@@ -106,6 +107,15 @@ pub fn run(opts: Options) -> Result<String> {
             full.message(now_secs())
         ));
     }
+    let backoff = backoff::check(&cfg.backoff, &root.to_string_lossy(), now_secs());
+    if backoff.lifted {
+        eprintln!("lens sweep: {}", backoff::LIFTED);
+    }
+    if let Some((why, _)) = &backoff.pause {
+        return Ok(format!(
+            "lens sweep: paused: {why}. {commits} commit(s), {total} changed line(s) wait for the next sweep."
+        ));
+    }
 
     fs::create_dir_all(&review_dir)?;
     if !review_dir.join(".gitignore").exists() {
@@ -142,6 +152,7 @@ pub fn run(opts: Options) -> Result<String> {
         report_path.clone(),
         prepared,
     )?;
+    pass.lighter = backoff.lighter;
     let scope = format!(
         "\nThis is a sweep: the {commits} commit(s) pushed to {target} since {}. Raise only problems these commits caused; what was there before them is out of scope.\n",
         short(&start)
@@ -246,10 +257,12 @@ pub fn run(opts: Options) -> Result<String> {
                 format!(" Why: {}", area.why)
             }
         );
-        for plan in review::plan_pr(&area_profiles, &area.files)
+        let mut plans: Vec<_> = review::plan_pr(&area_profiles, &area.files)
             .into_iter()
             .filter(|p| p.name != LEAD)
-        {
+            .collect();
+        pass.lighten(&mut plans);
+        for plan in plans {
             if !plan.run {
                 let mut row = plan.json(None);
                 row["area"] = json!(i + 1);

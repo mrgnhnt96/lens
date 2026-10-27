@@ -403,3 +403,30 @@ fn a_failed_reviewer_or_a_dry_run_leaves_the_watermark() {
     );
     assert_eq!(fx.watermark(), start);
 }
+
+#[test]
+fn a_sweep_waits_while_backoff_pauses_reviews() {
+    let fx = Fixture::new();
+    fx.sweep(&[], &[]);
+    let start = fx.watermark();
+    fx.push(&[("src/a.rs", "pub fn a() {}\npub fn parse() {}\n")]);
+    fs::write(
+        fx.repo().join(".lens.toml"),
+        "[backoff.seven_day]\npause_at = 0.9\n",
+    )
+    .unwrap();
+    let usage = fx.dir.path().join("usage");
+    fs::create_dir_all(&usage).unwrap();
+    let reading = json!({ "at": "2026-10-27T12:00:00Z", "window": "seven_day", "utilization": 0.95,
+                          "resetsAt": "2999-01-01T00:00:00Z", "status": "allowed" });
+    fs::write(usage.join("readings.jsonl"), format!("{reading}\n")).unwrap();
+
+    let out = fx.sweep(&["--now"], &[]);
+    assert!(
+        out.contains("lens sweep: paused: backoff: the plan's seven_day window is 95% used (pause_at 90%); resumes at 2999-01-01T00:00Z. 1 commit(s)"),
+        "{out}"
+    );
+    assert!(!fx.dir.path().join("calls.jsonl").exists());
+    assert!(!fx.repo().join(".review").exists());
+    assert_eq!(fx.watermark(), start);
+}

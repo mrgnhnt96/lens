@@ -5,8 +5,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use lens::review::iso;
+use serde_json::{json, Value};
 
 fn git(dir: &Path, args: &[&str]) {
     let ok = Command::new("git")
@@ -150,6 +152,16 @@ impl Fixture {
     }
 
     fn review_with(&self, base: &[&str], args: &[&str], env: &[(&str, &Path)]) -> String {
+        self.review_logged(base, args, env).0
+    }
+
+    /// What `lens review` printed, and what it logged as it went.
+    fn review_logged(
+        &self,
+        base: &[&str],
+        args: &[&str],
+        env: &[(&str, &Path)],
+    ) -> (String, String) {
         let out = Command::new(env!("CARGO_BIN_EXE_lens"))
             .arg("review")
             .args(base)
@@ -170,7 +182,10 @@ impl Fixture {
             "lens review: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        String::from_utf8(out.stdout).unwrap()
+        (
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
     }
 
     fn usage(&self) -> PathBuf {
@@ -189,6 +204,19 @@ impl Fixture {
     fn report(&self) -> Value {
         serde_json::from_str(&fs::read_to_string(self.repo().join(".review/feature.json")).unwrap())
             .unwrap()
+    }
+
+    /// Makes the usage log hold one reading: `window` is `utilization` used and resets
+    /// `resets_in` seconds from now.
+    fn read_window(&self, window: &str, utilization: f64, resets_in: u64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let line = json!({ "at": iso(now), "window": window, "utilization": utilization,
+                           "resetsAt": iso(now + resets_in), "status": "allowed" });
+        fs::create_dir_all(self.usage()).unwrap();
+        fs::write(self.usage().join("readings.jsonl"), format!("{line}\n")).unwrap();
     }
 
     /// Every agent started so far, and clears the log.
@@ -639,4 +667,79 @@ fn a_pr_outside_the_sample_runs_nothing() {
     );
     assert!(fx.calls().is_empty());
     assert!(!d.join(".review/pr-7.json").exists());
+}
+
+#[test]
+fn backoff_pauses_reviews_while_a_window_is_past_its_limit_and_says_when_it_lifts() {
+    let fx = Fixture::new(60);
+    write(
+        &fx.repo(),
+        ".lens.toml",
+        "[backoff.five_hour]\npause_at = 0.85\n",
+    );
+    fx.read_window("five_hour", 0.9, 3600);
+    let out = fx.review(&["--no-fix"]);
+    assert!(
+        out.contains("lens: paused: backoff: the plan's five_hour window is 90% used (pause_at 85%); resumes at "),
+        "{out}"
+    );
+    assert!(fx.calls().is_empty());
+    assert!(!fx.repo().join(".review/feature.json").exists());
+
+    fx.read_window("five_hour", 0.2, 3600);
+    let (_, log) = fx.review_logged(&["main"], &["--no-fix"], &[]);
+    assert!(log.contains("lens: backoff lifted: "), "{log}");
+    assert!(!fx.calls().is_empty());
+}
+
+#[test]
+fn backoff_lighter_at_runs_the_correctness_reviewer_only() {
+    let fx = Fixture::new(60);
+    write(
+        &fx.repo(),
+        ".lens.toml",
+        "[backoff.five_hour]\nlighter_at = 0.7\n",
+    );
+    fx.read_window("five_hour", 0.75, 3600);
+    let (_, log) = fx.review_logged(&["main"], &["--no-fix"], &[]);
+    assert!(
+        log.contains("lens: backoff: the plan's five_hour window is 75% used (lighter_at 70%); running correctness only, skipping testing"),
+        "{log}"
+    );
+    let reviewers: Vec<Value> = fx
+        .calls()
+        .into_iter()
+        .filter(|c| c["role"] == "reviewer")
+        .collect();
+    assert_eq!(reviewers.len(), 1);
+    let report = fx.report();
+    let testing = report["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "testing")
+        .unwrap();
+    assert_eq!(
+        (&testing["ran"], &testing["reason"]),
+        (&json!(false), &json!("backoff"))
+    );
+}
+
+#[test]
+fn backoff_ahead_of_pace_skips_prs_outside_the_smaller_share() {
+    let fx = Fixture::new(60);
+    write(
+        &fx.repo(),
+        ".lens.toml",
+        "[backoff.seven_day]\nahead_by = 0.1\nsample = 0\n",
+    );
+    // A day into the week with 60% used: 46 points ahead of an even pace.
+    fx.read_window("seven_day", 0.6, 6 * 86400);
+    // No gh and no origin: a skipped PR needs neither.
+    let out = fx.review_with(&[], &["--pr", "7"], &[]);
+    assert!(
+        out.contains("lens: PR #7 skipped: backoff: the plan's seven_day window is 60% used, 46 points ahead of an even pace (ahead_by 10%), so lens reviews 0% of PRs"),
+        "{out}"
+    );
+    assert!(fx.calls().is_empty());
 }
