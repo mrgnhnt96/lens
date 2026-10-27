@@ -407,7 +407,7 @@ impl Pass {
             fixer_permission_mode: cfg.review.fixer_permission_mode.clone(),
             log_dir: work.join("agents"),
             cached: Default::default(),
-            usage: usage::Log::new(root.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
+            usage: usage::Log::new(&repo_name(&root)),
             gate: Gate::shared(),
         };
         let mut roles = HashMap::new();
@@ -778,6 +778,20 @@ fn prepare(assets: &Path, root: &Path, opts: &Options) -> Result<Value> {
 
 /// The tree an earlier report reviewed: its last fix attempt's, else the one it recorded, else
 /// `head`'s when the tree was clean.
+/// The name usage rows are filed under: the main repository's folder, so a review run in a
+/// worktree slot counts toward its repo. Falls back to the folder name outside a git repo.
+fn repo_name(root: &Path) -> String {
+    let named = |p: &Path| p.file_name().and_then(|n| n.to_str()).map(str::to_string);
+    git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()
+    .and_then(|out| named(Path::new(out.trim()).parent()?))
+    .or_else(|| named(root))
+    .unwrap_or_else(|| "?".into())
+}
+
 fn reviewed_tree(root: &Path, report: &Value) -> Option<String> {
     let fixed = report["findings"].as_array().and_then(|fs| {
         fs.iter().rev().find_map(|f| {
@@ -1848,6 +1862,47 @@ pub fn iso(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        git(dir, args).unwrap();
+    }
+
+    #[test]
+    fn usage_is_filed_under_the_repo_not_the_worktree_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("taskboard");
+        fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q"]);
+        git_in(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+        );
+        let slot = tmp.path().join("slot-1");
+        git_in(
+            &repo,
+            &["worktree", "add", "-q", slot.to_str().unwrap(), "-b", "w"],
+        );
+        assert_eq!(repo_name(&repo), "taskboard");
+        assert_eq!(repo_name(&slot), "taskboard");
+    }
+
+    #[test]
+    fn usage_name_falls_back_to_the_folder_outside_a_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("plain");
+        fs::create_dir(&dir).unwrap();
+        assert_eq!(repo_name(&dir), "plain");
+    }
 
     fn f(file: &str, line: u64, sev: &str, title: &str, profile: &str) -> Finding {
         Finding {
