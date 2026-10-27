@@ -344,7 +344,8 @@ pub struct Plan {
     /// Findings on lines outside the diff, listed in the review body instead.
     pub in_body: Vec<String>,
     pub skipped: Vec<Skipped>,
-    /// The review to post; `None` when there's nothing new and an earlier run already reviewed.
+    /// The review to post; `None` when there's nothing new to raise: lens comments only on what
+    /// needs changing.
     pub review: Option<Value>,
 }
 
@@ -398,7 +399,7 @@ pub fn plan(report: &Report, earlier: &Earlier, lines: &BTreeMap<String, BTreeSe
         }
     }
     let new = !inline.is_empty() || !in_body.is_empty();
-    let review = (new || earlier.reviews == 0).then(|| {
+    let review = new.then(|| {
         json!({
             "commit_id": report.head,
             "event": "COMMENT",
@@ -702,16 +703,22 @@ diff --git a/gone.rs b/gone.rs
     }
 
     #[test]
-    fn nothing_new_posts_nothing_once_a_review_exists() {
+    fn nothing_new_posts_nothing() {
         let r = report(vec![]);
         assert!(plan(&r, &Earlier::default(), &BTreeMap::new())
             .review
-            .is_some());
+            .is_none());
+        let r = report(vec![finding("F1", "src/a.rs", 2, "major", "breaks")]);
         let earlier = Earlier {
             reviews: 1,
-            findings: vec![],
+            findings: vec![Posted {
+                key: key("src/a.rs", "breaks"),
+                path: Some("src/a.rs".into()),
+                line: Some(2),
+                url: None,
+            }],
         };
-        assert!(plan(&r, &earlier, &BTreeMap::new()).review.is_none());
+        assert!(plan(&r, &earlier, &commentable(PATCH)).review.is_none());
     }
 
     #[test]
