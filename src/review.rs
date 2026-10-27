@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::agent::{self, Access, Outcome, Runner, Spec};
+use crate::agent::{self, Access, Full, Gate, Outcome, Runner, Spec};
 use crate::config::{self, Config};
 use crate::diff::git;
 use crate::fix;
@@ -384,6 +384,8 @@ pub(crate) struct Pass {
     /// One row per agent run, for the report's `agents`.
     agents: Vec<Value>,
     seconds: serde_json::Map<String, Value>,
+    /// The plan's window that turned one of this pass's agents away, if one did.
+    turned_away: Option<Full>,
 }
 
 impl Pass {
@@ -406,6 +408,7 @@ impl Pass {
             log_dir: work.join("agents"),
             cached: Default::default(),
             usage: usage::Log::new(root.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
+            gate: Gate::shared(),
         };
         let mut roles = HashMap::new();
         for role in ROLES {
@@ -427,6 +430,7 @@ impl Pass {
             cost: 0.0,
             agents: Vec::new(),
             seconds: serde_json::Map::new(),
+            turned_away: None,
         })
     }
 
@@ -439,8 +443,22 @@ impl Pass {
             .insert(name.into(), json!(since.elapsed().as_secs()));
     }
 
+    /// Why the pass stops here, once the plan has turned one of its agents away.
+    pub(crate) fn parked(&self) -> Option<String> {
+        self.turned_away
+            .as_ref()
+            .map(|f| f.message(agent::now_secs()))
+    }
+
     pub(crate) fn tally(&mut self, outcomes: &[Outcome]) {
         for o in outcomes {
+            if let Some(full) = &o.full {
+                self.turned_away.get_or_insert_with(|| full.clone());
+                // An agent the plan turned away before it spent anything didn't run.
+                if o.cost_usd == 0.0 {
+                    continue;
+                }
+            }
             self.cost += o.cost_usd;
             let mut row = json!({
                 "label": o.label,
@@ -695,6 +713,10 @@ pub fn run(opts: Options) -> Result<Done> {
             });
         }
     }
+    let now = agent::now_secs();
+    if let Some(full) = Gate::shared().full(now) {
+        return Ok(parked(&full.message(now)));
+    }
     let prepared = prepare(&assets, &root, &opts)?;
     let work = PathBuf::from(
         prepared["work"]
@@ -885,8 +907,12 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
             fix_loop(pass, &prev, None)?;
         }
         let report: Value = serde_json::from_str(&fs::read_to_string(&pass.report_path)?)?;
+        let mut summary = summarize(&report, &pass.report_path, true);
+        if let Some(why) = pass.parked() {
+            summary.push_str(&fix_paused(&why));
+        }
         return Ok(Done {
-            summary: summarize(&report, &pass.report_path, true),
+            summary,
             report: Some(pass.report_path.clone()),
         });
     }
@@ -1005,6 +1031,9 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     let outcomes = pass.runner.run_all(specs);
     pass.tally(&outcomes);
     pass.lap("reviewers", t);
+    if let Some(why) = pass.parked() {
+        return unpark_previous(pass, &prev_dir, &why);
+    }
 
     let mut raised = Vec::new();
     let mut profile_rows = Vec::new();
@@ -1058,6 +1087,9 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
         (keep, drop)
     };
     let (mut confirmed, unverified) = pass.verify(&system, &to_verify, |s| rank(s) <= 1);
+    if let Some(why) = pass.parked() {
+        return unpark_previous(pass, &prev_dir, &why);
+    }
     dropped.extend(unverified);
     confirmed.extend(kept);
 
@@ -1099,10 +1131,39 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
             failed.join(", ")
         ));
     }
+    if let Some(why) = pass.parked() {
+        summary.push_str(&fix_paused(&why));
+    }
     Ok(Done {
         summary,
         report: Some(pass.report_path.clone()),
     })
+}
+
+/// What a pass the plan stopped prints: no report, and when it can run again.
+pub(crate) fn parked(why: &str) -> Done {
+    Done {
+        summary: format!(
+            "lens: paused: {why}. Nothing was reviewed; run lens again then to pick it up."
+        ),
+        report: None,
+    }
+}
+
+fn fix_paused(why: &str) -> String {
+    format!("\nFixing paused: {why}. The next run picks the fix loop up where it stopped.")
+}
+
+/// Parks a local pass the plan stopped part way: the last review stays the current one, so the
+/// next run starts from it as if this one never ran.
+fn unpark_previous(pass: &Pass, prev_dir: &Path, why: &str) -> Result<Done> {
+    if prev_dir.join("report.json").is_file() {
+        fs::rename(prev_dir.join("report.json"), &pass.report_path)?;
+        if prev_dir.join("fix").is_dir() {
+            fs::rename(prev_dir.join("fix"), pass.work.join("fix"))?;
+        }
+    }
+    Ok(parked(why))
 }
 
 /// Ids F1, F2… in report order, blockers first.
@@ -1178,7 +1239,10 @@ pub(crate) fn fix_loop(pass: &mut Pass, report: &Value, only: Option<&str>) -> R
         serde_json::from_str(&fs::read_to_string(pass.work.join("profiles.json"))?)?;
     let guidelines = pass.guidelines()?;
 
-    for b in blockers {
+    'blockers: for b in blockers {
+        if pass.parked().is_some() {
+            break;
+        }
         let id = b["id"].as_str().unwrap_or("F1").to_string();
         pass.log(&format!(
             "fixing blocker {id}: {}",
@@ -1223,6 +1287,10 @@ pub(crate) fn fix_loop(pass: &mut Pass, report: &Value, only: Option<&str>) -> R
                     );
                     let o = pass.runner.run(spec);
                     pass.tally(std::slice::from_ref(&o));
+                    // A fixer the plan cut off isn't an attempt; the next run tries again.
+                    if pass.parked().is_some() {
+                        break 'blockers;
+                    }
                     let fixer = fix::parse_reply(&o.text)
                         .unwrap_or_else(|_| json!({ "summary": "(the fixer's reply couldn't be read)", "error": o.error }));
                     let pending = fix::pending_diff(&step.ledger)?;
@@ -1234,6 +1302,9 @@ pub(crate) fn fix_loop(pass: &mut Pass, report: &Value, only: Option<&str>) -> R
                     fs::create_dir_all(patch.parent().unwrap())?;
                     fs::write(&patch, &pending)?;
                     let review = rereview(pass, &system, &profiles, &finding, &id, &patch)?;
+                    if pass.parked().is_some() {
+                        break 'blockers;
+                    }
                     step = fix::record(&step.ledger, Some(fixer), Some(review))?;
                 }
                 fix::Next::Judge => {
@@ -1251,6 +1322,9 @@ pub(crate) fn fix_loop(pass: &mut Pass, report: &Value, only: Option<&str>) -> R
                         );
                         let o = pass.runner.run(spec);
                         pass.tally(std::slice::from_ref(&o));
+                        if pass.parked().is_some() {
+                            break 'blockers;
+                        }
                         if let Some(d) = fix::parse_reply(&o.text)
                             .ok()
                             .and_then(|v| serde_json::from_value::<fix::Decision>(v).ok())
@@ -1420,6 +1494,9 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         )?;
     }
     pass.lap("lead", t);
+    if let Some(why) = pass.parked() {
+        return Ok(parked(&why));
+    }
 
     let mut runs: Vec<(String, Plan, String)> = Vec::new();
     for plan in plans.iter().filter(|p| p.name != LEAD) {
@@ -1474,6 +1551,9 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
     let outcomes = pass.runner.run_all(specs);
     pass.tally(&outcomes);
     pass.lap("reviewers", t);
+    if let Some(why) = pass.parked() {
+        return Ok(parked(&why));
+    }
     for ((name, plan, _), o) in runs.iter().zip(&outcomes) {
         let mut row = plan.json(None);
         row["name"] = json!(name);
@@ -1501,6 +1581,9 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
     }
 
     let (confirmed, dropped) = pass.verify(&system, &merge(raised), |_| true);
+    if let Some(why) = pass.parked() {
+        return Ok(parked(&why));
+    }
     let pr_info: Value = serde_json::from_str(&fs::read_to_string(pass.work.join("pr.json"))?)
         .unwrap_or(Value::Null);
     let mut report = json!({

@@ -7,6 +7,9 @@
 //! through the fix loop in a worktree on `lens/sweep-<stamp>`, one commit per fix, and the branch
 //! is opened as one PR whose body is the digest. The watermark moves only after a pass no
 //! reviewer failed.
+//!
+//! When the plan turns an agent away, the sweep stops before writing a report: it doesn't count
+//! as a sweep, and the watermark stays for the next one after the window resets.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -18,7 +21,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::agent::Access;
+use crate::agent::{Access, Gate};
 use crate::config::{self, SweepConfig};
 use crate::diff::git;
 use crate::review::{self, Finding, Pass, LEAD};
@@ -94,6 +97,14 @@ pub fn run(opts: Options) -> Result<String> {
                 "lens: sweep deferred: {why}. {commits} commit(s), {total} changed line(s) wait for the next one (--now runs it anyway)."
             ));
         }
+    }
+
+    // `--now` doesn't run it anyway: the plan would only turn the agents away.
+    if let Some(full) = Gate::shared().full(now_secs()) {
+        return Ok(format!(
+            "lens sweep: paused: {}. {commits} commit(s), {total} changed line(s) wait for the next sweep.",
+            full.message(now_secs())
+        ));
     }
 
     fs::create_dir_all(&review_dir)?;
@@ -192,6 +203,9 @@ pub fn run(opts: Options) -> Result<String> {
         }
     }
     pass.lap("lead", t);
+    if let Some(why) = pass.parked() {
+        return Ok(park(tree, &work, &why));
+    }
 
     let (areas, doc_areas): (Vec<Area>, Vec<Area>) =
         split_areas(&changed, &proposed, cfg.sweep.area_lines)
@@ -265,6 +279,9 @@ pub fn run(opts: Options) -> Result<String> {
     let outcomes = pass.runner.run_all(specs);
     pass.tally(&outcomes);
     pass.lap("reviewers", t);
+    if let Some(why) = pass.parked() {
+        return Ok(park(tree, &work, &why));
+    }
     for ((i, plan), o) in runs.iter().zip(&outcomes) {
         let mut row = plan.json(None);
         row["area"] = json!(i + 1);
@@ -346,6 +363,9 @@ pub fn run(opts: Options) -> Result<String> {
     pass.work = work.clone();
     pass.runner.log_dir = work.join("agents");
     pass.lap("verify", t);
+    if let Some(why) = pass.parked() {
+        return Ok(park(tree, &work, &why));
+    }
 
     let mut report = json!({
         "version": 1,
@@ -377,6 +397,8 @@ pub fn run(opts: Options) -> Result<String> {
 
     // One fix at a time, each committed on the sweep's branch or thrown away.
     let mut fixed: BTreeMap<String, String> = BTreeMap::new();
+    // The review stands once written; blockers the plan left no room to fix stay open in it.
+    let mut unfixed: Vec<String> = Vec::new();
     if !opts.dry_run {
         let blockers: Vec<(String, usize)> = report["findings"]
             .as_array()
@@ -391,6 +413,10 @@ pub fn run(opts: Options) -> Result<String> {
             })
             .collect();
         for (id, area) in blockers {
+            if pass.parked().is_some() {
+                unfixed.push(id);
+                continue;
+            }
             let dir = work.join(format!("area-{area}"));
             pass.work = dir.clone();
             pass.runner.log_dir = dir.join("agents");
@@ -406,6 +432,12 @@ pub fn run(opts: Options) -> Result<String> {
                 .find(|f| f["id"] == id.as_str())
                 .cloned()
                 .unwrap_or(Value::Null);
+            if pass.parked().is_some() && !ledger.as_ref().is_ok_and(|l| l["status"] == "resolved")
+            {
+                tree.reset();
+                unfixed.push(id);
+                continue;
+            }
             match ledger {
                 Ok(l) if l["status"] == "resolved" => {
                     match commit_fix(&tree.path, &stamp, &id, &finding, &l) {
@@ -485,6 +517,12 @@ pub fn run(opts: Options) -> Result<String> {
         report_path.display(),
         digest_path.display(),
     );
+    if let (Some(why), false) = (pass.parked(), unfixed.is_empty()) {
+        out.push_str(&format!(
+            "\nFixing paused: {why}. Left open: {}.",
+            unfixed.join(", ")
+        ));
+    }
     if moved {
         out.push_str(&format!(
             "\nWatermark: {WATERMARK} moved to {}.",
@@ -498,6 +536,14 @@ pub fn run(opts: Options) -> Result<String> {
         ));
     }
     Ok(out)
+}
+
+/// Stops a sweep the plan turned away part way: no report, so it isn't counted as a sweep, and
+/// the watermark stays for the next one.
+fn park(tree: Tree, work: &Path, why: &str) -> String {
+    drop(tree);
+    let _ = fs::remove_dir_all(work);
+    format!("lens sweep: paused: {why}. Nothing was reported and the watermark stays; the next sweep after then reviews this range.")
 }
 
 /// The sweep's worktree, removed when the sweep ends; its branch too unless it got commits.

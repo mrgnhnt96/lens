@@ -5,6 +5,9 @@
 //! with the same model and tools then send the same cached prefix, so the first one's request
 //! caches it and the rest read it at a tenth of the price: a batch starts one agent per (model,
 //! tools) group and holds the rest of that group until its first response.
+//!
+//! When the plan turns an agent away (a `rate_limit_event` whose status is `rejected`), no agent
+//! starts again until that window resets, in this lens or any other: see [`Gate`].
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -15,9 +18,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::review::iso_now;
+use crate::review::{iso, iso_now};
 use crate::usage;
 
 /// What an agent may do.
@@ -67,6 +71,27 @@ pub struct Outcome {
     pub cache_read: u64,
     /// Why the run failed (the process died, timed out or reported an error).
     pub error: Option<String>,
+    /// The plan's window that turned the agent away, or kept it from starting.
+    pub full: Option<Full>,
+}
+
+/// A window of the plan that turned an agent away, and when it takes requests again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Full {
+    /// `five_hour` or `seven_day`.
+    pub window: String,
+    /// Seconds since the epoch.
+    pub resets_at: u64,
+}
+
+/// Whether the plan takes new agents. Once an agent's reading is rejected, no agent starts until
+/// that window resets: not on any runner cloned from this one, and not in another lens, which reads
+/// the hold from `full.json` beside the usage logs.
+#[derive(Debug, Clone, Default)]
+pub struct Gate {
+    held: Arc<Mutex<Option<Full>>>,
+    file: Option<PathBuf>,
 }
 
 /// How agents run: the `claude` program, limits and the fixer's permission mode.
@@ -82,10 +107,14 @@ pub struct Runner {
     pub cached: Arc<Mutex<HashMap<String, Instant>>>,
     /// Where each agent's tokens and the plan's window readings are recorded, if anywhere.
     pub usage: Option<usage::Log>,
+    pub gate: Gate,
 }
 
 /// How long after a group's last request its prefix counts as cached: under the 5-minute TTL.
 const CACHED_FOR: Duration = Duration::from_secs(4 * 60);
+
+/// How long to hold agents when a rejected reading gives no reset time still ahead.
+const HOLD_WITHOUT_RESET: u64 = 5 * 60;
 
 const READ_ONLY_BASH: &[&str] = &[
     "Bash(git log:*)",
@@ -102,6 +131,105 @@ enum Event {
     /// The agent's first response is back, so its group's prefix is cached.
     Warm(usize),
     Done(usize, Outcome),
+}
+
+impl Full {
+    /// The window a `rate_limit_event` says is full, or `None` when the plan let the request
+    /// through.
+    pub fn of(event: &Value, now: u64) -> Option<Full> {
+        let info = &event["rate_limit_info"];
+        // The request's own status decides; a full window under an allowed request (extra usage)
+        // still runs agents.
+        if info["status"].as_str().is_some_and(|s| s != "rejected") {
+            return None;
+        }
+        let window = info["unifiedWindows"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, w)| w["status"] == "rejected")
+            .map(|(name, w)| Full {
+                window: name.clone(),
+                resets_at: w["resetsAt"].as_u64().unwrap_or(0),
+            })
+            .max_by_key(|f| f.resets_at);
+        let full = window.or_else(|| {
+            (info["status"] == "rejected").then(|| Full {
+                window: info["rateLimitType"]
+                    .as_str()
+                    .unwrap_or("usage")
+                    .to_string(),
+                resets_at: info["resetsAt"].as_u64().unwrap_or(0),
+            })
+        })?;
+        Some(Full {
+            resets_at: if full.resets_at > now {
+                full.resets_at
+            } else {
+                now + HOLD_WITHOUT_RESET
+            },
+            ..full
+        })
+    }
+
+    /// E.g. `the plan's five_hour window is full; resumes at 18:30Z`.
+    pub fn message(&self, now: u64) -> String {
+        let at = iso(self.resets_at);
+        // The time alone on the same day, the date too on another.
+        let at = if at[..10] == iso(now)[..10] {
+            format!("{}Z", &at[11..16])
+        } else {
+            format!("{}Z", &at[..16])
+        };
+        format!("the plan's {} window is full; resumes at {at}", self.window)
+    }
+}
+
+impl Gate {
+    pub fn new(file: Option<PathBuf>) -> Gate {
+        Gate {
+            held: Default::default(),
+            file,
+        }
+    }
+
+    /// The gate every lens shares, kept in `full.json` beside the usage logs.
+    pub fn shared() -> Gate {
+        Gate::new(usage::dir().map(|d| d.join("full.json")))
+    }
+
+    /// The window holding agents back at `now`, if any.
+    pub fn full(&self, now: u64) -> Option<Full> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if held.as_ref().is_none_or(|f| f.resets_at <= now) {
+            *held = self
+                .file
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|s| serde_json::from_str(&s).ok());
+        }
+        held.clone().filter(|f| f.resets_at > now)
+    }
+
+    /// Holds new agents until `full`'s window resets, unless a later reset already holds them.
+    pub fn hold(&self, full: Full) {
+        if self
+            .full(now_secs())
+            .is_some_and(|h| h.resets_at >= full.resets_at)
+        {
+            return;
+        }
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = Some(full.clone());
+        let Some(path) = &self.file else { return };
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")));
+        // Written aside and renamed, so another lens never reads half of it.
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        if let Ok(text) = serde_json::to_string(&full) {
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
 }
 
 impl Access {
@@ -189,6 +317,14 @@ impl Runner {
         let (tx, rx) = mpsc::channel();
         let mut running = 0;
         loop {
+            // Once the plan turns an agent away, the rest of the batch doesn't start.
+            if let Some(full) = self.gate.full(now_secs()) {
+                for (i, spec) in queue.iter_mut().enumerate() {
+                    if let Some(spec) = spec.take() {
+                        out[i] = Some(refused(&spec, full.clone()));
+                    }
+                }
+            }
             for i in 0..n {
                 if running >= self.parallel.max(1) {
                     break;
@@ -247,6 +383,9 @@ impl Runner {
     }
 
     fn exec(&self, i: usize, spec: &Spec, tx: &mpsc::Sender<Event>) -> Result<Outcome> {
+        if let Some(full) = self.gate.full(now_secs()) {
+            return Ok(refused(spec, full));
+        }
         let group = group(spec);
         let started_at = iso_now();
         let mut child = Command::new(&self.claude)
@@ -280,6 +419,7 @@ impl Runner {
         });
         let deadline = Instant::now() + self.timeout;
         let mut first_usage: Option<(u64, u64)> = None;
+        let mut turned_away: Option<Full> = None;
         let mut result: Option<Value> = None;
         let mut last_text = String::new();
         loop {
@@ -312,9 +452,16 @@ impl Runner {
                             if let Some(log) = &self.usage {
                                 log.record_readings(&spec.label, &iso_now(), &event);
                             }
+                            if let Some(full) = Full::of(&event, now_secs()) {
+                                self.gate.hold(full.clone());
+                                turned_away = Some(full);
+                            }
                         }
                         Some("result") => {
-                            if let Some(log) = &self.usage {
+                            // A run the plan turned away before it spent anything isn't one.
+                            let spent = event["total_cost_usd"].as_f64().unwrap_or(0.0) > 0.0;
+                            if let (Some(log), true) = (&self.usage, turned_away.is_none() || spent)
+                            {
                                 log.record_result(
                                     &spec.label,
                                     &spec.model,
@@ -335,6 +482,7 @@ impl Runner {
                     return Ok(Outcome {
                         text: last_text,
                         error: Some(format!("timed out after {}s", self.timeout.as_secs())),
+                        full: turned_away,
                         ..usage_outcome(first_usage)
                     });
                 }
@@ -342,6 +490,18 @@ impl Runner {
         }
         let status = child.wait()?;
         let stderr = err_reader.join().unwrap_or_default();
+        if let Some(full) = turned_away {
+            return Ok(Outcome {
+                text: last_text,
+                cost_usd: result
+                    .as_ref()
+                    .and_then(|r| r["total_cost_usd"].as_f64())
+                    .unwrap_or(0.0),
+                error: Some(full.message(now_secs())),
+                full: Some(full),
+                ..usage_outcome(first_usage)
+            });
+        }
         let Some(result) = result else {
             return Ok(Outcome {
                 text: last_text,
@@ -399,6 +559,25 @@ fn group(spec: &Spec) -> String {
     )
 }
 
+/// An agent that didn't start because the plan's `full` window is full.
+fn refused(spec: &Spec, full: Full) -> Outcome {
+    Outcome {
+        label: spec.label.clone(),
+        model: spec.model.clone(),
+        tools: spec.access.tools().to_string(),
+        error: Some(full.message(now_secs())),
+        full: Some(full),
+        ..Outcome::default()
+    }
+}
+
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn usage_outcome(first: Option<(u64, u64)>) -> Outcome {
     let (cache_creation, cache_read) = first.unwrap_or_default();
     Outcome {
@@ -451,6 +630,7 @@ pub fn strip_frontmatter(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn runner() -> Runner {
         Runner {
@@ -461,6 +641,7 @@ mod tests {
             log_dir: "/tmp".into(),
             cached: Default::default(),
             usage: None,
+            gate: Gate::default(),
         }
     }
 
@@ -592,6 +773,203 @@ echo '{{"type":"result","result":"ok"}}'
         assert!(at(&log, "start a2") > at(&log, "first a1"), "{log:?}");
         // Another group doesn't wait for it.
         assert!(at(&log, "start b") < at(&log, "first a1"), "{log:?}");
+    }
+
+    fn limit_event(status: &str, resets_at: u64) -> Value {
+        json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": status,
+                "resetsAt": resets_at,
+                "rateLimitType": "five_hour",
+                "unifiedWindows": {
+                    "five_hour": { "utilization": 1.0, "resetsAt": resets_at, "status": status },
+                    "seven_day": { "utilization": 0.4, "resetsAt": resets_at + 86400, "status": "allowed" },
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn a_rejected_reading_names_the_full_window_and_its_reset() {
+        let now = 1_000_000;
+        assert_eq!(
+            Full::of(&limit_event("rejected", now + 600), now),
+            Some(Full {
+                window: "five_hour".into(),
+                resets_at: now + 600
+            })
+        );
+        assert_eq!(Full::of(&limit_event("allowed", now + 600), now), None);
+        assert_eq!(
+            Full::of(&limit_event("allowed_warning", now + 600), now),
+            None
+        );
+        // A reset already past still holds agents for a while rather than not at all.
+        let late = Full::of(&limit_event("rejected", now - 5), now).unwrap();
+        assert_eq!(late.resets_at, now + HOLD_WITHOUT_RESET);
+    }
+
+    #[test]
+    fn says_when_the_window_resumes() {
+        let now = 1_761_586_920; // 2025-10-27T17:42:00Z
+        let full = Full {
+            window: "five_hour".into(),
+            resets_at: now + 48 * 60,
+        };
+        assert_eq!(
+            full.message(now),
+            "the plan's five_hour window is full; resumes at 18:30Z"
+        );
+        let full = Full {
+            window: "seven_day".into(),
+            resets_at: now + 86400,
+        };
+        assert_eq!(
+            full.message(now),
+            "the plan's seven_day window is full; resumes at 2025-10-28T17:42Z"
+        );
+    }
+
+    #[test]
+    fn a_hold_is_shared_through_its_file_until_the_window_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("full.json");
+        let now = now_secs();
+        let full = Full {
+            window: "five_hour".into(),
+            resets_at: now + 600,
+        };
+        Gate::new(Some(file.clone())).hold(full.clone());
+        // Another lens reads it.
+        let other = Gate::new(Some(file.clone()));
+        assert_eq!(other.full(now), Some(full.clone()));
+        assert_eq!(other.full(now + 599), Some(full.clone()));
+        assert_eq!(other.full(now + 600), None);
+        // An earlier reset doesn't shorten a later one.
+        other.hold(Full {
+            window: "five_hour".into(),
+            resets_at: now + 60,
+        });
+        assert_eq!(Gate::new(Some(file)).full(now), Some(full));
+    }
+
+    /// Runs `specs` (labelled by their prompt) through a fake claude the plan turns away for every
+    /// prompt starting with `r`. Returns the start log, the outcomes and the usage folder.
+    fn turned_away(
+        gate: Gate,
+        resets_at: u64,
+        specs: Vec<Spec>,
+    ) -> (Vec<String>, Vec<Outcome>, tempfile::TempDir) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let claude = dir.path().join("claude");
+        std::fs::write(
+            &claude,
+            format!(
+                r#"#!/bin/sh
+label=$(cat)
+echo "start $label" >> {log}
+case "$label" in
+r*)
+  echo '{rejected}'
+  echo '{{"type":"result","is_error":true,"result":"limit reached","total_cost_usd":0}}'
+  exit 1;;
+esac
+sleep 0.2
+echo '{{"type":"assistant","message":{{"content":[]}}}}'
+echo '{{"type":"result","result":"ok","total_cost_usd":0.01}}'
+"#,
+                log = log.display(),
+                rejected = limit_event("rejected", resets_at),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runner = Runner {
+            claude,
+            log_dir: dir.path().into(),
+            usage: Some(usage::Log {
+                dir: dir.path().join("usage"),
+                repo: "repo".into(),
+            }),
+            gate,
+            ..runner()
+        };
+        let specs = specs
+            .into_iter()
+            .map(|s| Spec {
+                cwd: dir.path().into(),
+                ..s
+            })
+            .collect();
+        let outcomes = runner.run_all(specs);
+        let log = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (log, outcomes, dir)
+    }
+
+    #[test]
+    fn a_rejected_reading_starts_no_more_agents_until_the_window_resets() {
+        let resets_at = now_secs() + 600;
+        let gate = Gate::default();
+        let (log, outcomes, dir) = turned_away(
+            gate.clone(),
+            resets_at,
+            vec![
+                labelled("r1", "sonnet"),
+                labelled("a2", "sonnet"),
+                labelled("a3", "sonnet"),
+            ],
+        );
+        assert_eq!(log, ["start r1"]);
+        let full = Full {
+            window: "five_hour".into(),
+            resets_at,
+        };
+        for o in &outcomes {
+            assert_eq!(o.full.as_ref(), Some(&full), "{o:?}");
+            assert_eq!(o.error.as_deref(), Some(full.message(now_secs()).as_str()));
+        }
+        // The reading is kept; the refused run isn't a row of spend.
+        let usage = dir.path().join("usage");
+        assert!(std::fs::read_to_string(usage.join("readings.jsonl"))
+            .unwrap()
+            .contains("rejected"));
+        assert!(!usage.join("agents.jsonl").exists());
+
+        // A later batch on the same gate starts nothing.
+        let (log, outcomes, _dir) = turned_away(gate, resets_at, vec![labelled("a4", "opus")]);
+        assert!(log.is_empty(), "{log:?}");
+        assert!(outcomes[0].full.is_some());
+    }
+
+    #[test]
+    fn agents_start_again_once_the_window_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("full.json");
+        std::fs::write(
+            &file,
+            serde_json::to_string(&Full {
+                window: "five_hour".into(),
+                resets_at: now_secs() - 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let (log, outcomes, _dir) = turned_away(
+            Gate::new(Some(file)),
+            now_secs() + 600,
+            vec![labelled("a1", "sonnet"), labelled("a2", "sonnet")],
+        );
+        assert_eq!(log.len(), 2, "{log:?}");
+        for o in outcomes {
+            assert_eq!((o.error, o.full), (None, None));
+        }
     }
 
     #[test]
