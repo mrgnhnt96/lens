@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use lens::{config, cost, diff, fix, map, pr, profile, review, select, sweep};
+use lens::{config, cost, diff, fix, map, pr, profile, review, select, sweep, usage};
 
 /// Agent code review for Claude Code.
 #[derive(Parser)]
@@ -105,6 +105,14 @@ enum Command {
         /// Count the `prev/` archives of earlier passes too.
         #[arg(long)]
         with_prev: bool,
+    },
+    /// What lens's agents took of the Claude plan, from the usage log (~/.lens/usage, or
+    /// $LENS_USAGE_DIR): spend per repo, role and model, how far the 5-hour and 7-day windows
+    /// moved, and the least lens work 1% of each window holds.
+    Usage {
+        /// Only usage since a span like 1d, or a date like 2026-10-19.
+        #[arg(long)]
+        since: Option<String>,
     },
     /// The PR pass's GitHub side, through `gh` (posting as .lens.toml's `[pr] post_as`).
     Pr {
@@ -268,6 +276,14 @@ fn main() -> Result<()> {
                     .join("Development"),
             };
             println!("{}", cost::run(&root, since.as_deref(), with_prev)?);
+        }
+        Command::Usage { since } => {
+            let dir = usage::dir().context("HOME is not set")?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            println!("{}", usage::run(&dir, since.as_deref(), now)?);
         }
         Command::Sweep {
             since,

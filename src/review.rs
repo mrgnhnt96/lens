@@ -78,7 +78,7 @@ pub fn risky_files<'a>(globs: &[String], files: &'a [String]) -> Result<Vec<&'a 
 
 const LOCAL_PROFILES: &[&str] = &["correctness", "testing", "intent-alignment"];
 pub(crate) const LEAD: &str = "impact-assessment";
-const ROLES: &[&str] = &["reviewer", "verifier", "fixer", "escalator"];
+pub(crate) const ROLES: &[&str] = &["reviewer", "verifier", "fixer", "escalator"];
 /// Above this many bytes the diff isn't put in the prompt; agents read the file instead.
 const INLINE_DIFF_MAX: usize = 150_000;
 const INLINE_MAP_MAX: usize = 60_000;
