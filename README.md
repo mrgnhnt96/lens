@@ -214,9 +214,13 @@ The ledger format is in [docs/REVIEW.md](docs/REVIEW.md).
 
 The PR pass's GitHub side, through `gh`. `earlier` lists the lens findings already posted on the
 PR. `post` posts a report as one review at the reviewed commit: an inline comment per new finding
-on a line the diff shows (minor and nit collapsed), the rest in the review's summary. Findings an
-earlier run posted (same finding, or the same file within 3 lines) are skipped, and a run with
-nothing new to raise, a clean first review included, posts nothing. `--dry-run` prints the payload instead.
+on a line the diff shows (minor and nit collapsed), the rest in the review's summary. A review is
+never just comments: it requests changes while a blocker or major is unfixed, and approves
+otherwise, minors and nits included. A clean review approves with an empty body. Findings an
+earlier run posted (same finding, or the same file within 3 lines) are skipped, and a rerun with
+nothing new and the same verdict posts nothing. GitHub doesn't let a PR's author approve or
+request changes on it, so posting as the author falls back to a plain review with the findings,
+or posts nothing for a clean one. `--dry-run` prints the payload instead.
 
 Which PRs `lens review --pr` reviews, and who posts, are set in `.lens.toml`:
 

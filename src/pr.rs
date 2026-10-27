@@ -1,8 +1,11 @@
 //! The PR pass's GitHub side: reading the comments earlier lens runs left on a PR, and posting a
 //! review's verified findings as one review with inline comments.
 //!
+//! A review is never just comments: it requests changes while a blocker or major is unfixed and
+//! approves otherwise, nits and minors included.
+//!
 //! Every comment lens posts ends in a marker, `<!-- lens:finding key=<key> -->`, and the review
-//! body in `<!-- lens:review head=<sha> -->`. The key is a hash of the file and the normalized
+//! body in `<!-- lens:review head=<sha> verdict=<event> -->`. The key is a hash of the file and the normalized
 //! title, so a later run can tell which findings it already posted.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,6 +68,8 @@ pub struct Finding {
     pub failure_scenario: String,
     #[serde(default)]
     pub how_it_fails: Option<String>,
+    #[serde(default)]
+    pub fix: Option<Value>,
 }
 
 impl Finding {
@@ -74,6 +79,11 @@ impl Finding {
 
     fn collapsed(&self) -> bool {
         matches!(self.severity.as_str(), "minor" | "nit")
+    }
+
+    /// A blocker or major the fix loop hasn't fixed: the PR can't merge with it.
+    fn blocking(&self) -> bool {
+        !self.collapsed() && self.fix.as_ref().is_none_or(|f| f["status"] != "resolved")
     }
 }
 
@@ -94,6 +104,8 @@ pub struct Posted {
 #[serde(rename_all = "camelCase")]
 pub struct Earlier {
     pub reviews: usize,
+    /// The verdict the latest lens review gave, `APPROVE` or `REQUEST_CHANGES`, from its marker.
+    pub verdict: Option<String>,
     pub findings: Vec<Posted>,
 }
 
@@ -206,17 +218,31 @@ impl Gh {
     }
 
     /// Posts `review` (from [`plan`]) on PR `pr` and returns the review's URL.
+    ///
+    /// GitHub won't let anyone approve or request changes on their own PR, so posting as its
+    /// author falls back to a plain review: the findings still land, and an approval with none
+    /// posts nothing.
     pub fn post(&self, pr: u64, review: &Value) -> Result<Option<String>> {
-        let out = self.api(
-            &[
-                "--method",
-                "POST",
-                &format!("repos/{{owner}}/{{repo}}/pulls/{pr}/reviews"),
-                "--input",
-                "-",
-            ],
-            Some(&review.to_string()),
-        )?;
+        let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{pr}/reviews");
+        let send = |review: &Value| {
+            self.api(
+                &["--method", "POST", &endpoint, "--input", "-"],
+                Some(&review.to_string()),
+            )
+        };
+        let out = match send(review) {
+            Err(e) if format!("{e:#}").contains("your own pull request") => {
+                if review["event"] == "APPROVE"
+                    && review["comments"].as_array().is_none_or(Vec::is_empty)
+                {
+                    return Ok(None);
+                }
+                let mut plain = review.clone();
+                plain["event"] = "COMMENT".into();
+                send(&plain)?
+            }
+            out => out?,
+        };
         let v: Value = serde_json::from_str(&out).context("parsing the posted review")?;
         Ok(v["html_url"].as_str().map(str::to_string))
     }
@@ -241,6 +267,7 @@ pub fn earlier_from(comments: &[Value], reviews: &[Value]) -> Earlier {
             continue;
         }
         out.reviews += 1;
+        out.verdict = verdict_in(body);
         for key in keys_in(body) {
             out.findings.push(Posted {
                 key,
@@ -251,6 +278,16 @@ pub fn earlier_from(comments: &[Value], reviews: &[Value]) -> Earlier {
         }
     }
     out
+}
+
+fn verdict_in(body: &str) -> Option<String> {
+    let mark = &body[body.rfind(REVIEW_MARK)?..];
+    let rest = &mark[mark.find(" verdict=")? + " verdict=".len()..];
+    let v: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_uppercase() || *c == '_')
+        .collect();
+    (!v.is_empty()).then_some(v)
 }
 
 fn keys_in(body: &str) -> Vec<String> {
@@ -344,8 +381,10 @@ pub struct Plan {
     /// Findings on lines outside the diff, listed in the review body instead.
     pub in_body: Vec<String>,
     pub skipped: Vec<Skipped>,
-    /// The review to post; `None` when there's nothing new to raise: lens comments only on what
-    /// needs changing.
+    /// `REQUEST_CHANGES` while a blocker or major is unfixed, else `APPROVE`.
+    pub event: &'static str,
+    /// The review to post; `None` when there's nothing new to raise and an earlier lens review
+    /// already gave this verdict.
     pub review: Option<Value>,
 }
 
@@ -399,11 +438,23 @@ pub fn plan(report: &Report, earlier: &Earlier, lines: &BTreeMap<String, BTreeSe
         }
     }
     let new = !inline.is_empty() || !in_body.is_empty();
-    let review = new.then(|| {
+    let event = if report.findings.iter().any(Finding::blocking) {
+        "REQUEST_CHANGES"
+    } else {
+        "APPROVE"
+    };
+    let changed = earlier.verdict.as_deref() != Some(event);
+    let review = (new || changed).then(|| {
+        // An approval with nothing new to raise says nothing: the marker alone renders empty.
+        let body = if new || event == "REQUEST_CHANGES" {
+            review_body(report, &body_findings, skipped.len(), event)
+        } else {
+            review_mark(report, event)
+        };
         json!({
             "commit_id": report.head,
-            "event": "COMMENT",
-            "body": review_body(report, &body_findings, skipped.len()),
+            "event": event,
+            "body": body,
             "comments": comments,
         })
     });
@@ -411,6 +462,7 @@ pub fn plan(report: &Report, earlier: &Earlier, lines: &BTreeMap<String, BTreeSe
         inline,
         in_body,
         skipped,
+        event,
         review,
     }
 }
@@ -469,7 +521,12 @@ fn counts(findings: &[&Finding]) -> String {
     parts.join(", ")
 }
 
-pub fn review_body(report: &Report, outside: &[(&Finding, String)], skipped: usize) -> String {
+pub fn review_body(
+    report: &Report,
+    outside: &[(&Finding, String)],
+    skipped: usize,
+    event: &str,
+) -> String {
     let posted: Vec<&Finding> = report.findings.iter().collect();
     let n = posted.len();
     let mut s = format!(
@@ -548,8 +605,12 @@ pub fn review_body(report: &Report, outside: &[(&Finding, String)], skipped: usi
             report.dropped.len()
         ));
     }
-    s.push_str(&format!("\n\n{REVIEW_MARK} head={} -->", report.head));
+    s.push_str(&format!("\n\n{}", review_mark(report, event)));
     s
+}
+
+fn review_mark(report: &Report, event: &str) -> String {
+    format!("{REVIEW_MARK} head={} verdict={event} -->", report.head)
 }
 
 #[cfg(test)]
@@ -566,6 +627,7 @@ mod tests {
             title: title.into(),
             failure_scenario: "x happens".into(),
             how_it_fails: Some("1. step".into()),
+            fix: None,
         }
     }
 
@@ -632,11 +694,12 @@ diff --git a/gone.rs b/gone.rs
             json!({"path": "src/a.rs", "line": null, "body": "a human comment"}),
         ];
         let reviews = vec![
-            json!({"body": format!("- y {FINDING_MARK}ffff -->\n\n{REVIEW_MARK} head=1 -->"), "html_url": "u2"}),
+            json!({"body": format!("- y {FINDING_MARK}ffff -->\n\n{REVIEW_MARK} head=1 verdict=REQUEST_CHANGES -->"), "html_url": "u2"}),
             json!({"body": format!("someone quoting {FINDING_MARK}eeee -->")}),
         ];
         let e = earlier_from(&comments, &reviews);
         assert_eq!(e.reviews, 1);
+        assert_eq!(e.verdict.as_deref(), Some("REQUEST_CHANGES"));
         let keys: Vec<&str> = e.findings.iter().map(|p| p.key.as_str()).collect();
         assert_eq!(keys, vec![k.as_str(), "ffff"]);
         assert_eq!(e.findings[0].line, Some(3));
@@ -654,7 +717,7 @@ diff --git a/gone.rs b/gone.rs
         assert_eq!(p.in_body, vec!["F2"]);
         let review = p.review.unwrap();
         assert_eq!(review["commit_id"], "abcdef1234");
-        assert_eq!(review["event"], "COMMENT");
+        assert_eq!(review["event"], "REQUEST_CHANGES");
         assert_eq!(review["comments"][0]["line"], 2);
         assert_eq!(review["comments"][0]["side"], "RIGHT");
         let body = review["body"].as_str().unwrap();
@@ -663,7 +726,7 @@ diff --git a/gone.rs b/gone.rs
             "{body}"
         );
         assert!(body.contains(&key("src/a.rs", "far away")));
-        assert!(body.contains("<!-- lens:review head=abcdef1234 -->"));
+        assert!(body.contains("<!-- lens:review head=abcdef1234 verdict=REQUEST_CHANGES -->"));
         let nit = review["comments"][1]["body"].as_str().unwrap();
         assert!(
             nit.starts_with("<details><summary><b>nit</b> · tiny"),
@@ -680,6 +743,7 @@ diff --git a/gone.rs b/gone.rs
         ]);
         let earlier = Earlier {
             reviews: 1,
+            verdict: Some("REQUEST_CHANGES".into()),
             findings: vec![
                 Posted {
                     key: key("src/a.rs", "BREAKS"),
@@ -703,14 +767,71 @@ diff --git a/gone.rs b/gone.rs
     }
 
     #[test]
-    fn nothing_new_posts_nothing() {
-        let r = report(vec![]);
-        assert!(plan(&r, &Earlier::default(), &BTreeMap::new())
+    fn only_nits_and_minors_approve() {
+        let r = report(vec![
+            finding("F1", "src/a.rs", 2, "minor", "edge"),
+            finding("F2", "src/a.rs", 3, "nit", "tiny"),
+        ]);
+        let p = plan(&r, &Earlier::default(), &commentable(PATCH));
+        assert_eq!(p.event, "APPROVE");
+        assert_eq!(p.review.unwrap()["comments"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_blocker_the_fix_loop_fixed_does_not_block() {
+        let mut f = finding("F1", "src/a.rs", 2, "blocker", "breaks");
+        f.fix = Some(json!({"status": "resolved"}));
+        let p = plan(
+            &report(vec![f.clone()]),
+            &Earlier::default(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(p.event, "APPROVE");
+        f.fix = Some(json!({"status": "escalated"}));
+        let p = plan(&report(vec![f]), &Earlier::default(), &BTreeMap::new());
+        assert_eq!(p.event, "REQUEST_CHANGES");
+    }
+
+    #[test]
+    fn a_clean_review_approves_with_an_empty_body() {
+        let review = plan(&report(vec![]), &Earlier::default(), &BTreeMap::new())
+            .review
+            .unwrap();
+        assert_eq!(review["event"], "APPROVE");
+        assert_eq!(
+            review["body"],
+            "<!-- lens:review head=abcdef1234 verdict=APPROVE -->"
+        );
+        assert!(review["comments"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn approves_once_the_blockers_it_requested_changes_for_are_gone() {
+        let earlier = Earlier {
+            reviews: 1,
+            verdict: Some("REQUEST_CHANGES".into()),
+            findings: vec![],
+        };
+        let review = plan(&report(vec![]), &earlier, &BTreeMap::new())
+            .review
+            .unwrap();
+        assert_eq!(review["event"], "APPROVE");
+    }
+
+    #[test]
+    fn nothing_new_posts_nothing_once_the_verdict_stands() {
+        let earlier = Earlier {
+            reviews: 1,
+            verdict: Some("APPROVE".into()),
+            findings: vec![],
+        };
+        assert!(plan(&report(vec![]), &earlier, &BTreeMap::new())
             .review
             .is_none());
         let r = report(vec![finding("F1", "src/a.rs", 2, "major", "breaks")]);
         let earlier = Earlier {
             reviews: 1,
+            verdict: Some("REQUEST_CHANGES".into()),
             findings: vec![Posted {
                 key: key("src/a.rs", "breaks"),
                 path: Some("src/a.rs".into()),

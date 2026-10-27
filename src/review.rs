@@ -1644,18 +1644,27 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
             (Some(review), false) => gh.post(number, review)?,
             _ => None,
         };
+        let verdict = if plan.event == "APPROVE" {
+            "approve"
+        } else {
+            "request changes"
+        };
         Ok(match (url, &plan.review) {
             (Some(url), _) => format!(
-                "Posted: {url} ({} inline, {} in the body; {} already posted)",
+                "Posted ({verdict}): {url} ({} inline, {} in the body; {} already posted)",
                 plan.inline.len(),
                 plan.in_body.len(),
                 plan.skipped.len()
             ),
-            (None, Some(_)) => format!(
-                "Dry run: would post {} inline, {} in the body.",
+            (None, Some(_)) if pass.opts.dry_run => format!(
+                "Dry run: would {verdict}, {} inline, {} in the body.",
                 plan.inline.len(),
                 plan.in_body.len()
             ),
+            (None, Some(_)) => {
+                "Nothing posted: lens would approve, but GitHub won't let a PR's author approve it."
+                    .into()
+            }
             (None, None) => "Nothing new to post.".into(),
         })
     })();
