@@ -21,7 +21,7 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -407,7 +407,7 @@ impl Pass {
             fixer_permission_mode: cfg.review.fixer_permission_mode.clone(),
             log_dir: work.join("agents"),
             cached: Default::default(),
-            usage: usage::Log::new(&repo_name(&root)),
+            usage: usage_log(&root),
             gate: Gate::shared(),
         };
         let mut roles = HashMap::new();
@@ -776,10 +776,15 @@ fn prepare(assets: &Path, root: &Path, opts: &Options) -> Result<Value> {
     serde_json::from_slice(&out.stdout).context("reading the prepare script's summary")
 }
 
-/// The tree an earlier report reviewed: its last fix attempt's, else the one it recorded, else
-/// `head`'s when the tree was clean.
+/// The usage log for a run in `root`, filed under its repo's name.
+fn usage_log(root: &Path) -> Option<usage::Log> {
+    usage::Log::new(&repo_name(root))
+}
+
 /// The name usage rows are filed under: the main repository's folder, so a review run in a
-/// worktree slot counts toward its repo. Falls back to the folder name outside a git repo.
+/// worktree slot counts toward its repo. The git common dir is `<repo>/.git` for a normal
+/// repo, `<repo>.git` for a bare one and `<super>/.git/modules/<repo>` for a submodule; the
+/// last two are named by the dir itself. Falls back to the folder name outside a git repo.
 fn repo_name(root: &Path) -> String {
     let named = |p: &Path| p.file_name().and_then(|n| n.to_str()).map(str::to_string);
     git(
@@ -787,11 +792,19 @@ fn repo_name(root: &Path) -> String {
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
     .ok()
-    .and_then(|out| named(Path::new(out.trim()).parent()?))
+    .and_then(|out| {
+        let common = Path::new(out.trim());
+        match named(common)? {
+            dot_git if dot_git == ".git" => named(common.parent()?),
+            dir => Some(dir.strip_suffix(".git").unwrap_or(&dir).to_string()),
+        }
+    })
     .or_else(|| named(root))
     .unwrap_or_else(|| "?".into())
 }
 
+/// The tree an earlier report reviewed: its last fix attempt's, else the one it recorded, else
+/// `head`'s when the tree was clean.
 fn reviewed_tree(root: &Path, report: &Value) -> Option<String> {
     let fixed = report["findings"].as_array().and_then(|fs| {
         fs.iter().rev().find_map(|f| {
@@ -1830,11 +1843,7 @@ pub fn summarize(report: &Value, path: &Path, fresh: bool) -> String {
 }
 
 pub(crate) fn iso_now() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    iso(secs)
+    iso(agent::now_secs())
 }
 
 /// Seconds since the epoch as `YYYY-MM-DDTHH:MM:SSZ`.
@@ -1894,6 +1903,57 @@ mod tests {
         );
         assert_eq!(repo_name(&repo), "taskboard");
         assert_eq!(repo_name(&slot), "taskboard");
+    }
+
+    #[test]
+    fn pass_files_usage_under_the_repo_name_from_a_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("taskboard");
+        fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q"]);
+        git_in(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+        );
+        let slot = tmp.path().join("slot-1");
+        git_in(
+            &repo,
+            &["worktree", "add", "-q", slot.to_str().unwrap(), "-b", "w"],
+        );
+        assert_eq!(usage_log(&slot).unwrap().repo(), "taskboard");
+    }
+
+    #[test]
+    fn usage_name_of_a_bare_repo_is_its_folder_without_dot_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("srv").join("foo.git");
+        fs::create_dir_all(&bare).unwrap();
+        git_in(&bare, &["init", "-q", "--bare"]);
+        assert_eq!(repo_name(&bare), "foo");
+    }
+
+    #[test]
+    fn usage_name_of_a_submodule_is_the_submodule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp
+            .path()
+            .join("sup")
+            .join(".git")
+            .join("modules")
+            .join("lib");
+        fs::create_dir_all(&sub).unwrap();
+        git_in(&sub, &["init", "-q", "--bare"]);
+        assert_eq!(repo_name(&sub), "lib");
     }
 
     #[test]

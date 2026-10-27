@@ -5,7 +5,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
 use serde_json::Value;
@@ -161,10 +160,7 @@ fn walk(
 }
 
 pub fn run(root: &Path, since: Option<&str>, with_prev: bool) -> Result<String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::agent::now_secs();
     let cutoff = since.map(|s| since_cutoff(s, now)).transpose()?;
     let entries = collect(root, cutoff.as_deref(), with_prev);
     Ok(render(root, cutoff.as_deref(), &entries))

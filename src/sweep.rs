@@ -15,13 +15,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::agent::{Access, Gate};
+use crate::agent::{now_secs, Access, Gate};
 use crate::config::{self, SweepConfig};
 use crate::diff::git;
 use crate::review::{self, Finding, Pass, LEAD};
@@ -1153,13 +1153,6 @@ fn free_stamp(review_dir: &Path, stamp: &str) -> String {
         .map(|n| format!("{stamp}-{n}"))
         .find(|s| !used(s))
         .unwrap()
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn read_json(path: &Path) -> Result<Value> {

@@ -279,10 +279,7 @@ fn main() -> Result<()> {
         }
         Command::Usage { since } => {
             let dir = usage::dir().context("HOME is not set")?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let now = lens::agent::now_secs();
             println!("{}", usage::run(&dir, since.as_deref(), now)?);
         }
         Command::Sweep {
