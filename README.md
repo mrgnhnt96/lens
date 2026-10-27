@@ -6,8 +6,8 @@ verifier drops anything it can't show failing, and only real problems reach you.
 - **Local pass** (`lens review`): a few minutes, before you open a PR.
 - **PR pass** (`lens review --pr <n>`): posts verified findings on the PR as inline comments.
 
-`lens review` runs the whole pass itself; no model orchestrates it. Each reviewer, verifier and
-fixer is its own headless `claude -p`, started as lean as a review allows (see below), so a
+`lens review` runs the whole pass itself; no model orchestrates it. Each reviewer and
+verifier is its own headless `claude -p`, started as lean as a review allows (see below), so a
 review costs only what its agents read and write. It needs `claude` (logged in) and `git` on the
 PATH, and `gh` for the PR pass.
 
@@ -28,7 +28,7 @@ them.
 ## Layout
 
 ```
-prompts/                     the agents' system prompts: reviewer, verifier, fixer, escalator
+prompts/                     the agents' system prompts: reviewer, verifier
 profiles/                    the default reviewer profiles (format in profiles/README.md)
 scripts/                     prepare.sh and prepare-pr.sh, which gather a pass's inputs
 build.rs                     compiles prompts/, profiles/ and scripts/ into the binary
@@ -37,7 +37,7 @@ docs/PROVIDERS.md            the change-map provider contract
 docs/REVIEW.md               the report and protocol result formats, and where state is kept
 ```
 
-## `lens review [<base>] [--intent <file>] [--no-fix] [--full]`, `lens review --floor`, `lens review --pr <n>`
+## `lens review [<base>] [--intent <file>] [--full]`, `lens review --floor`, `lens review --pr <n>`
 
 Runs a pass and prints its summary; the report goes to `<state>/<branch>.json` (format in
 [docs/REVIEW.md](docs/REVIEW.md)). Nothing is written to the repo: `<state>` is
@@ -46,7 +46,7 @@ Runs a pass and prints its summary; the report goes to `<state>/<branch>.json` (
 **Under the review protocol.** This is how lens is meant to run: the task board runs
 `lens review` before a task's PR, with `TASKBOARD_RESULT` and the other `TASKBOARD_*` variables
 set. lens then reviews the worktree against `TASKBOARD_BASE`, checks intent against
-`TASKBOARD_INTENT`, keeps its state in `TASKBOARD_STATE_DIR`, fixes nothing, writes the result
+`TASKBOARD_INTENT`, keeps its state in `TASKBOARD_STATE_DIR`, writes the result
 JSON to `TASKBOARD_RESULT` and exits 0. From the second round, `TASKBOARD_PREVIOUS` holds the last
 round's findings with how triage settled each: only the delta is reviewed, findings marked `fix`
 are verified again, and ones dismissed or backlogged aren't raised again. Finding ids stay the
@@ -57,12 +57,12 @@ exits non-zero without a result, which the board counts as a reviewer error. The
 **What runs.** The local pass runs `correctness` (Sonnet) always, plus `testing` and, with a task
 or `--intent`, `intent-alignment` (Sonnet) when the change is over `small_lines`. A change that
 only touches docs runs nothing. Blockers and majors go to a Sonnet verifier each; confirmed
-blockers go through the fix loop unless `--no-fix`. The PR pass runs every profile lens picks,
+blockers are in the report; fixing them is the task board's job. The PR pass runs every profile lens picks,
 the `impact-assessment` lead first and a correctness reviewer per focus area it names. Reviewers
-run on their profile's `model` (Sonnet for every built-in one); verifiers and fixers run on Sonnet.
+run on their profile's `model` (Sonnet for every built-in one); verifiers run on Sonnet.
 
 **Reviewing again.** When the last report reviewed this branch from the same merge base, an
-unchanged tree isn't reviewed again (an open fix loop resumes), and a changed tree is reviewed
+unchanged tree isn't reviewed again (its report stands), and a changed tree is reviewed
 only for what changed since (`mode: "delta"`). The last report's findings carry over: blockers
 left unfixed, and majors in files the delta touched, are verified again. A report a reviewer
 failed on doesn't count, so the next pass reviews everything; `--full` does too.
@@ -78,7 +78,7 @@ failed on doesn't count, so the next pass reviews everything; `--full` does too.
 - `CLAUDE_CODE_PROMPT_CACHE_TTL=5m`: a headless session otherwise writes the 1-hour cache, at
   twice the input price; review agents never pause long enough to need it.
 - Only the tools the role needs: reviewers and verifiers read files and run read-only git
-  commands (`--permission-mode dontAsk`), the judge only reads, the fixer edits and runs tests.
+  commands (`--permission-mode dontAsk`), and none of them edits the tree.
 
 Each agent's reply is saved in `<state>/<branch>/agents/`, and the report records `agents` and
 `costUsd`.
@@ -89,7 +89,6 @@ Each agent's reply is saved in `<state>/<branch>/agents/`, and the report record
 small_lines = 40                            # at most this many changed lines: correctness only
 parallel = 4                                # agents running at once
 timeout_mins = 20                           # per agent
-fixer_permission_mode = "bypassPermissions" # the fixer edits and runs tests, headless
 ```
 
 **The floor.** Deep review runs on the sweep, so each PR keeps only a cheap check:
@@ -97,8 +96,8 @@ fixer_permission_mode = "bypassPermissions" # the fixer edits and runs tests, he
 path matching a glob under `[floor] risky` in the repo's `.lens.toml`. Any other change runs
 nothing and prints so. Put the code where a miss costs most there: auth, migrations, money.
 Globs follow `globset`, where `*` also crosses `/`, and match repo-relative paths. Its findings
-are verified like any local pass's, but the floor raises only what this change caused, and it
-doesn't start the fix loop. The report records tier `floor`. A repo with no `[floor]` section
+are verified like any local pass's, but the floor raises only what this change caused.
+The report records tier `floor`. A repo with no `[floor]` section
 never gets a floor review.
 
 ```toml
@@ -196,32 +195,13 @@ the two logs are kept for comparing the change between readings with all the usa
 Reads the two logs back:
 
 - lens's spend (runs, `costUsd`, input, output and cache tokens) per repo, per role (reviewer,
-  verifier, fixer, escalator) and per model.
+  verifier) and per model.
 - each window's first and last reading, its peak, and how far it rose in all (a reset counts the
   next period from 0).
 - the least lens work 1% of each window holds. The readings are split into stretches that rose at
   least 2%, and each stretch's lens spend (each run's share by time) over its rise is a floor,
   since other sessions' usage is in the rise too. The tightest stretch gives the floor, and from it
   the least lens work the rest of the window holds if nothing else ran.
-
-## `lens fix`
-
-The blocker fix loop's ledger. `lens review` runs a fixer agent on each blocker, re-reviews the
-fix, and asks a Haiku judge after every failed re-review whether to try again or bring you in;
-`lens fix` keeps the record and the rules a model doesn't get to bend: at most 5 attempts
-(`--cap`), and a fix counts only when the verifier drops the finding and nothing new is
-confirmed.
-
-```sh
-lens fix start   --report <state>/feat/x.json --finding F1   # prints the next step
-lens fix diff    --ledger <ledger>                            # the attempt in progress
-lens fix record  --ledger <ledger> --fixer <reply> --review <re-review>
-lens fix judge   --ledger <ledger> --decision <judge reply>
-lens fix summary --ledger <ledger>                            # what to tell the human
-```
-
-Each command but `diff` and `summary` prints `{"next": "fix" | "judge" | "done" | "escalate"}`.
-The ledger format is in [docs/REVIEW.md](docs/REVIEW.md).
 
 ## `lens pr earlier --pr <n>` and `lens pr post --pr <n> --report <file> --diff <patch>`
 

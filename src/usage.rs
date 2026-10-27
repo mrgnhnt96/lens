@@ -245,7 +245,7 @@ fn load<T: DeserializeOwned>(path: &Path) -> Vec<T> {
         .collect()
 }
 
-/// An agent's role from its label: `reviewer-correctness` and `fix-3-reviewer-x` are reviewers.
+/// An agent's role from its label: `reviewer-correctness` and `sweep-3-reviewer-x` are reviewers.
 pub fn role(label: &str) -> &str {
     label
         .split('-')
@@ -686,8 +686,7 @@ mod tests {
     #[test]
     fn roles_from_labels() {
         assert_eq!(role("reviewer-correctness"), "reviewer");
-        assert_eq!(role("fix-3-verifier"), "verifier");
-        assert_eq!(role("escalator-2-1-1"), "escalator");
+        assert_eq!(role("pr-3-verifier"), "verifier");
         assert_eq!(role("mapper"), "mapper");
     }
 

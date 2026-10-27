@@ -1,6 +1,6 @@
 //! `lens review` end to end, against a throwaway repo and a fake `claude` whose replies are canned:
 //! what's under test is the pass around the agents (tiers, deltas, verification, the report, the
-//! fix loop and the pre-PR review protocol) and how each agent is started.
+//! the pre-PR review protocol) and how each agent is started.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,8 +38,7 @@ fn write(dir: &Path, path: &str, text: &str) {
 /// A fake `claude -p`: logs how it was started and answers by role (named in its first message)
 /// and prompt. It plays the prompt cache too: the first request with a given model, tools and
 /// system prompt reports the system prompt's length as cache creation, later ones as cache read. The correctness reviewer raises a blocker and a minor in src/a.rs and a
-/// major in src/b.rs; the verifier confirms the major, and the blocker until the fixer has marked
-/// src/a.rs FIXED. The reviewer whose profile `$FAKE_FAIL` names replies with no JSON. The PR
+/// major in src/b.rs; the verifier confirms both. The reviewer whose profile `$FAKE_FAIL` names replies with no JSON. The PR
 /// pass's lead names one focus area. The plan turns away every agent of the role `$FAKE_REJECT`
 /// names.
 const FAKE: &str = r#"#!/usr/bin/env python3
@@ -96,15 +95,10 @@ elif role == "reviewer":
 elif role == "verifier":
     if "src/b.rs" in prompt:
         reply = {"verdict": "confirmed", "severity": "major", "howItFails": "1. b() opens it"}
-    elif "FIXED" in code:
-        reply = {"verdict": "dropped", "reason": "guarded now"}
     else:
         reply = {"verdict": "confirmed", "severity": "blocker", "howItFails": "1. parse(\"\")\n2. Ok"}
-elif role == "fixer":
-    open("src/a.rs", "a").write("// FIXED\n")
-    reply = {"summary": "reject empty input", "files": ["src/a.rs"], "tests": "none", "needsDecision": None}
 else:
-    reply = {"decision": "escalate", "needs": "other", "reason": "stuck"}
+    reply = None
 text = "I couldn't finish." if reply is None else "Done.\n```json\n" + json.dumps(reply) + "\n```\n"
 print(json.dumps({"type": "system", "subtype": "init"}))
 print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {"unifiedWindows": {
@@ -359,7 +353,7 @@ fn roles(calls: &[Value]) -> Vec<String> {
 #[test]
 fn a_full_review_verifies_blockers_and_drops_the_rest() {
     let fx = Fixture::new(60);
-    let out = fx.review(&["--no-fix"]);
+    let out = fx.review(&[]);
     let report = fx.report();
     assert_eq!(report["mode"], "full");
     assert_eq!(report["tier"], "full");
@@ -461,7 +455,7 @@ fn a_full_review_verifies_blockers_and_drops_the_rest() {
 #[test]
 fn every_agent_records_its_tokens_and_the_window_readings() {
     let fx = Fixture::new(60);
-    fx.review(&["--no-fix"]);
+    fx.review(&[]);
     let ledger = fx.usage_log("agents.jsonl");
     assert_eq!(ledger.len(), 4, "{ledger:?}");
     for row in &ledger {
@@ -501,10 +495,10 @@ fn every_agent_records_its_tokens_and_the_window_readings() {
 #[test]
 fn an_unchanged_tree_isnt_reviewed_again_and_a_change_reviews_only_the_delta() {
     let fx = Fixture::new(60);
-    fx.review(&["--no-fix"]);
+    fx.review(&[]);
     fx.calls();
 
-    let out = fx.review(&["--no-fix"]);
+    let out = fx.review(&[]);
     assert!(out.contains("unchanged since the last review"), "{out}");
     assert!(fx.calls().is_empty());
 
@@ -513,7 +507,7 @@ fn an_unchanged_tree_isnt_reviewed_again_and_a_change_reviews_only_the_delta() {
         "src/a.rs",
         &(fs::read_to_string(fx.repo().join("src/a.rs")).unwrap() + "// one more\n"),
     );
-    fx.review(&["--no-fix"]);
+    fx.review(&[]);
     let report = fx.report();
     assert_eq!(report["mode"], "delta");
     assert_eq!(report["tier"], "small");
@@ -532,7 +526,7 @@ fn an_unchanged_tree_isnt_reviewed_again_and_a_change_reviews_only_the_delta() {
     assert!(fx.state().join("feature/prev/report.json").is_file());
 
     // --full reviews everything, even an unchanged tree.
-    fx.review(&["--no-fix", "--full"]);
+    fx.review(&["--full"]);
     assert_eq!(fx.report()["mode"], "full");
     assert_eq!(
         roles(&fx.calls())
@@ -546,11 +540,7 @@ fn an_unchanged_tree_isnt_reviewed_again_and_a_change_reviews_only_the_delta() {
 #[test]
 fn a_reviewer_that_failed_makes_the_next_pass_review_everything() {
     let fx = Fixture::new(60);
-    let out = fx.review_with(
-        &["main"],
-        &["--no-fix"],
-        &[("FAKE_FAIL", Path::new("testing"))],
-    );
+    let out = fx.review_with(&["main"], &[], &[("FAKE_FAIL", Path::new("testing"))]);
     assert!(
         out.contains("Failed (no readable reply): testing."),
         "{out}"
@@ -558,7 +548,7 @@ fn a_reviewer_that_failed_makes_the_next_pass_review_everything() {
     assert_eq!(fx.report()["incomplete"], serde_json::json!(["testing"]));
     fx.calls();
 
-    fx.review(&["--no-fix"]);
+    fx.review(&[]);
     let report = fx.report();
     assert_eq!(report["mode"], "full");
     assert!(report.get("incomplete").is_none());
@@ -620,31 +610,9 @@ fn the_floor_reviews_risky_paths_with_one_sonnet_and_nothing_else() {
         .as_str()
         .unwrap()
         .contains("this change caused"));
-    // Findings are verified, but the floor never starts the fix loop.
-    assert!(calls.iter().all(|c| c["role"] != "fixer"));
     let report = fx.report();
     assert_eq!(report["tier"], "floor");
     assert_eq!(report["profiles"][0]["reason"], "risky path: src/a.rs");
-}
-
-#[test]
-fn the_fix_loop_fixes_a_blocker_and_marks_it_resolved() {
-    let fx = Fixture::new(60);
-    let out = fx.review(&[]);
-    let report = fx.report();
-    let f1 = &report["findings"][0];
-    assert_eq!(f1["fix"]["status"], "resolved", "{out}");
-    assert!(fs::read_to_string(fx.repo().join("src/a.rs"))
-        .unwrap()
-        .contains("FIXED"));
-    let roles = roles(&fx.calls());
-    assert_eq!(roles.iter().filter(|r| *r == "fixer").count(), 1);
-    assert!(!roles.contains(&"escalator".to_string()));
-    assert!(out.contains("fixed by the fix loop"), "{out}");
-
-    // The fix changed the tree after the review, but the ledger's tree is the reviewed one.
-    let again = fx.review(&[]);
-    assert!(again.contains("unchanged since the last review"), "{again}");
 }
 
 /// A `gh` stand-in for the PR pass: `pr view` answers from a canned PR, `api` lists no earlier
@@ -728,8 +696,6 @@ fn the_pr_pass_runs_the_lead_and_its_focus_areas_and_posts() {
         out.contains("Posted (request changes): https://github.test/pr/7#review-1"),
         "{out}"
     );
-    let roles = roles(&fx.calls());
-    assert!(!roles.contains(&"fixer".to_string()));
 }
 
 #[test]
@@ -751,7 +717,7 @@ fn a_pr_outside_the_sample_runs_nothing() {
 fn a_review_by_hand_keeps_its_state_out_of_the_repo() {
     let fx = Fixture::new(60);
     let before = status(&fx.repo());
-    fx.review(&["--no-fix"]);
+    fx.review(&[]);
     assert_eq!(status(&fx.repo()), before);
     assert!(!fx.repo().join(".review").exists());
     assert!(fx.state().join("feature/diff.patch").is_file());
@@ -798,7 +764,6 @@ fn the_protocol_writes_a_result_and_never_touches_the_worktree() {
 
     // The intent reached intent-alignment, and no fix loop ran.
     let calls = fx.calls();
-    assert!(calls.iter().all(|c| c["role"] != "fixer"));
     assert!(calls.iter().any(|c| c["prompt"]
         .as_str()
         .unwrap()
@@ -906,7 +871,7 @@ fn backoff_pauses_reviews_while_a_window_is_past_its_limit_and_says_when_it_lift
         "[backoff.five_hour]\npause_at = 0.85\n",
     );
     fx.read_window("five_hour", 0.9, 3600);
-    let out = fx.review(&["--no-fix"]);
+    let out = fx.review(&[]);
     assert!(
         out.contains("lens: paused: backoff: the plan's five_hour window is 90% used (pause_at 85%); resumes at "),
         "{out}"
@@ -915,7 +880,7 @@ fn backoff_pauses_reviews_while_a_window_is_past_its_limit_and_says_when_it_lift
     assert!(!fx.dir.path().join("cache/lens/state").exists());
 
     fx.read_window("five_hour", 0.2, 3600);
-    let (_, log) = fx.review_logged(&["main"], &["--no-fix"], &[]);
+    let (_, log) = fx.review_logged(&["main"], &[], &[]);
     assert!(log.contains("lens: backoff lifted: "), "{log}");
     assert!(!fx.calls().is_empty());
 }
@@ -929,7 +894,7 @@ fn backoff_lighter_at_runs_the_correctness_reviewer_only() {
         "[backoff.five_hour]\nlighter_at = 0.7\n",
     );
     fx.read_window("five_hour", 0.75, 3600);
-    let (_, log) = fx.review_logged(&["main"], &["--no-fix"], &[]);
+    let (_, log) = fx.review_logged(&["main"], &[], &[]);
     assert!(
         log.contains("lens: backoff: the plan's five_hour window is 75% used (lighter_at 70%); running correctness only, skipping testing"),
         "{log}"
@@ -1009,7 +974,7 @@ fn a_review_the_backoff_lightened_is_incomplete_so_the_next_one_runs_everything(
         "[backoff.five_hour]\nlighter_at = 0.7\n",
     );
     fx.read_window("five_hour", 0.75, 3600);
-    fx.review(&["--no-fix"]);
+    fx.review(&[]);
     let incomplete = fx.report()["incomplete"].clone();
     assert!(
         incomplete.as_array().unwrap().contains(&json!("testing")),
@@ -1019,7 +984,7 @@ fn a_review_the_backoff_lightened_is_incomplete_so_the_next_one_runs_everything(
 
     // The window eases and nothing changed, yet the lightened report isn't taken as current.
     fx.read_window("five_hour", 0.2, 3600);
-    fx.review(&["--no-fix"]);
+    fx.review(&[]);
     let reviewers = fx
         .calls()
         .iter()
@@ -1032,16 +997,12 @@ fn a_review_the_backoff_lightened_is_incomplete_so_the_next_one_runs_everything(
 #[test]
 fn a_local_review_the_plan_turns_away_mid_pass_keeps_the_last_report() {
     let fx = Fixture::new(60);
-    fx.review(&["--no-fix"]);
+    fx.review(&[]);
     let before = fs::read_to_string(fx.state().join("feature.json")).unwrap();
     fx.calls();
 
     for role in ["reviewer", "verifier"] {
-        let out = fx.review_with(
-            &["main"],
-            &["--no-fix", "--full"],
-            &[("FAKE_REJECT", Path::new(role))],
-        );
+        let out = fx.review_with(&["main"], &["--full"], &[("FAKE_REJECT", Path::new(role))]);
         assert!(out.contains("lens: paused: "), "{role}: {out}");
         assert!(out.contains("Nothing was reviewed"), "{role}: {out}");
         assert_eq!(
@@ -1050,17 +1011,4 @@ fn a_local_review_the_plan_turns_away_mid_pass_keeps_the_last_report() {
             "{role}: the last review stays the current one"
         );
     }
-}
-
-#[test]
-fn a_fix_loop_the_plan_cuts_off_says_so_and_leaves_the_blocker_open() {
-    let fx = Fixture::new(60);
-    let out = fx.review_with(&["main"], &[], &[("FAKE_REJECT", Path::new("fixer"))]);
-    assert!(out.contains("Fixing paused: "), "{out}");
-    assert!(out.contains("The next run picks the fix loop up"), "{out}");
-    let report = fx.report();
-    assert_eq!(report["findings"][0]["severity"], "blocker");
-    assert!(!fs::read_to_string(fx.repo().join("src/a.rs"))
-        .unwrap()
-        .contains("FIXED"));
 }

@@ -29,10 +29,6 @@ use crate::usage;
 pub enum Access {
     /// Read files and run read-only git commands; everything else is denied.
     ReadOnly,
-    /// Read only, without Bash (the escalation judge).
-    ReadFiles,
-    /// Edit the working tree and run builds and tests (the fixer), in the given permission mode.
-    Edit,
 }
 
 /// One agent to run.
@@ -94,13 +90,12 @@ pub struct Gate {
     file: Option<PathBuf>,
 }
 
-/// How agents run: the `claude` program, limits and the fixer's permission mode.
+/// How agents run: the `claude` program and its limits.
 #[derive(Debug, Clone)]
 pub struct Runner {
     pub claude: PathBuf,
     pub parallel: usize,
     pub timeout: Duration,
-    pub fixer_permission_mode: String,
     /// Where each agent's reply is saved, as `<label>.md`.
     pub log_dir: PathBuf,
     /// When each cache group last sent a request, so a later batch knows its prefix is cached.
@@ -233,8 +228,6 @@ impl Access {
     fn tools(self) -> &'static str {
         match self {
             Access::ReadOnly => "Read,Grep,Glob,Bash",
-            Access::ReadFiles => "Read,Grep,Glob",
-            Access::Edit => "Read,Grep,Glob,Bash,Edit,Write",
         }
     }
 }
@@ -270,8 +263,6 @@ impl Runner {
                     .chain(READ_ONLY_BASH.iter().copied())
                     .collect(),
             ),
-            Access::ReadFiles => ("dontAsk", vec!["Read", "Grep", "Glob"]),
-            Access::Edit => (self.fixer_permission_mode.as_str(), vec![]),
         };
         args.extend([
             "--tools".into(),
@@ -644,7 +635,6 @@ mod tests {
             claude: "claude".into(),
             parallel: 4,
             timeout: Duration::from_secs(60),
-            fixer_permission_mode: "bypassPermissions".into(),
             log_dir: "/tmp".into(),
             cached: Default::default(),
             usage: None,
@@ -682,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewers_read_and_fixers_edit() {
+    fn reviewers_are_read_only() {
         let r = runner();
         let args = r.args(&spec(Access::ReadOnly, "opus"));
         assert_eq!(flag(&args, "--permission-mode"), Some("dontAsk"));
@@ -690,13 +680,7 @@ mod tests {
             .unwrap()
             .contains("Bash(git show:*)"));
         assert_eq!(flag(&args, "--effort"), Some("high"));
-        let args = r.args(&spec(Access::Edit, "opus"));
-        assert_eq!(flag(&args, "--permission-mode"), Some("bypassPermissions"));
-        assert!(flag(&args, "--tools").unwrap().contains("Edit"));
-        assert_eq!(flag(&args, "--allowedTools"), None);
-        let args = r.args(&spec(Access::ReadFiles, "haiku"));
-        assert_eq!(flag(&args, "--tools"), Some("Read,Grep,Glob"));
-        assert_eq!(flag(&args, "--effort"), None);
+        assert_eq!(flag(&args, "--tools"), Some("Read,Grep,Glob,Bash"));
     }
 
     #[test]
