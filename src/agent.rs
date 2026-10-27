@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use crate::review::iso_now;
+use crate::usage;
+
 /// What an agent may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
@@ -77,6 +80,8 @@ pub struct Runner {
     pub log_dir: PathBuf,
     /// When each cache group last sent a request, so a later batch knows its prefix is cached.
     pub cached: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Where each agent's tokens and the plan's window readings are recorded, if anywhere.
+    pub usage: Option<usage::Log>,
 }
 
 /// How long after a group's last request its prefix counts as cached: under the 5-minute TTL.
@@ -243,6 +248,7 @@ impl Runner {
 
     fn exec(&self, i: usize, spec: &Spec, tx: &mpsc::Sender<Event>) -> Result<Outcome> {
         let group = group(spec);
+        let started_at = iso_now();
         let mut child = Command::new(&self.claude)
             .args(self.args(spec))
             .current_dir(&spec.cwd)
@@ -302,7 +308,23 @@ impl Runner {
                                 last_text = text;
                             }
                         }
-                        Some("result") => result = Some(event),
+                        Some("rate_limit_event") => {
+                            if let Some(log) = &self.usage {
+                                log.record_readings(&spec.label, &iso_now(), &event);
+                            }
+                        }
+                        Some("result") => {
+                            if let Some(log) = &self.usage {
+                                log.record_result(
+                                    &spec.label,
+                                    &spec.model,
+                                    &started_at,
+                                    &iso_now(),
+                                    &event,
+                                );
+                            }
+                            result = Some(event);
+                        }
                         _ => {}
                     }
                 }
@@ -438,6 +460,7 @@ mod tests {
             fixer_permission_mode: "bypassPermissions".into(),
             log_dir: "/tmp".into(),
             cached: Default::default(),
+            usage: None,
         }
     }
 

@@ -154,6 +154,7 @@ impl Fixture {
             .env("LENS_GH", self.dir.path().join("gh"))
             .env("FAKE_LOG", self.dir.path().join("calls.jsonl"))
             .env("FAKE_GH_LOG", self.dir.path().join("gh.log"))
+            .env("LENS_USAGE_DIR", self.dir.path().join("usage"))
             .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
             .output()
             .unwrap();
