@@ -1,6 +1,7 @@
 //! `lens cost`: what reviews spent. lens's `claude -p` agents never show in session transcripts,
-//! so the reports under `.review/` are the only record: this adds up their `costUsd`, agents and
-//! findings per repo and per day.
+//! so the reports are the only record: those in the state folders of reviews run by hand, and
+//! any under a `.review/` folder older versions of lens left in repos. This adds up their
+//! `costUsd`, agents and findings per repo and per day.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -116,9 +117,32 @@ pub fn collect(root: &Path, cutoff: Option<&str>, with_prev: bool) -> Vec<Entry>
     out
 }
 
+/// Every report in the state folders under `state_root`, one `<repo>-<hash>` folder per repo.
+pub fn collect_states(state_root: &Path, cutoff: Option<&str>, with_prev: bool) -> Vec<Entry> {
+    let mut out = Vec::new();
+    let Ok(read) = fs::read_dir(state_root) else {
+        return out;
+    };
+    let mut dirs: Vec<PathBuf> = read.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    for dir in dirs.iter().filter(|d| d.is_dir() && !d.is_symlink()) {
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        let repo = match name.rsplit_once('-') {
+            Some((repo, hash))
+                if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                repo
+            }
+            _ => name,
+        };
+        walk(dir, Some(repo), cutoff, with_prev, &mut out);
+    }
+    out
+}
+
 fn walk(
     dir: &Path,
-    review_of: Option<&Path>,
+    review_of: Option<&str>,
     cutoff: Option<&str>,
     with_prev: bool,
     out: &mut Vec<Entry>,
@@ -137,7 +161,10 @@ fn walk(
             }
             match review_of {
                 Some(repo) => walk(&path, Some(repo), cutoff, with_prev, out),
-                None if name == ".review" => walk(&path, Some(dir), cutoff, with_prev, out),
+                None if name == ".review" => {
+                    let repo = dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                    walk(&path, Some(repo), cutoff, with_prev, out)
+                }
                 None => walk(&path, None, cutoff, with_prev, out),
             }
         } else if let (Some(repo), true) = (review_of, name.ends_with(".json")) {
@@ -147,8 +174,7 @@ fn walk(
             else {
                 continue;
             };
-            let label = repo.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            let Some(e) = entry(label, &report) else {
+            let Some(e) = entry(repo, &report) else {
                 continue;
             };
             let started = report["startedAt"].as_str().unwrap_or(&e.day);
@@ -159,10 +185,18 @@ fn walk(
     }
 }
 
-pub fn run(root: &Path, since: Option<&str>, with_prev: bool) -> Result<String> {
+pub fn run(
+    root: &Path,
+    state_root: Option<&Path>,
+    since: Option<&str>,
+    with_prev: bool,
+) -> Result<String> {
     let now = crate::agent::now_secs();
     let cutoff = since.map(|s| since_cutoff(s, now)).transpose()?;
-    let entries = collect(root, cutoff.as_deref(), with_prev);
+    let mut entries = collect(root, cutoff.as_deref(), with_prev);
+    if let Some(state_root) = state_root {
+        entries.extend(collect_states(state_root, cutoff.as_deref(), with_prev));
+    }
     Ok(render(root, cutoff.as_deref(), &entries))
 }
 
@@ -280,6 +314,26 @@ mod tests {
         assert!(!by["a"].has_cache);
         let cut = collect(dir.path(), Some("2026-10-20"), true);
         assert_eq!(cut.len(), 1);
+    }
+
+    #[test]
+    fn totals_the_state_folders_by_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = |cost: f64| json!({"costUsd": cost, "startedAt": "2026-10-19T10:00:00Z"});
+        write(dir.path(), "my-app-0123456789abcdef/feat/x.json", r(1.0));
+        write(
+            dir.path(),
+            "my-app-0123456789abcdef/feat/x/prev/report.json",
+            r(0.5),
+        );
+        write(dir.path(), "my-app-fedcba9876543210/pr-7.json", r(2.0));
+        write(dir.path(), "other/main.json", r(4.0));
+        let e = collect_states(dir.path(), None, false);
+        let by = group(&e, |e| &e.repo);
+        assert_eq!(by["my-app"].cost, 3.0);
+        assert_eq!(by["other"].cost, 4.0);
+        assert_eq!(collect_states(dir.path(), None, true).len(), 4);
+        assert!(collect_states(&dir.path().join("none"), None, true).is_empty());
     }
 
     #[test]

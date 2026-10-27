@@ -19,10 +19,7 @@ pub fn root() -> Result<PathBuf> {
     }
     let mut hasher = DefaultHasher::new();
     FILES.hash(&mut hasher);
-    let base = match std::env::var_os("XDG_CACHE_HOME") {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME").context("HOME isn't set")?).join(".cache"),
-    };
+    let base = cache()?;
     let dir = base.join("lens").join(format!("{:016x}", hasher.finish()));
     if dir.join(".complete").is_file() {
         return Ok(dir);
@@ -48,6 +45,20 @@ pub fn root() -> Result<PathBuf> {
         let _ = fs::remove_dir_all(&tmp);
     }
     Ok(dir)
+}
+
+/// The user's cache: `$XDG_CACHE_HOME`, else `~/.cache`.
+pub fn cache() -> Result<PathBuf> {
+    Ok(match std::env::var_os("XDG_CACHE_HOME") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(std::env::var_os("HOME").context("HOME isn't set")?).join(".cache"),
+    })
+}
+
+/// Where a review run by hand keeps its state: one folder per repo under the cache's
+/// `lens/state`, never inside the repo.
+pub fn state_root() -> Result<PathBuf> {
+    Ok(cache()?.join("lens").join("state"))
 }
 
 #[cfg(test)]

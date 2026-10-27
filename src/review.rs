@@ -52,6 +52,53 @@ pub struct Options {
     /// The per-PR floor: one Sonnet correctness reviewer, only when the change touches a
     /// `[floor] risky` path.
     pub floor: bool,
+    /// Where the pass keeps its work folders and reports; defaults to a folder for the repo under
+    /// `assets::state_root`.
+    pub state: Option<PathBuf>,
+    /// Set when the task board runs lens as its pre-PR reviewer.
+    pub protocol: Option<Protocol>,
+}
+
+/// A run under the pre-PR review protocol (docs/REVIEW.md): the board sets `TASKBOARD_*`
+/// variables, lens writes its verdict to `result` and exits 0, or fails without one.
+#[derive(Debug, Clone, Default)]
+pub struct Protocol {
+    pub result: PathBuf,
+    /// The last round's result, each finding with the triage's `outcome` and `reason`.
+    pub previous: Option<PathBuf>,
+}
+
+impl Options {
+    /// Takes the protocol's variables, when `TASKBOARD_RESULT` is set and this isn't a PR pass:
+    /// the repo, base and intent the board names (flags given win), its state folder, and no
+    /// fix loop, since the reviewer never changes the worktree.
+    pub fn with_protocol(mut self, var: impl Fn(&str) -> Option<String>) -> Options {
+        let var = |k: &str| var(k).filter(|v| !v.is_empty());
+        let Some(result) = var("TASKBOARD_RESULT") else {
+            return self;
+        };
+        if self.pr.is_some() {
+            return self;
+        }
+        if self.repo == Path::new(".") {
+            if let Some(repo) = var("TASKBOARD_REPO") {
+                self.repo = repo.into();
+            }
+        }
+        self.base = self.base.or_else(|| var("TASKBOARD_BASE"));
+        self.intent = self
+            .intent
+            .or_else(|| var("TASKBOARD_INTENT").map(PathBuf::from));
+        self.state = self
+            .state
+            .or_else(|| var("TASKBOARD_STATE_DIR").map(PathBuf::from));
+        self.no_fix = true;
+        self.protocol = Some(Protocol {
+            result: result.into(),
+            previous: var("TASKBOARD_PREVIOUS").map(PathBuf::from),
+        });
+        self
+    }
 }
 
 /// What `lens review` did, for the caller to print.
@@ -97,6 +144,8 @@ pub(crate) struct Finding {
     pub(crate) confidence: f64,
     /// A blocker the last report left unfixed, verified again in a delta review.
     pub(crate) carried: bool,
+    /// The id an earlier report gave it, kept so a finding has one id across rounds.
+    pub(crate) id: Option<String>,
 }
 
 impl Finding {
@@ -110,6 +159,7 @@ impl Finding {
             failure_scenario: v["failureScenario"].as_str().unwrap_or("").to_string(),
             confidence: v["confidence"].as_f64().unwrap_or(0.5),
             carried: false,
+            id: None,
         })
     }
 
@@ -167,6 +217,9 @@ pub(crate) fn merge(findings: Vec<Finding>) -> Vec<Finding> {
                 }
                 o.confidence = o.confidence.max(f.confidence);
                 o.carried &= f.carried;
+                if o.id.is_none() {
+                    o.id = f.id;
+                }
                 for p in f.profiles {
                     if !o.profiles.contains(&p) {
                         o.profiles.push(p);
@@ -740,13 +793,20 @@ pub fn run(opts: Options) -> Result<Done> {
     }
     let now = agent::now_secs();
     if let Some(full) = Gate::shared().full(now) {
-        return Ok(parked(&full.message(now)));
+        let why = full.message(now);
+        if opts.protocol.is_some() {
+            bail!("paused: {why}");
+        }
+        return Ok(parked(&why));
     }
     let backoff = backoff::check(&cfg.backoff, &root.to_string_lossy(), now);
     if backoff.lifted {
         eprintln!("lens: {}", backoff::LIFTED);
     }
     if let Some((why, _)) = &backoff.pause {
+        if opts.protocol.is_some() {
+            bail!("paused: {why}");
+        }
         return Ok(parked(why));
     }
     if let (Some(n), Some((share, why))) = (opts.pr, &backoff.share) {
@@ -760,7 +820,13 @@ pub fn run(opts: Options) -> Result<Done> {
             });
         }
     }
-    let prepared = prepare(&assets, &root, &opts)?;
+    let state = match &opts.state {
+        Some(dir) => dir.clone(),
+        None => state_dir(&crate::assets::state_root()?, &root),
+    };
+    fs::create_dir_all(&state).with_context(|| format!("making {}", state.display()))?;
+    let state = state.canonicalize()?;
+    let prepared = prepare(&assets, &root, &state, &opts)?;
     let work = PathBuf::from(
         prepared["work"]
             .as_str()
@@ -788,7 +854,21 @@ pub fn run(opts: Options) -> Result<Done> {
     }
 }
 
-fn prepare(assets: &Path, root: &Path, opts: &Options) -> Result<Value> {
+/// A repo's state folder under `state_root`: its name, then a hash of its path, so two checkouts
+/// of one repo keep apart. The hash is FNV-1a, which no toolchain update changes, so a rebuilt
+/// lens still finds the last report.
+fn state_dir(state_root: &Path, root: &Path) -> PathBuf {
+    let hash = root
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        });
+    state_root.join(format!("{}-{hash:016x}", repo_name(root)))
+}
+
+fn prepare(assets: &Path, root: &Path, state: &Path, opts: &Options) -> Result<Value> {
     let scripts = assets.join("scripts");
     let mut cmd = match opts.pr {
         Some(n) => {
@@ -804,6 +884,7 @@ fn prepare(assets: &Path, root: &Path, opts: &Options) -> Result<Value> {
     };
     cmd.current_dir(root)
         .env("LENS", std::env::current_exe()?)
+        .env("LENS_STATE", state)
         .env(
             "LENS_PROFILES_DIR",
             std::env::var_os("LENS_PROFILES_DIR")
@@ -887,6 +968,7 @@ fn carry(f: &Value) -> Option<Finding> {
     let mut x = Finding::from_reply(profiles.first().map_or("correctness", String::as_str), f)?;
     x.profiles = profiles;
     x.carried = true;
+    x.id = f["id"].as_str().map(String::from);
     Some(x)
 }
 
@@ -907,8 +989,10 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     let prepared = pass.prepared.clone();
     let changed = prepared["changedLines"].as_u64().unwrap_or(0) as u32;
     if changed == 0 {
+        let summary = "lens: nothing to review: the branch has no changes against its base.";
+        respond(pass, None, summary, 0.0)?;
         return Ok(Done {
-            summary: "lens: nothing to review: the branch has no changes against its base.".into(),
+            summary: summary.into(),
             report: None,
         });
     }
@@ -924,18 +1008,23 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
             .collect();
         let risky = risky_files(&pass.cfg.floor.risky, &changed_files)?;
         if risky.is_empty() {
+            let summary = "lens: floor: no risky paths changed, nothing to review.";
+            respond(pass, None, summary, 0.0)?;
             return Ok(Done {
-                summary: "lens: floor: no risky paths changed, nothing to review.".into(),
+                summary: summary.into(),
                 report: None,
             });
         }
         floor_reason = Some(format!("risky path: {}", risky.join(", ")));
     }
     let now = fix::snapshot(&pass.root)?;
-    let previous: Option<Value> = fs::read_to_string(&pass.report_path)
+    let prior: Option<Value> = fs::read_to_string(&pass.report_path)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .filter(|r: &Value| r["pass"] == "local" && !pass.opts.floor);
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let triaged = triaged(pass)?;
+    let settled = settle(prior.as_ref(), triaged.as_ref());
+    let last = prior.as_ref().map_or(0, last_id);
+    let previous = prior.filter(|r: &Value| r["pass"] == "local" && !pass.opts.floor);
     let mode = match previous {
         // A report some reviewers failed on doesn't count: the next pass reviews everything.
         Some(prev)
@@ -972,12 +1061,28 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
         _ => Mode::Full,
     };
 
-    if let Mode::Fresh(prev) = mode {
+    if let Mode::Fresh(mut prev) = mode {
         pass.log("the last review still matches the tree; resuming its fix loop if it has one");
+        if !settled.is_empty() {
+            if let Some(fs) = prev["findings"].as_array_mut() {
+                fs.retain(|f| !settled.iter().any(|s| s["id"] == f["id"]));
+            }
+            prev["settled"] = json!(settled);
+            fs::write(
+                &pass.report_path,
+                serde_json::to_string_pretty(&prev)? + "\n",
+            )?;
+        }
         if !pass.opts.no_fix {
             fix_loop(pass, &prev, None)?;
         }
         let report: Value = serde_json::from_str(&fs::read_to_string(&pass.report_path)?)?;
+        respond(
+            pass,
+            Some(&report),
+            &summarize(&report, &pass.report_path, true),
+            0.0,
+        )?;
         let mut summary = summarize(&report, &pass.report_path, true);
         if let Some(why) = pass.parked() {
             summary.push_str(&fix_paused(&why));
@@ -1009,8 +1114,9 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
         .iter()
         .filter_map(|f| f.as_str().map(String::from))
         .collect();
-    // A delta carries the last report's findings over. Unfixed blockers, and majors in files the
-    // delta touched, are verified again; other majors are kept as they were.
+    // A delta carries the last report's findings over. Unfixed blockers, majors in files the
+    // delta touched and findings the triage sent to be fixed are verified again; other majors are
+    // kept as they were. What the triage dismissed or backlogged stays out.
     let mut kept: Vec<(Finding, Value)> = Vec::new();
     let (files, lines, delta_patch, delta_info, carried) = match &mode {
         Mode::Delta {
@@ -1024,14 +1130,17 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
                 if f["severity"] == "blocker" && f["fix"]["status"] == "resolved" {
                     continue;
                 }
+                if settled.iter().any(|s| s["id"] == f["id"]) {
+                    continue;
+                }
                 let touched = files.iter().any(|p| f["file"] == *p.as_str());
+                let to_fix = outcome(triaged.as_ref(), &f["id"]) == Some("fix");
                 let Some(x) = carry(&f) else { continue };
-                if f["severity"] == "blocker" || touched {
+                if f["severity"] == "blocker" || touched || to_fix {
                     carried.push(x);
                 } else {
                     let mut entry = f.clone();
                     if let Some(o) = entry.as_object_mut() {
-                        o.remove("id");
                         o.remove("fix");
                     }
                     kept.push((x, entry));
@@ -1153,7 +1262,22 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
         let mut keep = Vec::new();
         let mut drop = Vec::new();
         for f in merged {
-            if rank(&f.severity) <= 1 {
+            if let Some(s) = settled_as(&settled, &f) {
+                let mut e = f.json();
+                e["reason"] = json!(format!(
+                    "{} in triage{}",
+                    if s["outcome"] == "dismiss" {
+                        "dismissed"
+                    } else {
+                        "backlogged"
+                    },
+                    s["reason"]
+                        .as_str()
+                        .map(|r| format!(": {r}"))
+                        .unwrap_or_default()
+                ));
+                drop.push(e);
+            } else if rank(&f.severity) <= 1 {
                 keep.push(f);
             } else {
                 let mut e = f.json();
@@ -1173,6 +1297,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     let mut report = json!({
         "version": 1,
         "pass": "local",
+        "root": pass.root,
         "branch": prepared["branch"],
         "base": prepared["base"],
         "mergeBase": prepared["mergeBase"],
@@ -1185,16 +1310,34 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
         "startedAt": pass.started_at,
         "map": map_status(&pass.work),
         "profiles": profile_rows,
-        "findings": number(confirmed),
+        "findings": number(confirmed, last),
         "dropped": dropped,
     });
     if let Some(d) = delta_info {
         report["delta"] = d;
     }
+    if !settled.is_empty() {
+        report["settled"] = json!(settled);
+    }
+    report["lastId"] = json!(last_id(&report));
     if !failed.is_empty() || !lightened.is_empty() {
         report["incomplete"] = json!(failed.iter().chain(&lightened).collect::<Vec<_>>());
     }
     finish(pass, &mut report)?;
+    if pass.opts.protocol.is_some() && !failed.is_empty() {
+        bail!(
+            "{} reviewer(s) gave no readable reply ({}); the review is incomplete. Report: {}",
+            failed.len(),
+            failed.join(", "),
+            pass.report_path.display()
+        );
+    }
+    respond(
+        pass,
+        Some(&report),
+        &summarize(&report, &pass.report_path, false),
+        report["costUsd"].as_f64().unwrap_or(0.0),
+    )?;
 
     if !pass.opts.no_fix && !pass.opts.floor {
         fix_loop(pass, &report, None)?;
@@ -1240,23 +1383,171 @@ fn unpark_previous(pass: &Pass, prev_dir: &Path, why: &str) -> Result<Done> {
             fs::rename(prev_dir.join("fix"), pass.work.join("fix"))?;
         }
     }
+    if pass.opts.protocol.is_some() {
+        bail!("paused: {why}");
+    }
     Ok(parked(why))
 }
 
-/// Ids F1, F2… in report order, blockers first.
-fn number(mut confirmed: Vec<(Finding, Value)>) -> Vec<Value> {
+/// The last round's result the board passed in `TASKBOARD_PREVIOUS`, with the triage's outcomes.
+fn triaged(pass: &Pass) -> Result<Option<Value>> {
+    let Some(path) = pass
+        .opts
+        .protocol
+        .as_ref()
+        .and_then(|p| p.previous.as_ref())
+    else {
+        return Ok(None);
+    };
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .with_context(|| format!("reading {}", path.display()))
+}
+
+/// What the triage made of the finding with `id`: fix, backlog or dismiss.
+fn outcome<'a>(triaged: Option<&'a Value>, id: &Value) -> Option<&'a str> {
+    triaged?["findings"]
+        .as_array()?
+        .iter()
+        .find(|f| f["id"] == *id)?["outcome"]
+        .as_str()
+}
+
+/// Every finding the triage dismissed or backlogged so far: the last report's `settled` and the
+/// last round's. They're never raised again.
+fn settle(prior: Option<&Value>, triaged: Option<&Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = prior
+        .and_then(|r| r["settled"].as_array().cloned())
+        .unwrap_or_default();
+    let findings = triaged.and_then(|t| t["findings"].as_array());
+    for f in findings.into_iter().flatten() {
+        if !matches!(f["outcome"].as_str(), Some("dismiss" | "backlog"))
+            || out.iter().any(|s| s["id"] == f["id"])
+        {
+            continue;
+        }
+        out.push(json!({
+            "id": f["id"],
+            "file": f["file"],
+            "line": f["line"],
+            "severity": f["severity"],
+            "title": f["title"],
+            "outcome": f["outcome"],
+            "reason": f["reason"],
+        }));
+    }
+    out
+}
+
+/// The settled finding `f` raises again: the same id, or the same failure.
+fn settled_as<'a>(settled: &'a [Value], f: &Finding) -> Option<&'a Value> {
+    settled.iter().find(|s| {
+        f.id.as_deref().is_some_and(|id| s["id"] == id) || carry(s).is_some_and(|x| same(&x, f))
+    })
+}
+
+fn id_number(id: &Value) -> u32 {
+    id.as_str()
+        .and_then(|s| s.strip_prefix('F'))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The highest id a report has handed out, so a new finding never takes an old one's.
+fn last_id(report: &Value) -> u32 {
+    let ids = ["findings", "settled"]
+        .iter()
+        .flat_map(|k| report[*k].as_array().cloned().unwrap_or_default())
+        .map(|f| id_number(&f["id"]));
+    ids.chain([report["lastId"].as_u64().unwrap_or(0) as u32])
+        .max()
+        .unwrap_or(0)
+}
+
+/// Ids in report order, blockers first. A finding an earlier report raised keeps its id; a new
+/// one takes the next after `last`.
+fn number(mut confirmed: Vec<(Finding, Value)>, last: u32) -> Vec<Value> {
     confirmed.sort_by_key(|(_, v)| rank(v["severity"].as_str().unwrap_or("nit")));
+    let old = |f: &Finding, v: &Value| f.id.clone().or_else(|| v["id"].as_str().map(String::from));
+    let mut next = confirmed
+        .iter()
+        .filter_map(|(f, v)| old(f, v))
+        .map(|id| id_number(&json!(id)))
+        .fold(last, u32::max);
+    let mut used = BTreeSet::new();
     confirmed
         .into_iter()
-        .enumerate()
-        .map(|(i, (_, mut v))| {
+        .map(|(f, mut v)| {
+            let id = match old(&f, &v) {
+                Some(id) if used.insert(id.clone()) => id,
+                _ => {
+                    next += 1;
+                    format!("F{next}")
+                }
+            };
             let obj = v.as_object_mut().unwrap();
+            obj.remove("id");
             let mut out = serde_json::Map::new();
-            out.insert("id".into(), json!(format!("F{}", i + 1)));
+            out.insert("id".into(), json!(id));
             out.extend(std::mem::take(obj));
             Value::Object(out)
         })
         .collect()
+}
+
+/// Under the protocol, writes the round's result to `TASKBOARD_RESULT`: fail with the findings,
+/// pass when a review found none, skip when there was nothing to review.
+fn respond(pass: &Pass, report: Option<&Value>, summary: &str, cost: f64) -> Result<()> {
+    let Some(protocol) = &pass.opts.protocol else {
+        return Ok(());
+    };
+    let result = protocol_result(report, summary, cost);
+    fs::write(
+        &protocol.result,
+        serde_json::to_string_pretty(&result)? + "\n",
+    )
+    .with_context(|| format!("writing {}", protocol.result.display()))
+}
+
+fn protocol_result(report: Option<&Value>, summary: &str, cost: f64) -> Value {
+    let findings: Vec<Value> = report
+        .and_then(|r| r["findings"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|f| {
+            let mut detail = f["failureScenario"].as_str().unwrap_or("").to_string();
+            if let Some(how) = f["howItFails"].as_str().filter(|h| !h.is_empty()) {
+                detail = format!("{detail}\n\n{how}");
+            }
+            json!({
+                "id": f["id"],
+                "title": f["title"],
+                "severity": f["severity"],
+                "file": f["file"],
+                "line": f["line"],
+                "detail": detail.trim(),
+                "url": null,
+            })
+        })
+        .collect();
+    let reviewed = report.is_some_and(|r| r["totals"]["agents"].as_u64().unwrap_or(0) > 0);
+    let verdict = if !findings.is_empty() {
+        "fail"
+    } else if reviewed {
+        "pass"
+    } else {
+        "skip"
+    };
+    let headline = summary.lines().next().unwrap_or("");
+    json!({
+        "protocol": 1,
+        "reviewer": "lens",
+        "verdict": verdict,
+        "headline": headline.strip_prefix("lens: ").unwrap_or(headline),
+        "findings": findings,
+        "cost": { "usd": (cost * 10000.0).round() / 10000.0 },
+    })
 }
 
 pub(crate) fn map_status(work: &Path) -> Value {
@@ -1740,7 +2031,7 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
 }
 
 pub(crate) fn number_all(confirmed: Vec<(Finding, Value)>) -> Vec<Value> {
-    number(confirmed)
+    number(confirmed, 0)
 }
 
 pub(crate) fn slug(s: &str) -> String {
@@ -2034,6 +2325,7 @@ mod tests {
             failure_scenario: String::new(),
             confidence: 0.5,
             carried: false,
+            id: None,
         }
     }
 
@@ -2117,16 +2409,117 @@ mod tests {
 
     #[test]
     fn numbers_blockers_first() {
-        let v = number(vec![
-            (f("a", 1, "major", "x", "c"), json!({ "severity": "major" })),
-            (
-                f("a", 1, "blocker", "y", "c"),
-                json!({ "severity": "blocker" }),
-            ),
-        ]);
+        let v = number(
+            vec![
+                (f("a", 1, "major", "x", "c"), json!({ "severity": "major" })),
+                (
+                    f("a", 1, "blocker", "y", "c"),
+                    json!({ "severity": "blocker" }),
+                ),
+            ],
+            0,
+        );
         assert_eq!(v[0]["id"], "F1");
         assert_eq!(v[0]["severity"], "blocker");
         assert_eq!(v[1]["id"], "F2");
+    }
+
+    #[test]
+    fn keeps_ids_across_rounds() {
+        let mut old = f("a", 1, "major", "x", "c");
+        old.id = Some("F2".into());
+        let v = number(
+            vec![
+                (f("b", 1, "minor", "y", "c"), json!({ "severity": "minor" })),
+                (old, json!({ "severity": "major" })),
+                (
+                    f("c", 1, "blocker", "z", "c"),
+                    json!({ "severity": "blocker" }),
+                ),
+            ],
+            3,
+        );
+        let ids: Vec<_> = v.iter().map(|f| f["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["F4", "F2", "F5"]);
+    }
+
+    #[test]
+    fn settles_dismissed_and_backlogged_findings() {
+        let prior = json!({ "settled": [{ "id": "F1", "outcome": "dismiss" }] });
+        let triaged = json!({ "findings": [
+            { "id": "F1", "outcome": "dismiss" },
+            { "id": "F2", "outcome": "fix" },
+            { "id": "F3", "outcome": "backlog", "reason": "old code", "file": "a", "line": 1 },
+        ]});
+        let settled = settle(Some(&prior), Some(&triaged));
+        let ids: Vec<_> = settled.iter().map(|s| s["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["F1", "F3"]);
+        assert_eq!(settled[1]["reason"], "old code");
+        assert_eq!(outcome(Some(&triaged), &json!("F2")), Some("fix"));
+        assert_eq!(
+            last_id(&json!({ "findings": [{ "id": "F2" }], "settled": settled, "lastId": 1 })),
+            3
+        );
+    }
+
+    #[test]
+    fn writes_protocol_verdicts() {
+        let findings = json!({
+            "totals": { "agents": 2 },
+            "findings": [{
+                "id": "F1", "title": "t", "severity": "major", "file": "a.rs", "line": 3,
+                "failureScenario": "boom", "howItFails": "because",
+            }],
+        });
+        let r = protocol_result(Some(&findings), "lens: 1 finding (1 major)\nmore", 0.123456);
+        assert_eq!(r["protocol"], 1);
+        assert_eq!(r["reviewer"], "lens");
+        assert_eq!(r["verdict"], "fail");
+        assert_eq!(r["headline"], "1 finding (1 major)");
+        assert_eq!(r["findings"][0]["detail"], "boom\n\nbecause");
+        assert_eq!(r["findings"][0]["url"], Value::Null);
+        assert_eq!(r["cost"]["usd"], 0.1235);
+        let clean = json!({ "totals": { "agents": 2 }, "findings": [] });
+        assert_eq!(protocol_result(Some(&clean), "", 0.0)["verdict"], "pass");
+        let skipped = json!({ "totals": { "agents": 0 }, "findings": [] });
+        assert_eq!(protocol_result(Some(&skipped), "", 0.0)["verdict"], "skip");
+        assert_eq!(protocol_result(None, "", 0.0)["verdict"], "skip");
+    }
+
+    #[test]
+    fn takes_protocol_variables() {
+        let env = HashMap::from([
+            ("TASKBOARD_RESULT", "/s/result.json"),
+            ("TASKBOARD_REPO", "/w"),
+            ("TASKBOARD_BASE", "origin/main"),
+            ("TASKBOARD_INTENT", "/s/intent.md"),
+            ("TASKBOARD_STATE_DIR", "/s/state"),
+            ("TASKBOARD_PREVIOUS", ""),
+        ]);
+        let var = |k: &str| env.get(k).map(|v| v.to_string());
+        let opts = Options {
+            repo: ".".into(),
+            base: Some("main".into()),
+            ..Default::default()
+        }
+        .with_protocol(var);
+        assert_eq!(opts.repo, Path::new("/w"));
+        assert_eq!(opts.base.as_deref(), Some("main"));
+        assert_eq!(opts.intent.as_deref(), Some(Path::new("/s/intent.md")));
+        assert_eq!(opts.state.as_deref(), Some(Path::new("/s/state")));
+        assert!(opts.no_fix);
+        let p = opts.protocol.unwrap();
+        assert_eq!(p.result, Path::new("/s/result.json"));
+        assert!(p.previous.is_none());
+
+        let by_hand = Options::default().with_protocol(|_| None);
+        assert!(by_hand.protocol.is_none() && !by_hand.no_fix);
+        let pr = Options {
+            pr: Some(7),
+            ..Default::default()
+        }
+        .with_protocol(var);
+        assert!(pr.protocol.is_none());
     }
 
     #[test]

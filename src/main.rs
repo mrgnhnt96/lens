@@ -18,8 +18,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Review the change: run the reviewers, verify their findings, write the report to
-    /// .review/<branch>.json and take blockers through the fix loop. Each agent runs as its own
-    /// headless `claude -p`. Progress goes to stderr, the summary to stdout.
+    /// <state>/<branch>.json (outside the repo) and take blockers through the fix loop. Each agent
+    /// runs as its own headless `claude -p`. Progress goes to stderr, the summary to stdout. With
+    /// TASKBOARD_RESULT set it runs as a review-protocol reviewer: it fixes nothing and writes the
+    /// protocol's result there (docs/REVIEW.md).
     Review {
         /// The base ref. Defaults to origin's default branch, then main, then master.
         base: Option<String>,
@@ -94,7 +96,8 @@ enum Command {
         repo: PathBuf,
     },
     /// What reviews spent: totals of cost, agents and findings per repo and per day, from the
-    /// `.review/**/*.json` reports under <root> (cache tokens too, when reports carry them).
+    /// reports of reviews run by hand (in lens's state folder) and any `.review/**/*.json` an
+    /// older lens left under <root> (cache tokens too, when reports carry them).
     Cost {
         /// Only reports started since a span like 1d, or a date like 2026-10-19.
         #[arg(long)]
@@ -125,7 +128,7 @@ enum Command {
 enum FixCommand {
     /// Open the loop for one finding of a `lens review` report and snapshot the working tree.
     Start {
-        /// The report, `.review/<branch>.json`.
+        /// The report, `<state>/<branch>.json`.
         #[arg(long)]
         report: PathBuf,
         /// The finding's id, e.g. F1.
@@ -184,7 +187,7 @@ enum PrCommand {
         /// The PR number.
         #[arg(long)]
         pr: u64,
-        /// The pass's report, `.review/pr-<n>.json`.
+        /// The pass's report, `<state>/pr-<n>.json`.
         #[arg(long)]
         report: PathBuf,
         /// The PR's diff, to tell which lines can take an inline comment.
@@ -252,8 +255,7 @@ fn main() -> Result<()> {
             dry_run,
             repo,
         } => {
-            let intent = intent.map(|p| p.canonicalize()).transpose()?;
-            let done = review::run(review::Options {
+            let mut opts = review::Options {
                 repo,
                 base,
                 intent,
@@ -262,7 +264,12 @@ fn main() -> Result<()> {
                 floor,
                 pr,
                 dry_run,
-            })?;
+                state: None,
+                protocol: None,
+            }
+            .with_protocol(|k| std::env::var(k).ok());
+            opts.intent = opts.intent.map(|p| p.canonicalize()).transpose()?;
+            let done = review::run(opts)?;
             println!("{}", done.summary);
         }
         Command::Cost {
@@ -275,7 +282,11 @@ fn main() -> Result<()> {
                 None => PathBuf::from(env::var_os("HOME").context("HOME is not set")?)
                     .join("Development"),
             };
-            println!("{}", cost::run(&root, since.as_deref(), with_prev)?);
+            let state_root = lens::assets::state_root().ok();
+            println!(
+                "{}",
+                cost::run(&root, state_root.as_deref(), since.as_deref(), with_prev)?
+            );
         }
         Command::Usage { since } => {
             let dir = usage::dir().context("HOME is not set")?;

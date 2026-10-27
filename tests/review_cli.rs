@@ -1,10 +1,10 @@
 //! `lens review` end to end, against a throwaway repo and a fake `claude` whose replies are canned:
-//! what's under test is the pass around the agents (tiers, deltas, verification, the report and
-//! the fix loop) and how each agent is started.
+//! what's under test is the pass around the agents (tiers, deltas, verification, the report, the
+//! fix loop and the pre-PR review protocol) and how each agent is started.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lens::review::iso;
@@ -161,6 +161,24 @@ impl Fixture {
         self.review_with(&["main"], args, &[])
     }
 
+    fn run(&self, args: &[&str], env: &[(&str, &Path)]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_lens"))
+            .arg("review")
+            .args(args)
+            .envs(env.iter().copied())
+            .current_dir(self.repo())
+            // The files built into lens and the state of reviews run by hand, under this test's
+            // own cache.
+            .env("XDG_CACHE_HOME", self.dir.path().join("cache"))
+            .env("LENS_CLAUDE", &self.fake)
+            .env("FAKE_LOG", &self.log)
+            .env("LENS_USAGE_DIR", self.usage())
+            // Keep tb out of it: no task context.
+            .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+            .output()
+            .unwrap()
+    }
+
     fn review_with(&self, base: &[&str], args: &[&str], env: &[(&str, &Path)]) -> String {
         self.review_logged(base, args, env).0
     }
@@ -172,21 +190,8 @@ impl Fixture {
         args: &[&str],
         env: &[(&str, &Path)],
     ) -> (String, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_lens"))
-            .arg("review")
-            .args(base)
-            .args(args)
-            .envs(env.iter().copied())
-            .current_dir(self.repo())
-            // The files built into lens, written under this test's own cache.
-            .env("XDG_CACHE_HOME", self.dir.path().join("cache"))
-            .env("LENS_CLAUDE", &self.fake)
-            .env("FAKE_LOG", &self.log)
-            .env("LENS_USAGE_DIR", self.usage())
-            // Keep tb out of it: no task context.
-            .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
-            .output()
-            .unwrap();
+        let args: Vec<&str> = base.iter().chain(args).copied().collect();
+        let out = self.run(&args, env);
         assert!(
             out.status.success(),
             "lens review: {}",
@@ -211,9 +216,51 @@ impl Fixture {
             .collect()
     }
 
-    fn report(&self) -> Value {
-        serde_json::from_str(&fs::read_to_string(self.repo().join(".review/feature.json")).unwrap())
+    /// Where a review run by hand keeps its state: the one repo folder under the cache.
+    fn state(&self) -> PathBuf {
+        let root = self.dir.path().join("cache/lens/state");
+        let dirs: Vec<PathBuf> = fs::read_dir(&root)
             .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        assert!(dirs[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("repo-"));
+        dirs[0].clone()
+    }
+
+    fn report(&self) -> Value {
+        read_json(&self.state().join("feature.json"))
+    }
+
+    /// One round of the review protocol, as the board runs it, with the state in `state/` and the
+    /// result in `result-<round>.json`.
+    fn protocol(&self, round: u32, env: &[(&str, &Path)]) -> Output {
+        let d = self.dir.path();
+        fs::write(d.join("intent.md"), "# Reject empty input\n").unwrap();
+        let result = d.join(format!("result-{round}.json"));
+        let _ = fs::remove_file(&result);
+        let round = round.to_string();
+        let vars: [(&str, &Path); 8] = [
+            ("TASKBOARD_REVIEW_PROTOCOL", Path::new("1")),
+            ("TASKBOARD_REPO", &self.repo()),
+            ("TASKBOARD_BASE", Path::new("main")),
+            ("TASKBOARD_BRANCH", Path::new("feature")),
+            ("TASKBOARD_ROUND", Path::new(&round)),
+            ("TASKBOARD_INTENT", &d.join("intent.md")),
+            ("TASKBOARD_STATE_DIR", &d.join("state")),
+            ("TASKBOARD_RESULT", &result),
+        ];
+        let env: Vec<(&str, &Path)> = vars.iter().chain(env).copied().collect();
+        self.run(&[], &env)
+    }
+
+    fn result(&self, round: u32) -> Value {
+        read_json(&self.dir.path().join(format!("result-{round}.json")))
     }
 
     /// Makes the usage log hold one reading: `window` is `utilization` used and resets
@@ -283,6 +330,21 @@ impl Fixture {
         let _ = fs::remove_file(&self.log);
         calls
     }
+}
+
+fn read_json(path: &Path) -> Value {
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// `git status`, to show a review left the checkout as it was.
+fn status(dir: &Path) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["status", "--porcelain", "--ignored"])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap()
 }
 
 fn roles(calls: &[Value]) -> Vec<String> {
@@ -467,7 +529,7 @@ fn an_unchanged_tree_isnt_reviewed_again_and_a_change_reviews_only_the_delta() {
     let findings = report["findings"].as_array().unwrap();
     assert_eq!(findings.len(), 2);
     assert_eq!(findings[1]["title"], "leaks a handle");
-    assert!(fx.repo().join(".review/feature/prev/report.json").is_file());
+    assert!(fx.state().join("feature/prev/report.json").is_file());
 
     // --full reviews everything, even an unchanged tree.
     fx.review(&["--no-fix", "--full"]);
@@ -528,7 +590,7 @@ fn the_floor_reviews_risky_paths_with_one_sonnet_and_nothing_else() {
     let out = fx.review(&["--floor"]);
     assert!(out.contains("no risky paths"), "{out}");
     assert!(fx.calls().is_empty());
-    assert!(!fx.repo().join(".review/feature.json").exists());
+    assert!(!fx.state().join("feature.json").exists());
 
     write(
         &fx.repo(),
@@ -615,13 +677,12 @@ fn the_pr_pass_runs_the_lead_and_its_focus_areas_and_posts() {
     // Every PR is in the sample, so PR 7 is reviewed whatever its hash.
     write(&d, ".lens.toml", "[pr]\nsample = 1\n");
     let out = fx.review_with(&[], &["--pr", "7"], &[("LENS_GH", &gh), ("FAKE", &fake)]);
-    let report: Value =
-        serde_json::from_str(&fs::read_to_string(d.join(".review/pr-7.json")).unwrap()).unwrap();
+    let report = read_json(&fx.state().join("pr-7.json"));
     assert_eq!(report["pass"], "pr");
     assert_eq!(report["risk"], "moderate");
     assert_eq!(report["assessment"], "**Impact**: small");
     assert_eq!(
-        fs::read_to_string(d.join(".review/pr-7/impact.md")).unwrap(),
+        fs::read_to_string(fx.state().join("pr-7/impact.md")).unwrap(),
         "**Impact**: small"
     );
     let names: Vec<&str> = report["profiles"]
@@ -683,7 +744,157 @@ fn a_pr_outside_the_sample_runs_nothing() {
         "{out}"
     );
     assert!(fx.calls().is_empty());
-    assert!(!d.join(".review/pr-7.json").exists());
+    assert!(!fx.dir.path().join("cache/lens/state").exists());
+}
+
+#[test]
+fn a_review_by_hand_keeps_its_state_out_of_the_repo() {
+    let fx = Fixture::new(60);
+    let before = status(&fx.repo());
+    fx.review(&["--no-fix"]);
+    assert_eq!(status(&fx.repo()), before);
+    assert!(!fx.repo().join(".review").exists());
+    assert!(fx.state().join("feature/diff.patch").is_file());
+    assert_eq!(fx.report()["pass"], "local");
+}
+
+#[test]
+fn the_protocol_writes_a_result_and_never_touches_the_worktree() {
+    let fx = Fixture::new(60);
+    let before = status(&fx.repo());
+    let out = fx.protocol(1, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(status(&fx.repo()), before);
+    assert!(!fx.repo().join(".review").exists());
+    assert!(!fx.dir.path().join("cache/lens/state").exists());
+    assert!(fx.dir.path().join("state/feature.json").is_file());
+
+    let result = fx.result(1);
+    assert_eq!(result["protocol"], 1);
+    assert_eq!(result["reviewer"], "lens");
+    assert_eq!(result["verdict"], "fail");
+    assert!(result["headline"]
+        .as_str()
+        .unwrap()
+        .starts_with("2 findings"));
+    let findings = result["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 2);
+    assert_eq!(findings[0]["id"], "F1");
+    assert_eq!(findings[0]["severity"], "blocker");
+    assert_eq!(findings[0]["file"], "src/a.rs");
+    assert_eq!(findings[0]["line"], 3);
+    assert_eq!(
+        findings[0]["detail"],
+        "parse(\"\") returns Ok\n\n1. parse(\"\")\n2. Ok"
+    );
+    assert_eq!(findings[0]["url"], Value::Null);
+    assert_eq!(findings[1]["id"], "F2");
+    assert_eq!(findings[1]["file"], "src/b.rs");
+    assert!(result["cost"]["usd"].as_f64().unwrap() > 0.0);
+
+    // The intent reached intent-alignment, and no fix loop ran.
+    let calls = fx.calls();
+    assert!(calls.iter().all(|c| c["role"] != "fixer"));
+    assert!(calls.iter().any(|c| c["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("name=\"intent-alignment\"")));
+}
+
+#[test]
+fn the_next_round_drops_what_triage_settled_and_reviews_only_the_delta() {
+    let fx = Fixture::new(60);
+    assert!(fx.protocol(1, &[]).status.success());
+    fx.calls();
+
+    // The triage dismissed the blocker and sent the major to be fixed; the task's agent changed
+    // src/a.rs.
+    let mut previous = fx.result(1);
+    previous["findings"][0]["outcome"] = "dismiss".into();
+    previous["findings"][0]["reason"] = "empty input is allowed".into();
+    previous["findings"][1]["outcome"] = "fix".into();
+    let prev = fx.dir.path().join("previous.json");
+    fs::write(&prev, previous.to_string()).unwrap();
+    write(
+        &fx.repo(),
+        "src/a.rs",
+        &(fs::read_to_string(fx.repo().join("src/a.rs")).unwrap() + "// one more\n"),
+    );
+
+    let out = fx.protocol(2, &[("TASKBOARD_PREVIOUS", &prev)]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = read_json(&fx.dir.path().join("state/feature.json"));
+    assert_eq!(report["mode"], "delta");
+    assert_eq!(report["settled"][0]["id"], "F1");
+    let calls = fx.calls();
+    // The correctness reviewer raised the blocker again: it's dropped unverified. The major the
+    // triage sent to be fixed is verified again, though the delta didn't touch src/b.rs.
+    let verifiers: Vec<&Value> = calls.iter().filter(|c| c["role"] == "verifier").collect();
+    assert_eq!(verifiers.len(), 1);
+    assert!(verifiers[0]["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("src/b.rs"));
+    let result = fx.result(2);
+    assert_eq!(result["verdict"], "fail");
+    let findings = result["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["id"], "F2");
+    assert_eq!(findings[0]["title"], "leaks a handle");
+
+    // Round 3 on the same tree: the triage backlogged F2, so nothing is left and nothing runs.
+    let mut previous = fx.result(2);
+    previous["findings"][0]["outcome"] = "backlog".into();
+    fs::write(&prev, previous.to_string()).unwrap();
+    assert!(fx
+        .protocol(3, &[("TASKBOARD_PREVIOUS", &prev)])
+        .status
+        .success());
+    assert!(fx.calls().is_empty());
+    let result = fx.result(3);
+    assert_eq!(result["verdict"], "pass");
+    assert!(result["findings"].as_array().unwrap().is_empty());
+    assert_eq!(result["cost"]["usd"], 0.0);
+}
+
+#[test]
+fn a_docs_only_change_is_a_skip_under_the_protocol() {
+    let fx = Fixture::new(1);
+    git(&fx.repo(), &["reset", "-q", "--hard", "main"]);
+    write(&fx.repo(), "README.md", "# a\n\nMore words.\n");
+    assert!(fx.protocol(1, &[]).status.success());
+    assert_eq!(fx.result(1)["verdict"], "skip");
+    assert!(fx.calls().is_empty());
+
+    git(&fx.repo(), &["checkout", "-q", "README.md"]);
+    assert!(fx.protocol(2, &[]).status.success());
+    let result = fx.result(2);
+    assert_eq!(result["verdict"], "skip");
+    assert!(result["headline"]
+        .as_str()
+        .unwrap()
+        .contains("nothing to review"));
+}
+
+#[test]
+fn an_incomplete_review_is_a_reviewer_error_under_the_protocol() {
+    let fx = Fixture::new(60);
+    let out = fx.protocol(1, &[("FAKE_FAIL", Path::new("testing"))]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("incomplete"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!fx.dir.path().join("result-1.json").exists());
 }
 
 #[test]
@@ -701,7 +912,7 @@ fn backoff_pauses_reviews_while_a_window_is_past_its_limit_and_says_when_it_lift
         "{out}"
     );
     assert!(fx.calls().is_empty());
-    assert!(!fx.repo().join(".review/feature.json").exists());
+    assert!(!fx.dir.path().join("cache/lens/state").exists());
 
     fx.read_window("five_hour", 0.2, 3600);
     let (_, log) = fx.review_logged(&["main"], &["--no-fix"], &[]);
@@ -822,7 +1033,7 @@ fn a_review_the_backoff_lightened_is_incomplete_so_the_next_one_runs_everything(
 fn a_local_review_the_plan_turns_away_mid_pass_keeps_the_last_report() {
     let fx = Fixture::new(60);
     fx.review(&["--no-fix"]);
-    let before = fs::read_to_string(fx.repo().join(".review/feature.json")).unwrap();
+    let before = fs::read_to_string(fx.state().join("feature.json")).unwrap();
     fx.calls();
 
     for role in ["reviewer", "verifier"] {
@@ -834,7 +1045,7 @@ fn a_local_review_the_plan_turns_away_mid_pass_keeps_the_last_report() {
         assert!(out.contains("lens: paused: "), "{role}: {out}");
         assert!(out.contains("Nothing was reviewed"), "{role}: {out}");
         assert_eq!(
-            fs::read_to_string(fx.repo().join(".review/feature.json")).unwrap(),
+            fs::read_to_string(fx.state().join("feature.json")).unwrap(),
             before,
             "{role}: the last review stays the current one"
         );

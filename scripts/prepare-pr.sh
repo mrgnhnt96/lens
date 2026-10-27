@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Gather what a `lens review --pr <n>` pass needs into .review/pr-<n>/ and print a summary as JSON.
+# Gather what a `lens review --pr <n>` pass needs into $LENS_STATE/pr-<n>/ and print a summary as
+# JSON.
 #
-#   prepare-pr.sh <n>
+#   LENS_STATE=<dir> prepare-pr.sh <n>
 #
 # Fetches the PR's head and base from origin. When the checkout is already at the PR's head with
 # a clean tree it reviews in place; otherwise it checks the head out detached in
-# .review/pr-<n>/tree, so the user's checkout is never touched. Writes:
+# $LENS_STATE/pr-<n>/tree, so the user's checkout is never touched. Writes:
 #   pr.json        `gh pr view` (number, url, title, body, baseRefName, headRefName, headRefOid)
 #   intent.md      the PR's title and description, for intent-alignment
 #   profiles.json  `lens profiles --base origin/<base>`
@@ -18,6 +19,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd -P)
 lens=${LENS:-lens}
 gh=${LENS_GH:-gh}
+state=${LENS_STATE:?prepare-pr: set LENS_STATE to the state folder of the review}
 
 pr=${1:-}
 case $pr in
@@ -27,9 +29,8 @@ esac
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 
-work=.review/pr-$pr
+work=$state/pr-$pr
 mkdir -p "$work"
-[ -f .review/.gitignore ] || printf '*\n' > .review/.gitignore
 rm -f "$work/map.err"
 date +%s > "$work/started"
 
@@ -55,7 +56,7 @@ if [ "$(git rev-parse HEAD)" = "$head" ] && git diff --quiet HEAD -- \
   && [ -z "$(git ls-files --others --exclude-standard)" ]; then
   tree=$root
 else
-  tree=$root/$work/tree
+  tree=$work/tree
   git worktree remove --force "$tree" 2>/dev/null || rm -rf "$tree"
   git worktree prune
   git worktree add --quiet --detach "$tree" "$head"
@@ -90,8 +91,8 @@ cat <<EOF
   "mergeBase": "$merge_base",
   "head": "$head",
   "tree": "$tree",
-  "work": "$root/$work",
-  "report": "$root/.review/pr-$pr.json",
+  "work": "$work",
+  "report": "$state/pr-$pr.json",
   "changedLines": $changed,
   "map": $map_ok,
   "mapSeconds": $map_secs

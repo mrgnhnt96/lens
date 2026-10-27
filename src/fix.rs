@@ -223,8 +223,12 @@ pub fn start(report: &Path, id: &str, cap: u32) -> Result<Step> {
             return Ok(ledger.step(&path));
         }
     }
-    // A sweep fixes in its own worktree; other reports fix the repo they sit in.
-    let root = match doc.get("worktree").and_then(Value::as_str) {
+    // A sweep fixes in its own worktree, a local pass the repo it names; a report from before
+    // lens kept state outside the repo fixes the repo it sits in.
+    let named = ["worktree", "root"]
+        .iter()
+        .find_map(|k| doc.get(*k).and_then(Value::as_str));
+    let root = match named {
         Some(tree) => PathBuf::from(tree),
         None => PathBuf::from(
             git(
