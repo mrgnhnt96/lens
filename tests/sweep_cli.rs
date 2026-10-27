@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -41,14 +41,24 @@ fn write(dir: &Path, path: &str, text: &str) {
 /// a major in src/b.rs, each only when its file is in the change block. The lead splits the range
 /// into one area per file. The verifier confirms the major, and the blocker until the fixer has
 /// marked src/a.rs FIXED. The reviewer whose profile `$FAKE_FAIL` names replies with no JSON.
+/// The plan turns away every agent of the role `$FAKE_REJECT` names, other than the lead.
 const FAKE: &str = r#"#!/usr/bin/env python3
-import json, os, re, sys
+import json, os, re, sys, time
 args = sys.argv[1:]
 prompt = sys.stdin.read()
 system = open(args[args.index("--system-prompt-file") + 1]).read()
 role = re.match(r'<role name="(\w+)">', prompt).group(1)
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps({"role": role, "prompt": prompt, "system": system}) + "\n")
+if role == os.environ.get("FAKE_REJECT") and "You are the lead reviewer" not in prompt:
+    reset = int(time.time()) + 600
+    window = {"utilization": 1.0, "resetsAt": reset, "status": "rejected"}
+    print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "rejected", "resetsAt": reset, "rateLimitType": "five_hour",
+        "unifiedWindows": {"five_hour": window}}}))
+    print(json.dumps({"type": "result", "is_error": True, "result": "limit reached",
+                      "total_cost_usd": 0, "usage": {"input_tokens": 0, "output_tokens": 0}}))
+    sys.exit(1)
 code = open("src/a.rs").read()
 fail = os.environ.get("FAKE_FAIL")
 if role == "reviewer" and fail and f'name="{fail}"' in prompt:
@@ -86,7 +96,8 @@ else:
     reply = {"decision": "escalate", "needs": "other", "reason": "stuck"}
 text = "I couldn't finish." if reply is None else "Done.\n```json\n" + json.dumps(reply) + "\n```\n"
 print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": text,
-                  "total_cost_usd": 0.01, "num_turns": 1}))
+                  "total_cost_usd": 0.01, "num_turns": 1,
+                  "usage": {"input_tokens": 10, "output_tokens": 5}}))
 "#;
 
 /// A fake `gh`: logs its args and prints a PR URL.
@@ -321,6 +332,56 @@ fn the_next_sweep_waits_and_skips_what_an_earlier_one_reported() {
         .as_str()
         .unwrap()
         .starts_with("reported by the sweep of"));
+}
+
+#[test]
+fn a_sweep_the_plan_turns_away_parks_until_the_window_resets() {
+    let fx = Fixture::new();
+    fx.sweep(&[], &[]);
+    let start = fx.watermark();
+    fx.push(&[
+        ("src/a.rs", "pub fn a() {}\npub fn parse() {}\n"),
+        ("src/b.rs", "pub fn b() {}\n"),
+    ]);
+    let calls = || {
+        fs::read_to_string(fx.dir.path().join("calls.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    let out = fx.sweep(&["--now"], &[("FAKE_REJECT", "reviewer")]);
+    assert!(
+        out.contains("lens sweep: paused: the plan's five_hour window is full; resumes at "),
+        "{out}"
+    );
+    assert!(fx.reports().is_empty(), "a parked sweep isn't a sweep");
+    assert_eq!(fx.watermark(), start);
+    // The lead and the first reviewer of each area's group, no more.
+    assert_eq!(calls(), 3);
+    let usage = fx.dir.path().join("usage");
+    assert!(fs::read_to_string(usage.join("readings.jsonl"))
+        .unwrap()
+        .contains("rejected"));
+    let ledger = fs::read_to_string(usage.join("agents.jsonl")).unwrap();
+    assert_eq!(ledger.lines().count(), 1, "only the lead spent: {ledger}");
+
+    // Until the window resets, the next sweep starts nothing.
+    let out = fx.sweep(&["--now"], &[]);
+    assert!(out.contains("lens sweep: paused: "), "{out}");
+    assert_eq!(calls(), 3);
+
+    // After it, the range is swept as if the parked sweep never ran.
+    let gate = usage.join("full.json");
+    let mut held: Value = serde_json::from_str(&fs::read_to_string(&gate).unwrap()).unwrap();
+    held["resetsAt"] = json!(1);
+    fs::write(&gate, held.to_string()).unwrap();
+    let out = fx.sweep(&["--now"], &[]);
+    assert!(
+        out.contains("Blockers: 1 (1 fixed), majors: 1, minors: 1"),
+        "{out}"
+    );
+    assert_eq!(fx.watermark(), Some(fx.origin_main()));
 }
 
 #[test]
