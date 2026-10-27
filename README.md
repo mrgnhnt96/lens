@@ -178,6 +178,19 @@ Every agent lens runs also records what it took of the Claude plan, in `~/.lens/
 Many sessions share the windows, so one run's before and after readings say little on their own;
 the two logs are kept for comparing the change between readings with all the usage in that gap.
 
+### `lens usage [--since 1d|<date>]`
+
+Reads the two logs back:
+
+- lens's spend (runs, `costUsd`, input, output and cache tokens) per repo, per role (reviewer,
+  verifier, fixer, escalator) and per model.
+- each window's first and last reading, its peak, and how far it rose in all (a reset counts the
+  next period from 0).
+- the least lens work 1% of each window holds. The readings are split into stretches that rose at
+  least 2%, and each stretch's lens spend (each run's share by time) over its rise is a floor,
+  since other sessions' usage is in the rise too. The tightest stretch gives the floor, and from it
+  the least lens work the rest of the window holds if nothing else ran.
+
 ## `lens fix`
 
 The blocker fix loop's ledger. `lens review` runs a fixer agent on each blocker, re-reviews the

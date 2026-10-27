@@ -8,16 +8,23 @@
 //!
 //! Many sessions share the windows, so a run's own before and after readings say little; the
 //! ledger and readings are kept side by side so a fit over many gaps can tell what lens's share is.
+//!
+//! `lens usage` reads them back: what lens spent, how far the windows moved, and what that says
+//! about how much of a window lens's dollars take.
 
-use std::fs::OpenOptions;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use serde::Serialize;
+use anyhow::Result;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::review::iso;
+use crate::cost::since_cutoff;
+use crate::review::{iso, ROLES};
 
 /// Where an agent's usage goes, and the repo it ran for.
 #[derive(Debug, Clone)]
@@ -27,8 +34,8 @@ pub struct Log {
 }
 
 /// One agent run's use of one model.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct Row {
     pub started_at: String,
     pub finished_at: String,
@@ -43,8 +50,8 @@ pub struct Row {
 }
 
 /// One window's utilization as the server reported it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct Reading {
     pub at: String,
     /// `five_hour` or `seven_day`.
@@ -57,28 +64,34 @@ pub struct Reading {
     pub label: String,
 }
 
+const LEDGER: &str = "agents.jsonl";
+const READINGS: &str = "readings.jsonl";
+
 /// Agents run on threads of one process; this keeps their lines whole.
 static WRITE: Mutex<()> = Mutex::new(());
 
+/// `$LENS_USAGE_DIR`, else `~/.lens/usage`; `None` without a home.
+pub fn dir() -> Option<PathBuf> {
+    match std::env::var_os("LENS_USAGE_DIR") {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => Some(PathBuf::from(std::env::var_os("HOME")?).join(".lens/usage")),
+    }
+}
+
 impl Log {
-    /// `$LENS_USAGE_DIR`, else `~/.lens/usage`; `None` without a home.
     pub fn new(repo: &str) -> Option<Log> {
-        let dir = match std::env::var_os("LENS_USAGE_DIR") {
-            Some(dir) => PathBuf::from(dir),
-            None => PathBuf::from(std::env::var_os("HOME")?).join(".lens/usage"),
-        };
         Some(Log {
-            dir,
+            dir: dir()?,
             repo: repo.to_string(),
         })
     }
 
     pub fn ledger(&self) -> PathBuf {
-        self.dir.join("agents.jsonl")
+        self.dir.join(LEDGER)
     }
 
     pub fn readings(&self) -> PathBuf {
-        self.dir.join("readings.jsonl")
+        self.dir.join(READINGS)
     }
 
     /// Records a `rate_limit_event`'s window readings, taken at `at`.
@@ -199,6 +212,273 @@ pub fn readings(repo: &str, label: &str, at: &str, event: &Value) -> Vec<Reading
         .collect()
 }
 
+/// The least a window must rise across a stretch of readings before its lens spend is read as a
+/// bound: utilization comes rounded, so smaller rises are mostly rounding.
+const MIN_RISE: f64 = 0.02;
+
+/// Seconds since the epoch of an `iso` time; `None` when it isn't one.
+pub fn secs(iso: &str) -> Option<u64> {
+    let n = |r: std::ops::Range<usize>| iso.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (hh, mm, ss) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    // Days since 1970-01-01 from a civil date (Howard Hinnant's algorithm), the inverse of `iso`.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86400 + hh * 3600 + mm * 60 + ss).ok()
+}
+
+/// Every line of a log that parses; a missing log is empty.
+fn load<T: DeserializeOwned>(path: &Path) -> Vec<T> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// An agent's role from its label: `reviewer-correctness` and `fix-3-reviewer-x` are reviewers.
+pub fn role(label: &str) -> &str {
+    label
+        .split('-')
+        .find(|part| ROLES.contains(part))
+        .unwrap_or_else(|| label.split('-').next().unwrap_or(label))
+}
+
+/// What a group of ledger rows spent.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Spend {
+    /// Agent runs, not rows: a run that used two models is one run.
+    pub runs: u64,
+    pub input: u64,
+    pub output: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
+    pub cost: f64,
+}
+
+/// `rows` grouped by `key`, most spent first.
+pub fn spend<'a>(rows: &'a [Row], key: impl Fn(&'a Row) -> &'a str) -> Vec<(String, Spend)> {
+    // A run is its repo, label and start time.
+    type Runs<'a> = BTreeSet<(&'a str, &'a str, &'a str)>;
+    let mut groups: BTreeMap<&str, (Spend, Runs)> = BTreeMap::new();
+    for r in rows {
+        let (s, runs) = groups.entry(key(r)).or_default();
+        runs.insert((&r.repo, &r.label, &r.started_at));
+        s.input += r.input_tokens;
+        s.output += r.output_tokens;
+        s.cache_creation += r.cache_creation_input_tokens;
+        s.cache_read += r.cache_read_input_tokens;
+        s.cost += r.cost_usd;
+    }
+    let mut out: Vec<(String, Spend)> = groups
+        .into_iter()
+        .map(|(k, (mut s, runs))| {
+            s.runs = runs.len() as u64;
+            (k.to_string(), s)
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.cost.total_cmp(&a.1.cost));
+    out
+}
+
+/// What lens spent between two readings, taking the share of each run that fell between them.
+pub fn spent_between(rows: &[Row], from: u64, to: u64) -> f64 {
+    rows.iter()
+        .filter_map(|r| {
+            let (s, f) = (secs(&r.started_at)?, secs(&r.finished_at)?);
+            let share = if f <= s {
+                f64::from(u8::from(from < f && f <= to))
+            } else {
+                to.min(f).saturating_sub(from.max(s)) as f64 / (f - s) as f64
+            };
+            Some(r.cost_usd * share)
+        })
+        .sum()
+}
+
+/// How one window moved over the span, and what lens spent while it did.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Window {
+    pub name: String,
+    pub first: Reading,
+    pub last: Reading,
+    pub peak: f64,
+    /// The rises added up, each period counted from 0 after a reset.
+    pub risen: f64,
+    pub resets: u64,
+    /// Stretches of readings that rose at least `MIN_RISE`, as (lens's spend, the rise).
+    pub stretches: Vec<(f64, f64)>,
+}
+
+impl Window {
+    /// The least a full window can hold in lens's dollars, per 1%: every stretch's rise includes
+    /// whatever else used the plan, so its lens spend over its rise is a floor. Pooled over every
+    /// stretch, and the tightest single one.
+    pub fn floors(&self) -> Option<(f64, f64)> {
+        let (cost, rise) = self
+            .stretches
+            .iter()
+            .fold((0.0, 0.0), |(c, r), (sc, sr)| (c + sc, r + sr));
+        if rise <= 0.0 || cost <= 0.0 {
+            return None;
+        }
+        let tightest = self
+            .stretches
+            .iter()
+            .map(|(c, r)| c / (r * 100.0))
+            .fold(0.0, f64::max);
+        Some((cost / (rise * 100.0), tightest))
+    }
+}
+
+/// One window's readings, in time order, against the ledger.
+pub fn window(name: &str, readings: &[&Reading], rows: &[Row]) -> Option<Window> {
+    let (first, last) = (*readings.first()?, *readings.last()?);
+    let mut w = Window {
+        name: name.to_string(),
+        first: first.clone(),
+        last: last.clone(),
+        peak: readings.iter().map(|r| r.utilization).fold(0.0, f64::max),
+        ..Window::default()
+    };
+    let mut anchor = first;
+    for pair in readings.windows(2) {
+        let (prev, next) = (pair[0], pair[1]);
+        if next.resets_at != prev.resets_at || next.utilization < prev.utilization {
+            w.resets += 1;
+            w.risen += next.utilization;
+            anchor = next;
+            continue;
+        }
+        w.risen += next.utilization - prev.utilization;
+        let rise = next.utilization - anchor.utilization;
+        if rise + 1e-9 >= MIN_RISE {
+            if let (Some(from), Some(to)) = (secs(&anchor.at), secs(&next.at)) {
+                w.stretches.push((spent_between(rows, from, to), rise));
+            }
+            anchor = next;
+        }
+    }
+    Some(w)
+}
+
+/// The usage report for everything at or after `cutoff`.
+pub fn report(dir: &Path, cutoff: Option<&str>) -> String {
+    let after = |at: &str| cutoff.is_none_or(|c| at >= c);
+    let rows: Vec<Row> = load::<Row>(&dir.join(LEDGER))
+        .into_iter()
+        .filter(|r| after(&r.started_at))
+        .collect();
+    let mut readings: Vec<Reading> = load::<Reading>(&dir.join(READINGS))
+        .into_iter()
+        .filter(|r| after(&r.at))
+        .collect();
+    readings.sort_by(|a, b| a.at.cmp(&b.at));
+    render(dir, cutoff, &rows, &readings)
+}
+
+pub fn run(dir: &Path, since: Option<&str>, now_secs: u64) -> Result<String> {
+    let cutoff = since.map(|s| since_cutoff(s, now_secs)).transpose()?;
+    Ok(report(dir, cutoff.as_deref()))
+}
+
+fn table(title: &str, groups: Vec<(String, Spend)>, all: &Spend) -> Vec<String> {
+    let width = groups
+        .iter()
+        .map(|(k, _)| k.len())
+        .max()
+        .unwrap_or(0)
+        .max(title.len())
+        .max(5);
+    let line = |k: &str, s: &Spend| {
+        format!(
+            "{k:<width$}  {:>5}  {:>9.2}  {:>10}  {:>10}  {:>12}  {:>12}",
+            s.runs, s.cost, s.input, s.output, s.cache_creation, s.cache_read
+        )
+    };
+    let mut out = vec![format!(
+        "{title:<width$}  {:>5}  {:>9}  {:>10}  {:>10}  {:>12}  {:>12}",
+        "runs", "cost USD", "input", "output", "cache write", "cache read"
+    )];
+    out.extend(groups.iter().map(|(k, s)| line(k, s)));
+    out.push(line("total", all));
+    out
+}
+
+fn pct(u: f64) -> String {
+    format!("{:.0}%", u * 100.0)
+}
+
+pub fn render(dir: &Path, cutoff: Option<&str>, rows: &[Row], readings: &[Reading]) -> String {
+    let mut out = vec![format!(
+        "lens usage in {}{}",
+        dir.display(),
+        cutoff.map_or(String::new(), |c| format!(", since {c}"))
+    )];
+    if rows.is_empty() && readings.is_empty() {
+        out.push("Nothing recorded yet.".into());
+        return out.join("\n");
+    }
+    if let Some((_, all)) = spend(rows, |_| "total").pop() {
+        out.push(String::new());
+        out.extend(table("repo", spend(rows, |r| &r.repo), &all));
+        out.push(String::new());
+        out.extend(table("role", spend(rows, |r| role(&r.label)), &all));
+        out.push(String::new());
+        out.extend(table("model", spend(rows, |r| &r.model), &all));
+    }
+    let names: BTreeSet<&str> = readings.iter().map(|r| r.window.as_str()).collect();
+    for name in names {
+        let of: Vec<&Reading> = readings.iter().filter(|r| r.window == name).collect();
+        let Some(w) = window(name, &of, rows) else {
+            continue;
+        };
+        out.push(String::new());
+        out.push(format!(
+            "{name}: {} at {} -> {} at {} (peak {}, rose {} in all{}), resets {}",
+            pct(w.first.utilization),
+            w.first.at,
+            pct(w.last.utilization),
+            w.last.at,
+            pct(w.peak),
+            pct(w.risen),
+            match w.resets {
+                0 => String::new(),
+                1 => ", across 1 reset".into(),
+                n => format!(", across {n} resets"),
+            },
+            w.last.resets_at,
+        ));
+        match w.floors() {
+            Some((pooled, tightest)) => {
+                let left = (1.0 - w.last.utilization).max(0.0) * 100.0 * tightest;
+                out.push(format!(
+                    "  1% of it holds at least ${tightest:.2} of lens work ({} stretches; pooled ${pooled:.2})",
+                    w.stretches.len()
+                ));
+                out.push(format!(
+                    "  so the {} left holds at least ${left:.2} of lens work, if nothing else ran",
+                    pct(1.0 - w.last.utilization)
+                ));
+            }
+            None => out.push(format!(
+                "  too little lens spend over a rise of {}+ to tell what 1% holds",
+                pct(MIN_RISE)
+            )),
+        }
+    }
+    out.push(String::new());
+    out.push(
+        "Other sessions share the windows, so the $ per 1% are floors: lens's real share of a window is at most its spend over these."
+            .into(),
+    );
+    out.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +580,144 @@ mod tests {
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger[0]["repo"], "lens");
         assert_eq!(ledger[0]["costUsd"], 0.1);
+    }
+
+    fn row(label: &str, model: &str, start: &str, finish: &str, cost: f64) -> Row {
+        Row {
+            started_at: start.into(),
+            finished_at: finish.into(),
+            repo: "lens".into(),
+            label: label.into(),
+            model: model.into(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cost_usd: cost,
+            ..Row::default()
+        }
+    }
+
+    fn reading(at: &str, u: f64, resets_at: &str) -> Reading {
+        Reading {
+            at: at.into(),
+            window: "five_hour".into(),
+            utilization: u,
+            resets_at: resets_at.into(),
+            ..Reading::default()
+        }
+    }
+
+    #[test]
+    fn secs_inverts_iso() {
+        for t in [0, 86399, 951_782_400, 1_793_125_800] {
+            assert_eq!(secs(&iso(t)), Some(t));
+        }
+        assert_eq!(secs("2026-10"), None);
+    }
+
+    #[test]
+    fn roles_from_labels() {
+        assert_eq!(role("reviewer-correctness"), "reviewer");
+        assert_eq!(role("fix-3-verifier"), "verifier");
+        assert_eq!(role("escalator-2-1-1"), "escalator");
+        assert_eq!(role("mapper"), "mapper");
+    }
+
+    #[test]
+    fn spend_counts_a_two_model_run_once() {
+        let rows = [
+            row(
+                "reviewer-a",
+                "sonnet",
+                "2026-10-27T10:00:00Z",
+                "2026-10-27T10:01:00Z",
+                0.4,
+            ),
+            row(
+                "reviewer-a",
+                "haiku",
+                "2026-10-27T10:00:00Z",
+                "2026-10-27T10:01:00Z",
+                0.1,
+            ),
+            row(
+                "verifier-1",
+                "sonnet",
+                "2026-10-27T10:02:00Z",
+                "2026-10-27T10:03:00Z",
+                1.0,
+            ),
+        ];
+        let by_role = spend(&rows, |r| role(&r.label));
+        assert_eq!(by_role[0].0, "verifier");
+        assert_eq!(by_role[1].1.runs, 1);
+        assert!((by_role[1].1.cost - 0.5).abs() < 1e-9);
+        assert_eq!(by_role[1].1.input, 20);
+        let by_model = spend(&rows, |r| &r.model);
+        assert_eq!(by_model[0].1.runs, 2);
+    }
+
+    #[test]
+    fn spend_between_takes_the_overlapping_share() {
+        let rows = [row("x", "m", &iso(100), &iso(200), 1.0)];
+        assert!((spent_between(&rows, 150, 300) - 0.5).abs() < 1e-9);
+        assert_eq!(spent_between(&rows, 200, 300), 0.0);
+        let instant = [row("x", "m", &iso(100), &iso(100), 1.0)];
+        assert_eq!(spent_between(&instant, 50, 100), 1.0);
+        assert_eq!(spent_between(&instant, 100, 150), 0.0);
+    }
+
+    #[test]
+    fn a_window_bounds_what_one_percent_holds() {
+        let r = "2026-10-27T15:00:00Z";
+        let readings = [
+            reading(&iso(0), 0.10, r),
+            reading(&iso(50), 0.11, r),
+            reading(&iso(100), 0.12, r),
+            reading(&iso(200), 0.20, r),
+            // A reset: the next period counts from 0.
+            reading(&iso(300), 0.03, "2026-10-27T20:00:00Z"),
+        ];
+        let refs: Vec<&Reading> = readings.iter().collect();
+        let rows = [row("x", "m", &iso(0), &iso(200), 4.0)];
+        let w = window("five_hour", &refs, &rows).unwrap();
+        assert_eq!(w.resets, 1);
+        assert!((w.risen - 0.13).abs() < 1e-9);
+        assert_eq!(w.peak, 0.20);
+        // 0.10 -> 0.12 over 0..100 ($2), then 0.12 -> 0.20 over 100..200 ($2).
+        assert_eq!(w.stretches.len(), 2);
+        let (pooled, tightest) = w.floors().unwrap();
+        assert!((pooled - 0.4).abs() < 1e-9);
+        assert!((tightest - 1.0).abs() < 1e-9);
+        let flat = [reading(&iso(0), 0.5, r), reading(&iso(9), 0.5, r)];
+        let refs: Vec<&Reading> = flat.iter().collect();
+        assert!(window("five_hour", &refs, &rows)
+            .unwrap()
+            .floors()
+            .is_none());
+    }
+
+    #[test]
+    fn report_reads_the_logs_back() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(report(dir.path(), None).contains("Nothing recorded yet."));
+        let log = Log {
+            dir: dir.path().into(),
+            repo: "lens".into(),
+        };
+        let result =
+            json!({"modelUsage": {"claude-sonnet-5-5": {"inputTokens": 1, "costUSD": 3.0}}});
+        log.record_result("reviewer-a", "sonnet", &iso(1000), &iso(2000), &result);
+        let event = |u: f64| {
+            json!({"rate_limit_info": {"unifiedWindows": {
+            "five_hour": {"utilization": u, "resetsAt": 1793125800}}}})
+        };
+        log.record_readings("reviewer-a", &iso(1000), &event(0.40));
+        log.record_readings("reviewer-a", &iso(2000), &event(0.50));
+        let text = report(dir.path(), None);
+        assert!(text.contains("reviewer"), "{text}");
+        assert!(text.contains("five_hour: 40%"), "{text}");
+        assert!(text.contains("1% of it holds at least $0.30"), "{text}");
+        assert!(text.contains("50% left holds at least $15.00"), "{text}");
+        assert!(report(dir.path(), Some("2100")).contains("Nothing recorded yet."));
     }
 }
