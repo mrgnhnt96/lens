@@ -418,7 +418,7 @@ pub(crate) struct Pass {
     /// lens's own files (`assets::root`).
     pub(crate) assets: PathBuf,
     pub(crate) root: PathBuf,
-    /// Where agents read the code: the repo, the PR's tree or the sweep's.
+    /// Where agents read the code: the repo or the PR's tree.
     pub(crate) tree_dir: PathBuf,
     /// The folder `context` reads the change from (diff.patch, map.json, profiles.json).
     pub(crate) work: PathBuf,

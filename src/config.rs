@@ -19,9 +19,10 @@ pub struct Config {
     #[serde(default)]
     pub floor: FloorConfig,
     #[serde(default)]
-    pub sweep: SweepConfig,
-    #[serde(default)]
     pub backoff: BackoffConfig,
+    /// `[sweep]` belonged to `lens sweep`, which is gone; old files still load.
+    #[serde(default, rename = "sweep")]
+    _sweep: Option<toml::Value>,
 }
 
 /// `[backoff]`: lens reviewing less as the plan's usage windows fill. Off unless a window's
@@ -64,31 +65,6 @@ impl WindowBackoff {
             ("ahead_by", self.ahead_by),
             ("sample", self.sample),
         ]
-    }
-}
-
-/// `[sweep]`: when `lens sweep` runs and how it splits what it reviews.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct SweepConfig {
-    /// How long after the last sweep the next one is due: a span like `6h`, `90m` or `1d`.
-    pub every: String,
-    /// A sweep is due early once this many lines changed since the last one.
-    pub max_lines: u32,
-    /// The most changed lines one area of the sweep gets.
-    pub area_lines: u32,
-    /// Once today's sweeps (UTC) spent this much, the next waits for tomorrow.
-    pub daily_budget_usd: Option<f64>,
-}
-
-impl Default for SweepConfig {
-    fn default() -> Self {
-        SweepConfig {
-            every: "6h".into(),
-            max_lines: 1500,
-            area_lines: 800,
-            daily_budget_usd: None,
-        }
     }
 }
 
@@ -362,18 +338,9 @@ mod tests {
     }
 
     #[test]
-    fn sweep_settings_default_and_override() {
-        let c: Config = toml::from_str("").unwrap();
-        assert_eq!(c.sweep.every, "6h");
-        assert_eq!(c.sweep.max_lines, 1500);
-        assert_eq!(c.sweep.area_lines, 800);
-        assert_eq!(c.sweep.daily_budget_usd, None);
-        let c: Config =
-            toml::from_str("[sweep]\nevery = \"2h\"\ndaily_budget_usd = 5.0\n").unwrap();
-        assert_eq!(c.sweep.every, "2h");
-        assert_eq!(c.sweep.daily_budget_usd, Some(5.0));
-        assert_eq!(c.sweep.max_lines, 1500);
-        assert!(toml::from_str::<Config>("[sweep]\nevry = \"2h\"\n").is_err());
+    fn a_leftover_sweep_section_is_ignored() {
+        let c: Config = toml::from_str("[sweep]\nevery = \"2h\"\n").unwrap();
+        assert_eq!(c.review.small_lines, 40);
     }
 
     #[test]
