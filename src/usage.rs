@@ -902,6 +902,46 @@ mod tests {
     }
 
     #[test]
+    fn a_report_of_only_rejected_runs_has_no_model_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log {
+            dir: dir.path().into(),
+            repo: "lens".into(),
+        };
+        let none = json!({"usage": {"input_tokens": 0, "output_tokens": 0}});
+        log.record_result("reviewer-a", "sonnet", &iso(1000), &iso(1000), &none);
+        log.record_result("reviewer-b", "sonnet", &iso(2000), &iso(2000), &none);
+        let text = report(dir.path(), None, 3000);
+        assert!(
+            text.contains("rejected runs (no tokens, not in the model table): 2"),
+            "{text}"
+        );
+        assert!(!text.contains("\nmodel"), "{text}");
+    }
+
+    #[test]
+    fn the_report_pluralises_stretches() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log {
+            dir: dir.path().into(),
+            repo: "lens".into(),
+        };
+        let used = json!({"modelUsage": {"claude-sonnet-5-5": {"inputTokens": 1, "costUSD": 1.0}}});
+        log.record_result("reviewer-a", "sonnet", &iso(0), &iso(100), &used);
+        log.record_result("reviewer-a", "sonnet", &iso(200), &iso(300), &used);
+        let event = |u: f64, resets: u64| {
+            json!({"rate_limit_info": {"unifiedWindows": {
+            "five_hour": {"utilization": u, "resetsAt": resets}}}})
+        };
+        log.record_readings("x", &iso(0), &event(0.10, 9000));
+        log.record_readings("x", &iso(100), &event(0.20, 9000));
+        log.record_readings("x", &iso(200), &event(0.05, 18000));
+        log.record_readings("x", &iso(300), &event(0.15, 18000));
+        let text = report(dir.path(), None, 400);
+        assert!(text.contains("pooled over 2 stretches)"), "{text}");
+    }
+
+    #[test]
     fn per_one_percent_and_left_agree_when_rounded_once() {
         let dir = tempfile::tempdir().unwrap();
         let log = Log {
