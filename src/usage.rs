@@ -707,6 +707,46 @@ mod tests {
     }
 
     #[test]
+    fn a_dip_inside_a_stretch_does_not_re_anchor_it() {
+        let r = "2026-10-27T15:00:00Z";
+        let readings = [
+            reading(&iso(0), 0.10, r),
+            reading(&iso(10), 0.08, r),
+            reading(&iso(20), 0.13, r),
+        ];
+        let refs: Vec<&Reading> = readings.iter().collect();
+        let rows = [row("x", "m", &iso(0), &iso(20), 3.0)];
+        let w = window("five_hour", &refs, &rows).unwrap();
+        // One stretch from the first reading, rising 0.03 from 0.10, not 0.05 from the dip.
+        assert_eq!(w.stretches.len(), 1);
+        let (spent, rise) = w.stretches[0];
+        assert!((spent - 3.0).abs() < 1e-9);
+        assert!((rise - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_reset_re_bases_the_stretch_at_the_post_reset_reading() {
+        let readings = [
+            reading(&iso(0), 0.50, "2026-10-27T15:00:00Z"),
+            reading(&iso(100), 0.90, "2026-10-27T15:00:00Z"),
+            reading(&iso(200), 0.05, "2026-10-27T20:00:00Z"),
+            reading(&iso(300), 0.08, "2026-10-27T20:00:00Z"),
+        ];
+        let refs: Vec<&Reading> = readings.iter().collect();
+        // The $100 row sits between the old stretch and the post-reset reading.
+        let rows = [
+            row("x", "m", &iso(0), &iso(100), 1.0),
+            row("x", "m", &iso(100), &iso(200), 100.0),
+            row("x", "m", &iso(200), &iso(300), 3.0),
+        ];
+        let w = window("five_hour", &refs, &rows).unwrap();
+        assert_eq!(w.stretches.len(), 2);
+        let (spent, rise) = w.stretches[1];
+        assert!((spent - 3.0).abs() < 1e-9, "spent {spent}");
+        assert!((rise - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
     fn a_window_bounds_what_one_percent_holds() {
         let r = "2026-10-27T15:00:00Z";
         let readings = [
