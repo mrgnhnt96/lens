@@ -1930,7 +1930,7 @@ mod tests {
             &repo,
             &["worktree", "add", "-q", slot.to_str().unwrap(), "-b", "w"],
         );
-        assert_eq!(usage_log(&slot).unwrap().repo,"taskboard");
+        assert_eq!(usage_log(&slot).unwrap().repo, "taskboard");
     }
 
     #[test]
