@@ -31,6 +31,7 @@ use crate::config::{self, Config};
 use crate::diff::git;
 use crate::fix;
 use crate::pr;
+use crate::usage;
 
 #[derive(Debug, Clone, Default)]
 pub struct Options {
@@ -404,6 +405,7 @@ impl Pass {
             fixer_permission_mode: cfg.review.fixer_permission_mode.clone(),
             log_dir: work.join("agents"),
             cached: Default::default(),
+            usage: usage::Log::new(root.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
         };
         let mut roles = HashMap::new();
         for role in ROLES {

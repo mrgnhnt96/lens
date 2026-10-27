@@ -165,6 +165,19 @@ per repo and per day, plus cache creation/read tokens when the reports carry the
 takes a span (`1d`) or a date (`2026-10-19`). Archived earlier passes (`prev/`) are left out
 unless you pass `--with-prev`.
 
+## Usage log
+
+Every agent lens runs also records what it took of the Claude plan, in `~/.lens/usage/` (or
+`$LENS_USAGE_DIR`), one JSON object per line:
+
+- `agents.jsonl`: a row per agent run and model, with its repo, label, start and finish times,
+  input, output and cache tokens, and `costUsd`.
+- `readings.jsonl`: every reading of the 5-hour and 7-day windows the agents' streams report
+  (`window`, `utilization` from 0 to 1, `resetsAt`, when it was seen).
+
+Many sessions share the windows, so one run's before and after readings say little on their own;
+the two logs are kept for comparing the change between readings with all the usage in that gap.
+
 ## `lens fix`
 
 The blocker fix loop's ledger. `lens review` runs a fixer agent on each blocker, re-reviews the

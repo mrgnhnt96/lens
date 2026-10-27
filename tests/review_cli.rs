@@ -95,9 +95,16 @@ else:
     reply = {"decision": "escalate", "needs": "other", "reason": "stuck"}
 text = "I couldn't finish." if reply is None else "Done.\n```json\n" + json.dumps(reply) + "\n```\n"
 print(json.dumps({"type": "system", "subtype": "init"}))
+print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {"unifiedWindows": {
+    "five_hour": {"utilization": 0.5, "resetsAt": 1793125800, "status": "allowed"},
+    "seven_day": {"utilization": 0.25, "resetsAt": 1793466000, "status": "allowed"}}}}))
 print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": text}], "usage": usage}}))
 print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": text,
-                  "total_cost_usd": 0.01, "num_turns": 1}))
+                  "total_cost_usd": 0.01, "num_turns": 1,
+                  "modelUsage": {args[args.index("--model") + 1]: {
+                      "inputTokens": 10, "outputTokens": 20, "costUSD": 0.01, **{
+                          "cacheCreationInputTokens": usage["cache_creation_input_tokens"],
+                          "cacheReadInputTokens": usage["cache_read_input_tokens"]}}}}))
 "#;
 
 struct Fixture {
@@ -153,6 +160,7 @@ impl Fixture {
             .env("XDG_CACHE_HOME", self.dir.path().join("cache"))
             .env("LENS_CLAUDE", &self.fake)
             .env("FAKE_LOG", &self.log)
+            .env("LENS_USAGE_DIR", self.usage())
             // Keep tb out of it: no task context.
             .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
             .output()
@@ -163,6 +171,19 @@ impl Fixture {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8(out.stdout).unwrap()
+    }
+
+    fn usage(&self) -> PathBuf {
+        self.dir.path().join("usage")
+    }
+
+    /// The lines of one of the usage logs.
+    fn usage_log(&self, name: &str) -> Vec<Value> {
+        fs::read_to_string(self.usage().join(name))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
     }
 
     fn report(&self) -> Value {
@@ -291,6 +312,46 @@ fn a_full_review_verifies_blockers_and_drops_the_rest() {
         report["totals"]["cacheReadInputTokens"],
         change * (4 - groups.len() as u64)
     );
+}
+
+#[test]
+fn every_agent_records_its_tokens_and_the_window_readings() {
+    let fx = Fixture::new(60);
+    fx.review(&["--no-fix"]);
+    let ledger = fx.usage_log("agents.jsonl");
+    assert_eq!(ledger.len(), 4, "{ledger:?}");
+    for row in &ledger {
+        assert_eq!(row["repo"], "repo");
+        assert_eq!(row["model"], "sonnet");
+        assert_eq!(
+            (&row["inputTokens"], &row["outputTokens"]),
+            (&10.into(), &20.into())
+        );
+        assert_eq!(row["costUsd"], 0.01);
+        assert!(row["startedAt"].as_str().unwrap() <= row["finishedAt"].as_str().unwrap());
+    }
+    let mut labels: Vec<&str> = ledger
+        .iter()
+        .map(|r| r["label"].as_str().unwrap())
+        .collect();
+    labels.sort();
+    labels.dedup();
+    assert_eq!(labels.len(), 4, "a row per agent: {labels:?}");
+
+    let readings = fx.usage_log("readings.jsonl");
+    assert_eq!(
+        readings.len(),
+        8,
+        "both windows from each agent: {readings:?}"
+    );
+    let five: Vec<&Value> = readings
+        .iter()
+        .filter(|r| r["window"] == "five_hour")
+        .collect();
+    assert_eq!(five.len(), 4);
+    assert!(five
+        .iter()
+        .all(|r| r["utilization"] == 0.5 && r["repo"] == "repo"));
 }
 
 #[test]
