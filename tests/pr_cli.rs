@@ -7,11 +7,18 @@ use std::process::Command;
 use serde_json::{json, Value};
 
 /// A `gh` stand-in: serves `$FAKE/comments.json` and `$FAKE/reviews.json`, saves a posted review
-/// to `$FAKE/posted.json` and the token it saw to `$FAKE/token`.
+/// to `$FAKE/posted.json` and the token it saw to `$FAKE/token`. With `$FAKE/own`, the PR is the
+/// poster's own and GitHub refuses a verdict on it.
 const FAKE_GH: &str = r#"#!/bin/sh
 printf '%s' "${GH_TOKEN:-}" > "$FAKE/token"
 case "$*" in
-  *--method\ POST*) cat > "$FAKE/posted.json"; echo '{"html_url":"https://github.test/pr/7#review-1"}' ;;
+  *--method\ POST*)
+    body=$(cat)
+    if [ -f "$FAKE/own" ] && ! printf '%s' "$body" | grep -q '"event":"COMMENT"'; then
+      echo 'gh: Unprocessable Entity (HTTP 422): Can not request changes on your own pull request' >&2
+      exit 1
+    fi
+    printf '%s' "$body" > "$FAKE/posted.json"; echo '{"html_url":"https://github.test/pr/7#review-1"}' ;;
   *pulls/7/comments*) cat "$FAKE/comments.json" ;;
   *pulls/7/reviews*) cat "$FAKE/reviews.json" ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -108,6 +115,7 @@ fn posts_one_review_inline_where_it_can() {
     let sent: Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join("posted.json")).unwrap()).unwrap();
     assert_eq!(sent["commit_id"], "0123456789abcdef");
+    assert_eq!(sent["event"], "REQUEST_CHANGES");
     assert_eq!(sent["comments"].as_array().unwrap().len(), 1);
     assert_eq!(sent["comments"][0]["path"], "src/a.rs");
     assert!(sent["body"].as_str().unwrap().contains("`src/b.rs:9`"));
@@ -185,4 +193,33 @@ fn bot_identity_uses_the_configured_token() {
         fs::read_to_string(dir.path().join("token")).unwrap(),
         "bot-secret"
     );
+}
+
+#[test]
+fn on_the_posters_own_pr_findings_post_as_a_plain_review() {
+    let dir = tempfile::tempdir().unwrap();
+    setup(dir.path(), json!([]));
+    fs::write(dir.path().join("own"), "").unwrap();
+    let out = post(dir.path(), &[]);
+    assert_eq!(out["posted"], true);
+    assert_eq!(out["event"], "REQUEST_CHANGES");
+    let sent: Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("posted.json")).unwrap()).unwrap();
+    assert_eq!(sent["event"], "COMMENT");
+    assert_eq!(sent["comments"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_clean_review_of_the_posters_own_pr_posts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    setup(dir.path(), json!([]));
+    let report = dir.path().join("pr-7.json");
+    let mut r: Value = serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+    r["findings"] = json!([]);
+    fs::write(&report, r.to_string()).unwrap();
+    fs::write(dir.path().join("own"), "").unwrap();
+    let out = post(dir.path(), &[]);
+    assert_eq!(out["posted"], false);
+    assert_eq!(out["event"], "APPROVE");
+    assert!(!dir.path().join("posted.json").exists());
 }

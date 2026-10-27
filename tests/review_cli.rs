@@ -617,8 +617,9 @@ fn the_pr_pass_runs_the_lead_and_its_focus_areas_and_posts() {
     let posted: Value =
         serde_json::from_str(&fs::read_to_string(fake.join("posted.json")).unwrap()).unwrap();
     assert!(!posted["comments"].as_array().unwrap().is_empty());
+    assert_eq!(posted["event"], "REQUEST_CHANGES");
     assert!(
-        out.contains("Posted: https://github.test/pr/7#review-1"),
+        out.contains("Posted (request changes): https://github.test/pr/7#review-1"),
         "{out}"
     );
     let roles = roles(&fx.calls());

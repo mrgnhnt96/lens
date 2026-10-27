@@ -179,7 +179,8 @@ The format is the same, except:
 `lens pr post` reads the report and posts it; it uses `head`, `base`, `risk`, `assessment`,
 `profiles`, `findings` and the length of `dropped`, and ignores the rest. Each posted comment
 ends with `<!-- lens:finding key=<hash of file and title> -->` and the review body with
-`<!-- lens:review head=<sha> -->`, which is how later runs find what's already there.
+`<!-- lens:review head=<sha> verdict=<APPROVE|REQUEST_CHANGES> -->`, which is how later runs find
+what's already there and the verdict they last gave.
 
 ## The sweep
 
