@@ -203,28 +203,3 @@ The format is the same, except:
 ends with `<!-- lens:finding key=<hash of file and title> -->` and the review body with
 `<!-- lens:review head=<sha> verdict=<APPROVE|REQUEST_CHANGES> -->`, which is how later runs find
 what's already there and the verdict they last gave.
-
-## The sweep
-
-`lens sweep` saves to `.review/sweep-<stamp>.json`, with its inputs in `.review/sweep-<stamp>/`
-(the whole range's `diff.patch`, `profiles.json` and `map.json`; an `area-<n>/` folder per area
-with the same files cut down to that area, plus its agents' replies; `fix/` and the worktree
-`tree/` while it runs). The digest goes to `.review/sweep-<stamp>.md`. The format is the same
-as the PR pass's, except:
-
-- `pass` is `sweep`. `target` is the branch swept (`origin/main`). `since`, `base` and
-  `mergeBase` are the watermark the range starts from, and `head` is where it ends. It also
-  has `commits` and `changedLines`, `dryRun`, `branch` (the fix branch, not set on a dry run)
-  and `worktree`.
-- `areas` lists `{ "title", "files", "why", "lines" }`. `docAreas` lists the areas that weren't
-  reviewed because they only touch docs. Every finding, minor and skipped entry carries the
-  `area` (1-based) it came from, and so do the reviewers' rows in `profiles`.
-- `findings` holds the confirmed blockers and majors. A fixed blocker has `fix.status:
-  "resolved"` and the `commit` of its fix. `minors` holds the minors and nits, unverified, with
-  ids `M1`, `M2`... `skipped` holds the findings an earlier sweep reported, with `reason`.
-- `pr` is the URL of the PR the sweep opened. `watermark` is `{ "moved": true, "to": "<sha>" }`,
-  or `{ "moved": false }` after a dry run or a failed reviewer.
-
-The next sweep reads earlier reports for three things: when the last one started (`every`),
-what today's cost (`daily_budget_usd`) and which findings they reported. Dry runs count only
-towards the budget.

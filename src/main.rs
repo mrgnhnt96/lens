@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use lens::{config, cost, diff, map, pr, profile, review, select, sweep, usage};
+use lens::{config, cost, diff, map, pr, profile, review, select, usage};
 
 /// Agent code review for Claude Code.
 #[derive(Parser)]
@@ -68,24 +68,6 @@ enum Command {
         /// The provider to use instead of .lens.toml's: "grep" (built in) or a program.
         #[arg(long)]
         provider: Option<String>,
-    },
-    /// Review everything pushed to origin's default branch since the last sweep (the
-    /// refs/lens/swept watermark): reviewers per area, the verifier, the fix loop on blockers in
-    /// a worktree on lens/sweep-<stamp>, and one PR with the digest. The report goes to
-    /// .review/sweep-<stamp>.json.
-    Sweep {
-        /// Review from this ref instead of the watermark.
-        #[arg(long)]
-        since: Option<String>,
-        /// Review and report, but fix nothing, open no PR and leave the watermark.
-        #[arg(long)]
-        dry_run: bool,
-        /// Run even when [sweep] says it isn't due or today's budget is spent.
-        #[arg(long)]
-        now: bool,
-        /// The repo to sweep. Defaults to the current directory.
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
     },
     /// What reviews spent: totals of cost, agents and findings per repo and per day, from the
     /// reports of reviews run by hand (in lens's state folder) and any `.review/**/*.json` an
@@ -236,22 +218,6 @@ fn main() -> Result<()> {
             let dir = usage::dir().context("HOME is not set")?;
             let now = lens::agent::now_secs();
             println!("{}", usage::run(&dir, since.as_deref(), now)?);
-        }
-        Command::Sweep {
-            since,
-            dry_run,
-            now,
-            repo,
-        } => {
-            println!(
-                "{}",
-                sweep::run(sweep::Options {
-                    repo,
-                    since,
-                    dry_run,
-                    now,
-                })?
-            );
         }
         Command::Pr { command } => run_pr(command)?,
     }

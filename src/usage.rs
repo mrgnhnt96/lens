@@ -245,7 +245,7 @@ fn load<T: DeserializeOwned>(path: &Path) -> Vec<T> {
         .collect()
 }
 
-/// An agent's role from its label: `reviewer-correctness` and `sweep-3-reviewer-x` are reviewers.
+/// An agent's role from its label: `reviewer-correctness` is a reviewer.
 pub fn role(label: &str) -> &str {
     label
         .split('-')
