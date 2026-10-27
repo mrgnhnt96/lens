@@ -345,22 +345,33 @@ pub fn window(name: &str, readings: &[&Reading], rows: &[Row]) -> Option<Window>
         peak: readings.iter().map(|r| r.utilization).fold(0.0, f64::max),
         ..Window::default()
     };
-    let mut anchor = first;
+    let mut anchor = first.utilization;
+    let mut anchor_at = first;
+    let mut top = first.utilization;
     for pair in readings.windows(2) {
         let (prev, next) = (pair[0], pair[1]);
-        if next.resets_at != prev.resets_at || next.utilization < prev.utilization {
+        if next.resets_at != prev.resets_at {
             w.resets += 1;
             w.risen += next.utilization;
-            anchor = next;
+            anchor = next.utilization;
+            anchor_at = next;
+            top = next.utilization;
             continue;
         }
-        w.risen += next.utilization - prev.utilization;
-        let rise = next.utilization - anchor.utilization;
+        // Out-of-step readings from parallel agents dip slightly under the same
+        // resets_at; those are not resets, so only rises above the running max count.
+        if next.utilization <= top {
+            continue;
+        }
+        w.risen += next.utilization - top;
+        top = next.utilization;
+        let rise = top - anchor;
         if rise + 1e-9 >= MIN_RISE {
-            if let (Some(from), Some(to)) = (secs(&anchor.at), secs(&next.at)) {
+            if let (Some(from), Some(to)) = (secs(&anchor_at.at), secs(&next.at)) {
                 w.stretches.push((spent_between(rows, from, to), rise));
             }
-            anchor = next;
+            anchor = top;
+            anchor_at = next;
         }
     }
     Some(w)
@@ -664,6 +675,35 @@ mod tests {
         let instant = [row("x", "m", &iso(100), &iso(100), 1.0)];
         assert_eq!(spent_between(&instant, 50, 100), 1.0);
         assert_eq!(spent_between(&instant, 100, 150), 0.0);
+    }
+
+    #[test]
+    fn a_small_dip_under_the_same_reset_is_not_a_reset() {
+        let r = "2026-10-27T15:00:00Z";
+        let readings = [
+            reading(&iso(0), 0.50, r),
+            reading(&iso(10), 0.49, r),
+            reading(&iso(20), 0.51, r),
+        ];
+        let refs: Vec<&Reading> = readings.iter().collect();
+        let w = window("five_hour", &refs, &[]).unwrap();
+        assert_eq!(w.resets, 0);
+        // Only the climb past the earlier 0.50 counts, not the dip's recovery.
+        assert!((w.risen - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_changed_reset_time_is_a_reset() {
+        let readings = [
+            reading(&iso(0), 0.81, "2026-10-27T18:30:00Z"),
+            reading(&iso(10), 1.0, "2026-10-27T18:30:00Z"),
+            reading(&iso(20), 0.0, "2026-10-27T23:30:00Z"),
+            reading(&iso(30), 0.23, "2026-10-27T23:30:00Z"),
+        ];
+        let refs: Vec<&Reading> = readings.iter().collect();
+        let w = window("five_hour", &refs, &[]).unwrap();
+        assert_eq!(w.resets, 1);
+        assert!((w.risen - 0.42).abs() < 1e-9);
     }
 
     #[test]
