@@ -956,6 +956,100 @@ echo '{{"type":"result","result":"ok","total_cost_usd":0.01}}'
     }
 
     #[test]
+    fn a_rejected_status_without_windows_names_the_window_from_the_top_level() {
+        let now = 1_000_000;
+        let event = json!({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "rejected", "rateLimitType": "seven_day", "resetsAt": now + 900}});
+        assert_eq!(
+            Full::of(&event, now),
+            Some(Full {
+                window: "seven_day".into(),
+                resets_at: now + 900
+            })
+        );
+        // No type and no reset still ahead: a generic window held for the fallback.
+        let bare = json!({"rate_limit_info": {"status": "rejected", "resetsAt": now - 5}});
+        assert_eq!(
+            Full::of(&bare, now),
+            Some(Full {
+                window: "usage".into(),
+                resets_at: now + HOLD_WITHOUT_RESET
+            })
+        );
+    }
+
+    #[test]
+    fn a_reading_with_no_status_is_not_a_rejection_unless_a_window_is() {
+        let now = 1_000_000;
+        assert_eq!(Full::of(&json!({"type": "rate_limit_event"}), now), None);
+        let windows = |a: u64, b: u64| {
+            json!({"rate_limit_info": {"unifiedWindows": {
+                "five_hour": {"status": "rejected", "resetsAt": a},
+                "seven_day": {"status": "rejected", "resetsAt": b}}}})
+        };
+        // Several rejected windows: the one that resets last holds the agents.
+        assert_eq!(
+            Full::of(&windows(now + 100, now + 500), now),
+            Some(Full {
+                window: "seven_day".into(),
+                resets_at: now + 500
+            })
+        );
+        let allowed = json!({"rate_limit_info": {"status": "allowed", "unifiedWindows": {
+            "five_hour": {"status": "rejected", "resetsAt": now + 100}}}});
+        assert_eq!(Full::of(&allowed, now), None);
+    }
+
+    /// A fake claude that is turned away and then `tail`s; run with a `timeout`. Returns the
+    /// outcome and the usage folder.
+    fn rejected_then(tail: &str, timeout: Duration) -> (Outcome, tempfile::TempDir) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("claude");
+        std::fs::write(
+            &claude,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\necho '{}'\n{tail}\n",
+                limit_event("rejected", now_secs() + 600)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runner = Runner {
+            claude,
+            timeout,
+            log_dir: dir.path().into(),
+            usage: Some(usage::Log {
+                dir: dir.path().join("usage"),
+                repo: "repo".into(),
+            }),
+            ..runner()
+        };
+        let spec = Spec {
+            cwd: dir.path().into(),
+            ..labelled("r1", "sonnet")
+        };
+        (runner.run(spec), dir)
+    }
+
+    #[test]
+    fn an_agent_turned_away_that_then_times_out_still_reports_the_full_window() {
+        let (o, _dir) = rejected_then("exec sleep 30", Duration::from_secs(3));
+        assert!(o.full.is_some(), "{o:?}");
+        assert!(o.error.unwrap().starts_with("timed out after"));
+    }
+
+    #[test]
+    fn a_turned_away_run_that_spent_is_still_recorded() {
+        let result = r#"{"type":"result","is_error":true,"result":"limit reached","total_cost_usd":0.05,"usage":{"input_tokens":3,"output_tokens":4}}"#;
+        let (o, dir) = rejected_then(&format!("echo '{result}'"), Duration::from_secs(10));
+        assert!(o.full.is_some());
+        assert_eq!(o.cost_usd, 0.05);
+        let ledger = std::fs::read_to_string(dir.path().join("usage/agents.jsonl")).unwrap();
+        assert_eq!(ledger.lines().count(), 1, "{ledger}");
+    }
+
+    #[test]
     fn agents_start_again_once_the_window_resets() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("full.json");

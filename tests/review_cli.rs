@@ -40,7 +40,8 @@ fn write(dir: &Path, path: &str, text: &str) {
 /// system prompt reports the system prompt's length as cache creation, later ones as cache read. The correctness reviewer raises a blocker and a minor in src/a.rs and a
 /// major in src/b.rs; the verifier confirms the major, and the blocker until the fixer has marked
 /// src/a.rs FIXED. The reviewer whose profile `$FAKE_FAIL` names replies with no JSON. The PR
-/// pass's lead names one focus area.
+/// pass's lead names one focus area. The plan turns away every agent of the role `$FAKE_REJECT`
+/// names.
 const FAKE: &str = r#"#!/usr/bin/env python3
 import hashlib, json, os, re, sys, time
 args = sys.argv[1:]
@@ -61,6 +62,15 @@ else:
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps({"role": role, "args": args, "ttl": os.environ.get("CLAUDE_CODE_PROMPT_CACHE_TTL"),
                           "prompt": prompt, "system": system_text, "usage": usage}) + "\n")
+if role == os.environ.get("FAKE_REJECT"):
+    reset = int(time.time()) + 600
+    window = {"utilization": 1.0, "resetsAt": reset, "status": "rejected"}
+    print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "rejected", "resetsAt": reset, "rateLimitType": "five_hour",
+        "unifiedWindows": {"five_hour": window}}}))
+    print(json.dumps({"type": "result", "is_error": True, "result": "limit reached",
+                      "total_cost_usd": 0, "usage": {"input_tokens": 0, "output_tokens": 0}}))
+    sys.exit(1)
 code = open("src/a.rs").read()
 fail = os.environ.get("FAKE_FAIL")
 if role == "reviewer" and fail and f'name="{fail}"' in prompt:
@@ -217,6 +227,50 @@ impl Fixture {
                            "resetsAt": iso(now + resets_in), "status": "allowed" });
         fs::create_dir_all(self.usage()).unwrap();
         fs::write(self.usage().join("readings.jsonl"), format!("{line}\n")).unwrap();
+    }
+
+    /// A bare origin holding PR 7, and the fake `gh` and its data directory that serve it.
+    fn pr_remote(&self) -> (PathBuf, PathBuf) {
+        let (fx, d) = (self, self.repo());
+        let origin = fx.dir.path().join("origin.git");
+        git(
+            fx.dir.path(),
+            &["init", "-q", "--bare", origin.to_str().unwrap()],
+        );
+        git(&d, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(
+            &d,
+            &["push", "-q", "origin", "main", "feature:refs/pull/7/head"],
+        );
+        let head = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&d)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let fake = fx.dir.path().join("ghfake");
+        fs::create_dir_all(&fake).unwrap();
+        fs::write(
+        fake.join("pr.json"),
+        serde_json::json!({
+            "number": 7, "url": "https://github.test/pr/7", "title": "Change a", "body": "Adds lines.",
+            "baseRefName": "main", "headRefName": "feature", "headRefOid": head.trim(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+        let gh = fake.join("gh");
+        fs::write(&gh, FAKE_GH).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (gh, fake)
     }
 
     /// Every agent started so far, and clears the log.
@@ -556,44 +610,7 @@ else:
 fn the_pr_pass_runs_the_lead_and_its_focus_areas_and_posts() {
     let fx = Fixture::new(60);
     let d = fx.repo();
-    let origin = fx.dir.path().join("origin.git");
-    git(
-        fx.dir.path(),
-        &["init", "-q", "--bare", origin.to_str().unwrap()],
-    );
-    git(&d, &["remote", "add", "origin", origin.to_str().unwrap()]);
-    git(
-        &d,
-        &["push", "-q", "origin", "main", "feature:refs/pull/7/head"],
-    );
-    let head = String::from_utf8(
-        Command::new("git")
-            .arg("-C")
-            .arg(&d)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
-    let fake = fx.dir.path().join("ghfake");
-    fs::create_dir_all(&fake).unwrap();
-    fs::write(
-        fake.join("pr.json"),
-        serde_json::json!({
-            "number": 7, "url": "https://github.test/pr/7", "title": "Change a", "body": "Adds lines.",
-            "baseRefName": "main", "headRefName": "feature", "headRefOid": head.trim(),
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let gh = fake.join("gh");
-    fs::write(&gh, FAKE_GH).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let (gh, fake) = fx.pr_remote();
 
     // Every PR is in the sample, so PR 7 is reviewed whatever its hash.
     write(&d, ".lens.toml", "[pr]\nsample = 1\n");
@@ -742,4 +759,97 @@ fn backoff_ahead_of_pace_skips_prs_outside_the_smaller_share() {
         "{out}"
     );
     assert!(fx.calls().is_empty());
+}
+
+#[test]
+fn backoff_lighter_at_drops_the_lead_and_its_focus_areas_from_the_pr_pass() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(
+        &d,
+        ".lens.toml",
+        "[pr]\nsample = 1\n[backoff.five_hour]\nlighter_at = 0.7\n",
+    );
+    fx.read_window("five_hour", 0.75, 3600);
+    let (_, log) = fx.review_logged(&[], &["--pr", "7"], &[("LENS_GH", &gh), ("FAKE", &fake)]);
+    assert!(log.contains("lens: backoff: "), "{log}");
+    let calls = fx.calls();
+    assert!(
+        calls.iter().all(|c| !c["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("You are the lead reviewer")),
+        "the lead sat the pass out"
+    );
+    assert_eq!(
+        calls.iter().filter(|c| c["role"] == "reviewer").count(),
+        1,
+        "correctness only"
+    );
+}
+
+#[test]
+fn a_review_the_backoff_lightened_is_incomplete_so_the_next_one_runs_everything() {
+    let fx = Fixture::new(60);
+    write(
+        &fx.repo(),
+        ".lens.toml",
+        "[backoff.five_hour]\nlighter_at = 0.7\n",
+    );
+    fx.read_window("five_hour", 0.75, 3600);
+    fx.review(&["--no-fix"]);
+    let incomplete = fx.report()["incomplete"].clone();
+    assert!(
+        incomplete.as_array().unwrap().contains(&json!("testing")),
+        "{incomplete}"
+    );
+    fx.calls();
+
+    // The window eases and nothing changed, yet the lightened report isn't taken as current.
+    fx.read_window("five_hour", 0.2, 3600);
+    fx.review(&["--no-fix"]);
+    let reviewers = fx
+        .calls()
+        .iter()
+        .filter(|c| c["role"] == "reviewer")
+        .count();
+    assert!(reviewers > 1, "{reviewers} reviewers");
+    assert!(fx.report().get("incomplete").is_none());
+}
+
+#[test]
+fn a_local_review_the_plan_turns_away_mid_pass_keeps_the_last_report() {
+    let fx = Fixture::new(60);
+    fx.review(&["--no-fix"]);
+    let before = fs::read_to_string(fx.repo().join(".review/feature.json")).unwrap();
+    fx.calls();
+
+    for role in ["reviewer", "verifier"] {
+        let out = fx.review_with(
+            &["main"],
+            &["--no-fix", "--full"],
+            &[("FAKE_REJECT", Path::new(role))],
+        );
+        assert!(out.contains("lens: paused: "), "{role}: {out}");
+        assert!(out.contains("Nothing was reviewed"), "{role}: {out}");
+        assert_eq!(
+            fs::read_to_string(fx.repo().join(".review/feature.json")).unwrap(),
+            before,
+            "{role}: the last review stays the current one"
+        );
+    }
+}
+
+#[test]
+fn a_fix_loop_the_plan_cuts_off_says_so_and_leaves_the_blocker_open() {
+    let fx = Fixture::new(60);
+    let out = fx.review_with(&["main"], &[], &[("FAKE_REJECT", Path::new("fixer"))]);
+    assert!(out.contains("Fixing paused: "), "{out}");
+    assert!(out.contains("The next run picks the fix loop up"), "{out}");
+    let report = fx.report();
+    assert_eq!(report["findings"][0]["severity"], "blocker");
+    assert!(!fs::read_to_string(fx.repo().join("src/a.rs"))
+        .unwrap()
+        .contains("FIXED"));
 }

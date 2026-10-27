@@ -430,3 +430,47 @@ fn a_sweep_waits_while_backoff_pauses_reviews() {
     assert!(!fx.repo().join(".review").exists());
     assert_eq!(fx.watermark(), start);
 }
+
+#[test]
+fn backoff_lighter_at_keeps_the_sweeps_lead_but_runs_correctness_only_in_each_area() {
+    let fx = Fixture::new();
+    fx.sweep(&[], &[]);
+    fx.push(&[
+        ("src/a.rs", "pub fn a() {}\npub fn parse() {}\n"),
+        ("src/b.rs", "pub fn b() {}\n"),
+    ]);
+    fs::write(
+        fx.repo().join(".lens.toml"),
+        "[backoff.five_hour]\nlighter_at = 0.7\n",
+    )
+    .unwrap();
+    let usage = fx.dir.path().join("usage");
+    fs::create_dir_all(&usage).unwrap();
+    let reading = json!({ "at": "2026-10-27T12:00:00Z", "window": "five_hour", "utilization": 0.75,
+                          "resetsAt": "2999-01-01T00:00:00Z", "status": "allowed" });
+    fs::write(usage.join("readings.jsonl"), format!("{reading}\n")).unwrap();
+
+    fx.sweep(&["--now"], &[]);
+    let calls: Vec<Value> = fs::read_to_string(fx.dir.path().join("calls.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let reviewers: Vec<&str> = calls
+        .iter()
+        .filter(|c| c["role"] == "reviewer")
+        .map(|c| c["prompt"].as_str().unwrap())
+        .collect();
+    assert!(
+        reviewers
+            .iter()
+            .any(|p| p.contains("You are the lead reviewer")),
+        "the lead still reads the whole range"
+    );
+    for p in reviewers
+        .iter()
+        .filter(|p| !p.contains("You are the lead reviewer"))
+    {
+        assert!(p.contains("name=\"correctness\""), "{p}");
+    }
+}

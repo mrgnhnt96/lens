@@ -1110,10 +1110,15 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     let mut raised = Vec::new();
     let mut profile_rows = Vec::new();
     let mut failed = Vec::new();
+    // Reviewers backoff skipped: the report counts as incomplete, so a later review redoes them.
+    let mut lightened = Vec::new();
     let mut it = outcomes.iter();
     for plan in &plans {
         if !plan.run {
             profile_rows.push(plan.json(None));
+            if plan.reason == "backoff" {
+                lightened.push(plan.name.clone());
+            }
             continue;
         }
         let o = it.next().unwrap();
@@ -1186,8 +1191,8 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     if let Some(d) = delta_info {
         report["delta"] = d;
     }
-    if !failed.is_empty() {
-        report["incomplete"] = json!(failed);
+    if !failed.is_empty() || !lightened.is_empty() {
+        report["incomplete"] = json!(failed.iter().chain(&lightened).collect::<Vec<_>>());
     }
     finish(pass, &mut report)?;
 
