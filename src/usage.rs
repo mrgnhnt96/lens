@@ -317,8 +317,8 @@ pub struct Window {
 impl Window {
     /// The least a full window can hold in lens's dollars, per 1%: every stretch's rise includes
     /// whatever else used the plan, so its lens spend over its rise is a floor. Pooled over every
-    /// stretch, and the tightest single one.
-    pub fn floors(&self) -> Option<(f64, f64)> {
+    /// stretch: single stretches rest on whole-percent readings, so the tightest of them is noise.
+    pub fn floor(&self) -> Option<f64> {
         let (cost, rise) = self
             .stretches
             .iter()
@@ -326,12 +326,7 @@ impl Window {
         if rise <= 0.0 || cost <= 0.0 {
             return None;
         }
-        let tightest = self
-            .stretches
-            .iter()
-            .map(|(c, r)| c / (r * 100.0))
-            .fold(0.0, f64::max);
-        Some((cost / (rise * 100.0), tightest))
+        Some(cost / (rise * 100.0))
     }
 }
 
@@ -378,7 +373,7 @@ pub fn window(name: &str, readings: &[&Reading], rows: &[Row]) -> Option<Window>
 }
 
 /// The usage report for everything at or after `cutoff`.
-pub fn report(dir: &Path, cutoff: Option<&str>) -> String {
+pub fn report(dir: &Path, cutoff: Option<&str>, now: u64) -> String {
     let after = |at: &str| cutoff.is_none_or(|c| at >= c);
     let rows: Vec<Row> = load::<Row>(&dir.join(LEDGER))
         .into_iter()
@@ -389,12 +384,12 @@ pub fn report(dir: &Path, cutoff: Option<&str>) -> String {
         .filter(|r| after(&r.at))
         .collect();
     readings.sort_by(|a, b| a.at.cmp(&b.at));
-    render(dir, cutoff, &rows, &readings)
+    render(dir, cutoff, &rows, &readings, now)
 }
 
 pub fn run(dir: &Path, since: Option<&str>, now_secs: u64) -> Result<String> {
     let cutoff = since.map(|s| since_cutoff(s, now_secs)).transpose()?;
-    Ok(report(dir, cutoff.as_deref()))
+    Ok(report(dir, cutoff.as_deref(), now_secs))
 }
 
 fn table(title: &str, groups: Vec<(String, Spend)>, all: &Spend) -> Vec<String> {
@@ -420,11 +415,41 @@ fn table(title: &str, groups: Vec<(String, Spend)>, all: &Spend) -> Vec<String> 
     out
 }
 
+/// A run that was turned away: it spent no tokens, so it has no model worth a row.
+fn rejected(r: &Row) -> bool {
+    r.input_tokens + r.output_tokens + r.cache_creation_input_tokens + r.cache_read_input_tokens
+        == 0
+}
+
+/// `t` as time from `now`: `3h39m ago`, `in 2h05m`, `in 4d3h`; `t` itself when it isn't a time.
+fn relative(t: &str, now: u64) -> String {
+    let Some(at) = secs(t) else {
+        return t.to_string();
+    };
+    let d = at.abs_diff(now);
+    let span = match (d / 86400, d / 3600 % 24, d / 60 % 60) {
+        (0, 0, m) => format!("{m}m"),
+        (0, h, m) => format!("{h}h{m:02}m"),
+        (days, h, _) => format!("{days}d{h}h"),
+    };
+    if at > now {
+        format!("in {span}")
+    } else {
+        format!("{span} ago")
+    }
+}
+
 fn pct(u: f64) -> String {
     format!("{:.0}%", u * 100.0)
 }
 
-pub fn render(dir: &Path, cutoff: Option<&str>, rows: &[Row], readings: &[Reading]) -> String {
+pub fn render(
+    dir: &Path,
+    cutoff: Option<&str>,
+    rows: &[Row],
+    readings: &[Reading],
+    now: u64,
+) -> String {
     let mut out = vec![format!(
         "lens usage in {}{}",
         dir.display(),
@@ -435,12 +460,36 @@ pub fn render(dir: &Path, cutoff: Option<&str>, rows: &[Row], readings: &[Readin
         return out.join("\n");
     }
     if let Some((_, all)) = spend(rows, |_| "total").pop() {
+        let start = rows.iter().map(|r| r.started_at.as_str()).min();
+        let end = rows.iter().map(|r| r.finished_at.as_str()).max();
+        if let (Some(start), Some(end)) = (start, end) {
+            out.push(format!(
+                "spend from {start} ({}) to {end} ({})",
+                relative(start, now),
+                relative(end, now)
+            ));
+        }
         out.push(String::new());
         out.extend(table("repo", spend(rows, |r| &r.repo), &all));
         out.push(String::new());
         out.extend(table("role", spend(rows, |r| role(&r.label)), &all));
         out.push(String::new());
-        out.extend(table("model", spend(rows, |r| &r.model), &all));
+        let used: Vec<Row> = rows.iter().filter(|r| !rejected(r)).cloned().collect();
+        if let Some((_, used_all)) = spend(&used, |_| "total").pop() {
+            out.extend(table("model", spend(&used, |r| &r.model), &used_all));
+        }
+        let turned_away = rows.iter().filter(|r| rejected(r)).collect::<Vec<_>>();
+        if !turned_away.is_empty() {
+            let runs = spend(
+                &turned_away.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
+                |_| "rejected",
+            )[0]
+            .1
+            .runs;
+            out.push(format!(
+                "rejected runs (no tokens, not in the model table): {runs}"
+            ));
+        }
     }
     let names: BTreeSet<&str> = readings.iter().map(|r| r.window.as_str()).collect();
     for name in names {
@@ -450,11 +499,13 @@ pub fn render(dir: &Path, cutoff: Option<&str>, rows: &[Row], readings: &[Readin
         };
         out.push(String::new());
         out.push(format!(
-            "{name}: {} at {} -> {} at {} (peak {}, rose {} in all{}), resets {}",
+            "{name}: {} at {} ({}) -> {} at {} ({}) (peak {}, rose {} in all{}), resets {} ({})",
             pct(w.first.utilization),
             w.first.at,
+            relative(&w.first.at, now),
             pct(w.last.utilization),
             w.last.at,
+            relative(&w.last.at, now),
             pct(w.peak),
             pct(w.risen),
             match w.resets {
@@ -463,16 +514,18 @@ pub fn render(dir: &Path, cutoff: Option<&str>, rows: &[Row], readings: &[Readin
                 n => format!(", across {n} resets"),
             },
             w.last.resets_at,
+            relative(&w.last.resets_at, now),
         ));
-        match w.floors() {
-            Some((pooled, tightest)) => {
-                let left = (1.0 - w.last.utilization).max(0.0) * 100.0 * tightest;
+        match w.floor() {
+            Some(pooled) => {
+                let left = (1.0 - w.last.utilization).max(0.0) * 100.0 * pooled;
+                let n = w.stretches.len();
                 out.push(format!(
-                    "  1% of it holds at least ${tightest:.2} of lens work ({} stretches; pooled ${pooled:.2})",
-                    w.stretches.len()
+                    "  1% of it holds at least ${pooled:.3} of lens work (pooled over {n} stretch{})",
+                    if n == 1 { "" } else { "es" }
                 ));
                 out.push(format!(
-                    "  so the {} left holds at least ${left:.2} of lens work, if nothing else ran",
+                    "  so the {} left holds at least ${left:.2} of lens work (same pooled figure), if nothing else ran",
                     pct(1.0 - w.last.utilization)
                 ));
             }
@@ -765,21 +818,16 @@ mod tests {
         assert_eq!(w.peak, 0.20);
         // 0.10 -> 0.12 over 0..100 ($2), then 0.12 -> 0.20 over 100..200 ($2).
         assert_eq!(w.stretches.len(), 2);
-        let (pooled, tightest) = w.floors().unwrap();
-        assert!((pooled - 0.4).abs() < 1e-9);
-        assert!((tightest - 1.0).abs() < 1e-9);
+        assert!((w.floor().unwrap() - 0.4).abs() < 1e-9);
         let flat = [reading(&iso(0), 0.5, r), reading(&iso(9), 0.5, r)];
         let refs: Vec<&Reading> = flat.iter().collect();
-        assert!(window("five_hour", &refs, &rows)
-            .unwrap()
-            .floors()
-            .is_none());
+        assert!(window("five_hour", &refs, &rows).unwrap().floor().is_none());
     }
 
     #[test]
     fn report_reads_the_logs_back() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(report(dir.path(), None).contains("Nothing recorded yet."));
+        assert!(report(dir.path(), None, 0).contains("Nothing recorded yet."));
         let log = Log {
             dir: dir.path().into(),
             repo: "lens".into(),
@@ -793,11 +841,123 @@ mod tests {
         };
         log.record_readings("reviewer-a", &iso(1000), &event(0.40));
         log.record_readings("reviewer-a", &iso(2000), &event(0.50));
-        let text = report(dir.path(), None);
+        let text = report(dir.path(), None, 3000);
         assert!(text.contains("reviewer"), "{text}");
         assert!(text.contains("five_hour: 40%"), "{text}");
-        assert!(text.contains("1% of it holds at least $0.30"), "{text}");
+        assert!(text.contains("1% of it holds at least $0.300"), "{text}");
         assert!(text.contains("50% left holds at least $15.00"), "{text}");
-        assert!(report(dir.path(), Some("2100")).contains("Nothing recorded yet."));
+        assert!(report(dir.path(), Some("2100"), 0).contains("Nothing recorded yet."));
+    }
+
+    #[test]
+    fn times_read_relative_to_now() {
+        let now = 1_000_000;
+        assert_eq!(relative(&iso(now - 13_140), now), "3h39m ago");
+        assert_eq!(relative(&iso(now + 7_500), now), "in 2h05m");
+        assert_eq!(relative(&iso(now + 4 * 86400 + 3 * 3600), now), "in 4d3h");
+        assert_eq!(relative(&iso(now - 300), now), "5m ago");
+        assert_eq!(relative("nope", now), "nope");
+    }
+
+    #[test]
+    fn the_report_names_its_span_and_counts_rejected_runs_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log {
+            dir: dir.path().into(),
+            repo: "lens".into(),
+        };
+        let used = json!({"modelUsage": {"claude-sonnet-5-5": {"inputTokens": 1, "costUSD": 3.0}}});
+        log.record_result("reviewer-a", "sonnet", &iso(1000), &iso(2000), &used);
+        let none = json!({"usage": {"input_tokens": 0, "output_tokens": 0}});
+        log.record_result("reviewer-b", "sonnet", &iso(2100), &iso(2100), &none);
+        let event = |u: f64, resets: u64| {
+            json!({"rate_limit_info": {"unifiedWindows": {
+            "five_hour": {"utilization": u, "resetsAt": resets}}}})
+        };
+        log.record_readings("x", &iso(1000), &event(0.40, 9000));
+        log.record_readings("x", &iso(2000), &event(0.50, 9000));
+        let text = report(dir.path(), None, 3000);
+        assert!(
+            text.contains(&format!("spend from {}", iso(1000))),
+            "{text}"
+        );
+        assert!(text.contains("to 1970-01-01T00:35:00Z (15m ago)"), "{text}");
+        assert!(
+            text.contains("rejected runs (no tokens, not in the model table): 1"),
+            "{text}"
+        );
+        let model = text
+            .split("\nmodel")
+            .nth(1)
+            .unwrap()
+            .split("\n\n")
+            .next()
+            .unwrap();
+        assert_eq!(model.matches("sonnet").count(), 1, "{text}");
+        assert!(
+            text.contains("resets 1970-01-01T02:30:00Z (in 1h40m)"),
+            "{text}"
+        );
+        assert!(text.contains("pooled over 1 stretch)"), "{text}");
+    }
+
+    #[test]
+    fn a_report_of_only_rejected_runs_has_no_model_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log {
+            dir: dir.path().into(),
+            repo: "lens".into(),
+        };
+        let none = json!({"usage": {"input_tokens": 0, "output_tokens": 0}});
+        log.record_result("reviewer-a", "sonnet", &iso(1000), &iso(1000), &none);
+        log.record_result("reviewer-b", "sonnet", &iso(2000), &iso(2000), &none);
+        let text = report(dir.path(), None, 3000);
+        assert!(
+            text.contains("rejected runs (no tokens, not in the model table): 2"),
+            "{text}"
+        );
+        assert!(!text.contains("\nmodel"), "{text}");
+    }
+
+    #[test]
+    fn the_report_pluralises_stretches() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log {
+            dir: dir.path().into(),
+            repo: "lens".into(),
+        };
+        let used = json!({"modelUsage": {"claude-sonnet-5-5": {"inputTokens": 1, "costUSD": 1.0}}});
+        log.record_result("reviewer-a", "sonnet", &iso(0), &iso(100), &used);
+        log.record_result("reviewer-a", "sonnet", &iso(200), &iso(300), &used);
+        let event = |u: f64, resets: u64| {
+            json!({"rate_limit_info": {"unifiedWindows": {
+            "five_hour": {"utilization": u, "resetsAt": resets}}}})
+        };
+        log.record_readings("x", &iso(0), &event(0.10, 9000));
+        log.record_readings("x", &iso(100), &event(0.20, 9000));
+        log.record_readings("x", &iso(200), &event(0.05, 18000));
+        log.record_readings("x", &iso(300), &event(0.15, 18000));
+        let text = report(dir.path(), None, 400);
+        assert!(text.contains("pooled over 2 stretches)"), "{text}");
+    }
+
+    #[test]
+    fn per_one_percent_and_left_agree_when_rounded_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log {
+            dir: dir.path().into(),
+            repo: "lens".into(),
+        };
+        let result = json!({"modelUsage": {"m": {"inputTokens": 1, "costUSD": 1.21}}});
+        log.record_result("reviewer-a", "m", &iso(1000), &iso(2000), &result);
+        let event = |u: f64| {
+            json!({"rate_limit_info": {"unifiedWindows": {
+            "five_hour": {"utilization": u, "resetsAt": 9000}}}})
+        };
+        log.record_readings("x", &iso(1000), &event(0.10));
+        log.record_readings("x", &iso(2000), &event(0.12));
+        let text = report(dir.path(), None, 3000);
+        assert!(text.contains("holds at least $0.605 "), "{text}");
+        assert!(text.contains("88% left holds at least $53.24"), "{text}");
     }
 }
