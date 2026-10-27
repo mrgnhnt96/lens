@@ -1,7 +1,7 @@
 //! `lens review`: a whole review pass, orchestrated here rather than by a model. Every judgment
 //! about the code still comes from an agent with a fresh context (see `agent.rs`); what this module
 //! decides is plumbing that doesn't need one: which reviewers run, merging duplicate findings,
-//! which findings get verified, the report, and the blocker fix loop.
+//! which findings get verified, and the report.
 //!
 //! The local pass keeps cost down three ways:
 //! - **Tiers.** A change that touches only docs isn't reviewed. A small change (`[review]
@@ -10,7 +10,7 @@
 //!   are the PR pass's.
 //! - **Deltas.** When the last report reviewed this branch from the same merge base, only what
 //!   changed since then is reviewed, and blockers it left unfixed are verified again.
-//! - **Fresh reports** aren't redone: an unchanged tree only resumes the fix loop.
+//! - **Fresh reports** aren't redone: an unchanged tree isn't reviewed again.
 //!
 //! Every agent of a pass gets the same system prompt (a short preamble and the change), and its
 //! role's instructions in its first message, so agents with the same model and tools share one
@@ -30,8 +30,8 @@ use crate::agent::{self, Access, Full, Gate, Outcome, Runner, Spec};
 use crate::backoff;
 use crate::config::{self, Config};
 use crate::diff::git;
-use crate::fix;
 use crate::pr;
+use crate::reply;
 use crate::usage;
 
 #[derive(Debug, Clone, Default)]
@@ -41,8 +41,6 @@ pub struct Options {
     pub base: Option<String>,
     /// A ticket or spec the change implements, for intent-alignment.
     pub intent: Option<PathBuf>,
-    /// Report blockers without running the fix loop.
-    pub no_fix: bool,
     /// Review the whole change even when an earlier report would allow a delta.
     pub full: bool,
     /// Run the PR pass on this PR instead of the local pass.
@@ -70,8 +68,7 @@ pub struct Protocol {
 
 impl Options {
     /// Takes the protocol's variables, when `TASKBOARD_RESULT` is set and this isn't a PR pass:
-    /// the repo, base and intent the board names (flags given win), its state folder, and no
-    /// fix loop, since the reviewer never changes the worktree.
+    /// the repo, base and intent the board names (flags given win) and its state folder.
     pub fn with_protocol(mut self, var: impl Fn(&str) -> Option<String>) -> Options {
         let var = |k: &str| var(k).filter(|v| !v.is_empty());
         let Some(result) = var("TASKBOARD_RESULT") else {
@@ -92,7 +89,6 @@ impl Options {
         self.state = self
             .state
             .or_else(|| var("TASKBOARD_STATE_DIR").map(PathBuf::from));
-        self.no_fix = true;
         self.protocol = Some(Protocol {
             result: result.into(),
             previous: var("TASKBOARD_PREVIOUS").map(PathBuf::from),
@@ -126,7 +122,7 @@ pub fn risky_files<'a>(globs: &[String], files: &'a [String]) -> Result<Vec<&'a 
 
 const LOCAL_PROFILES: &[&str] = &["correctness", "testing", "intent-alignment"];
 pub(crate) const LEAD: &str = "impact-assessment";
-pub(crate) const ROLES: &[&str] = &["reviewer", "verifier", "fixer", "escalator"];
+pub(crate) const ROLES: &[&str] = &["reviewer", "verifier"];
 /// Above this many bytes the diff isn't put in the prompt; agents read the file instead.
 const INLINE_DIFF_MAX: usize = 150_000;
 const INLINE_MAP_MAX: usize = 60_000;
@@ -460,7 +456,6 @@ impl Pass {
             claude: agent::claude_program(),
             parallel: cfg.review.parallel,
             timeout: Duration::from_secs(cfg.review.timeout_mins.max(1) * 60),
-            fixer_permission_mode: cfg.review.fixer_permission_mode.clone(),
             log_dir: work.join("agents"),
             cached: Default::default(),
             usage: usage_log(&root),
@@ -736,7 +731,7 @@ impl Pass {
         let mut confirmed = Vec::new();
         let mut dropped = Vec::new();
         for (f, o) in findings.iter().zip(outcomes) {
-            let reply = fix::parse_reply(&o.text).ok();
+            let reply = reply::parse_reply(&o.text).ok();
             let verdict = reply.as_ref().and_then(|r| r["verdict"].as_str());
             let mut entry = f.json();
             match (verdict, &reply) {
@@ -928,21 +923,9 @@ fn repo_name(root: &Path) -> String {
     .unwrap_or_else(|| "?".into())
 }
 
-/// The tree an earlier report reviewed: its last fix attempt's, else the one it recorded, else
+/// The tree an earlier report reviewed: the one it recorded, else
 /// `head`'s when the tree was clean.
 fn reviewed_tree(root: &Path, report: &Value) -> Option<String> {
-    let fixed = report["findings"].as_array().and_then(|fs| {
-        fs.iter().rev().find_map(|f| {
-            let ledger = fs::read_to_string(f["fix"]["ledger"].as_str()?).ok()?;
-            let ledger: Value = serde_json::from_str(&ledger).ok()?;
-            ledger["attempts"].as_array()?.last()?["after"]
-                .as_str()
-                .map(String::from)
-        })
-    });
-    if fixed.is_some() {
-        return fixed;
-    }
     if let Some(tree) = report["tree"].as_str() {
         return Some(tree.to_string());
     }
@@ -1017,7 +1000,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
         }
         floor_reason = Some(format!("risky path: {}", risky.join(", ")));
     }
-    let now = fix::snapshot(&pass.root)?;
+    let now = reply::snapshot(&pass.root)?;
     let prior: Option<Value> = fs::read_to_string(&pass.report_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok());
@@ -1062,7 +1045,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     };
 
     if let Mode::Fresh(mut prev) = mode {
-        pass.log("the last review still matches the tree; resuming its fix loop if it has one");
+        pass.log("the last review still matches the tree; nothing to review again");
         if !settled.is_empty() {
             if let Some(fs) = prev["findings"].as_array_mut() {
                 fs.retain(|f| !settled.iter().any(|s| s["id"] == f["id"]));
@@ -1073,9 +1056,6 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
                 serde_json::to_string_pretty(&prev)? + "\n",
             )?;
         }
-        if !pass.opts.no_fix {
-            fix_loop(pass, &prev, None)?;
-        }
         let report: Value = serde_json::from_str(&fs::read_to_string(&pass.report_path)?)?;
         respond(
             pass,
@@ -1083,12 +1063,8 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
             &summarize(&report, &pass.report_path, true),
             0.0,
         )?;
-        let mut summary = summarize(&report, &pass.report_path, true);
-        if let Some(why) = pass.parked() {
-            summary.push_str(&fix_paused(&why));
-        }
         return Ok(Done {
-            summary,
+            summary: summarize(&report, &pass.report_path, true),
             report: Some(pass.report_path.clone()),
         });
     }
@@ -1099,9 +1075,6 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     if pass.report_path.is_file() {
         fs::create_dir_all(&prev_dir)?;
         fs::rename(&pass.report_path, prev_dir.join("report.json"))?;
-        if pass.work.join("fix").is_dir() {
-            fs::rename(pass.work.join("fix"), prev_dir.join("fix"))?;
-        }
     }
     let _ = fs::remove_dir_all(pass.work.join("agents"));
 
@@ -1127,9 +1100,6 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
         } => {
             let mut carried: Vec<Finding> = Vec::new();
             for f in previous["findings"].as_array().cloned().unwrap_or_default() {
-                if f["severity"] == "blocker" && f["fix"]["status"] == "resolved" {
-                    continue;
-                }
                 if settled.iter().any(|s| s["id"] == f["id"]) {
                     continue;
                 }
@@ -1139,11 +1109,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
                 if f["severity"] == "blocker" || touched || to_fix {
                     carried.push(x);
                 } else {
-                    let mut entry = f.clone();
-                    if let Some(o) = entry.as_object_mut() {
-                        o.remove("fix");
-                    }
-                    kept.push((x, entry));
+                    kept.push((x, f.clone()));
                 }
             }
             let lines = changed_lines(patch);
@@ -1231,7 +1197,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
             continue;
         }
         let o = it.next().unwrap();
-        match fix::parse_reply(&o.text) {
+        match reply::parse_reply(&o.text) {
             Ok(reply) => {
                 let fs: Vec<Finding> = reply["findings"]
                     .as_array()
@@ -1339,20 +1305,12 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
         report["costUsd"].as_f64().unwrap_or(0.0),
     )?;
 
-    if !pass.opts.no_fix && !pass.opts.floor {
-        fix_loop(pass, &report, None)?;
-        report = serde_json::from_str(&fs::read_to_string(&pass.report_path)?)?;
-        finish(pass, &mut report)?;
-    }
     let mut summary = summarize(&report, &pass.report_path, false);
     if !failed.is_empty() {
         summary.push_str(&format!(
             "\nFailed (no readable reply): {}.",
             failed.join(", ")
         ));
-    }
-    if let Some(why) = pass.parked() {
-        summary.push_str(&fix_paused(&why));
     }
     Ok(Done {
         summary,
@@ -1370,18 +1328,11 @@ pub(crate) fn parked(why: &str) -> Done {
     }
 }
 
-fn fix_paused(why: &str) -> String {
-    format!("\nFixing paused: {why}. The next run picks the fix loop up where it stopped.")
-}
-
 /// Parks a local pass the plan stopped part way: the last review stays the current one, so the
 /// next run starts from it as if this one never ran.
 fn unpark_previous(pass: &Pass, prev_dir: &Path, why: &str) -> Result<Done> {
     if prev_dir.join("report.json").is_file() {
         fs::rename(prev_dir.join("report.json"), &pass.report_path)?;
-        if prev_dir.join("fix").is_dir() {
-            fs::rename(prev_dir.join("fix"), pass.work.join("fix"))?;
-        }
     }
     if pass.opts.protocol.is_some() {
         bail!("paused: {why}");
@@ -1584,206 +1535,6 @@ pub(crate) fn finish(pass: &mut Pass, report: &mut Value) -> Result<()> {
     .with_context(|| format!("writing {}", pass.report_path.display()))
 }
 
-/// Takes every blocker of `report` without a settled fix through the fix loop, one at a time;
-/// with `only`, just that one.
-pub(crate) fn fix_loop(pass: &mut Pass, report: &Value, only: Option<&str>) -> Result<()> {
-    let blockers: Vec<Value> = report["findings"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|f| {
-            f["severity"] == "blocker"
-                && only.is_none_or(|id| f["id"] == id)
-                && !matches!(f["fix"]["status"].as_str(), Some("resolved" | "escalated"))
-        })
-        .collect();
-    if blockers.is_empty() {
-        return Ok(());
-    }
-    let t = Instant::now();
-    let system = pass.system_prompt(&pass.context(None)?)?;
-    let profiles: Value =
-        serde_json::from_str(&fs::read_to_string(pass.work.join("profiles.json"))?)?;
-    let guidelines = pass.guidelines()?;
-
-    'blockers: for b in blockers {
-        if pass.parked().is_some() {
-            break;
-        }
-        let id = b["id"].as_str().unwrap_or("F1").to_string();
-        pass.log(&format!(
-            "fixing blocker {id}: {}",
-            b["title"].as_str().unwrap_or("")
-        ));
-        let mut step = fix::start(&pass.report_path, &id, fix::DEFAULT_CAP)?;
-        let finding = Finding::from_reply("correctness", &b).context("reading the blocker")?;
-        let finding = Finding {
-            profiles: b["profiles"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|p| p.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_else(|| vec!["correctness".into()]),
-            ..finding
-        };
-        loop {
-            match step.next {
-                fix::Next::Fix => {
-                    let n = step.attempts + 1;
-                    let prompt = format!(
-                        "Ledger: {}\nFinding {id} ({}): {}:{}  {}\nFailure: {}\nHow it fails:\n{}\nGuidelines: {}\n",
-                        step.ledger.display(),
-                        finding.profiles.join(", "),
-                        finding.file,
-                        b["line"],
-                        finding.title,
-                        finding.failure_scenario,
-                        b["howItFails"].as_str().unwrap_or(""),
-                        if guidelines.is_empty() { "none".into() } else { guidelines.join(", ") },
-                    );
-                    let spec = pass.spec(
-                        format!("fixer-{id}-{n}"),
-                        "fixer",
-                        &system,
-                        prompt,
-                        "sonnet",
-                        "high",
-                        Access::Edit,
-                    );
-                    let o = pass.runner.run(spec);
-                    pass.tally(std::slice::from_ref(&o));
-                    // A fixer the plan cut off isn't an attempt; the next run tries again.
-                    if pass.parked().is_some() {
-                        break 'blockers;
-                    }
-                    let fixer = fix::parse_reply(&o.text)
-                        .unwrap_or_else(|_| json!({ "summary": "(the fixer's reply couldn't be read)", "error": o.error }));
-                    let pending = fix::pending_diff(&step.ledger)?;
-                    if pending.trim().is_empty() {
-                        step = fix::record(&step.ledger, Some(fixer), None)?;
-                        continue;
-                    }
-                    let patch = pass.work.join("fix").join(format!("{id}-pending.patch"));
-                    fs::create_dir_all(patch.parent().unwrap())?;
-                    fs::write(&patch, &pending)?;
-                    let review = rereview(pass, &system, &profiles, &finding, &id, &patch)?;
-                    if pass.parked().is_some() {
-                        break 'blockers;
-                    }
-                    step = fix::record(&step.ledger, Some(fixer), Some(review))?;
-                }
-                fix::Next::Judge => {
-                    let prompt = format!("Ledger: {}\n", step.ledger.display());
-                    let mut decision = None;
-                    for attempt in 1..=2 {
-                        let spec = pass.spec(
-                            format!("escalator-{id}-{}-{attempt}", step.attempts),
-                            "escalator",
-                            &system,
-                            prompt.clone(),
-                            "haiku",
-                            "",
-                            Access::ReadFiles,
-                        );
-                        let o = pass.runner.run(spec);
-                        pass.tally(std::slice::from_ref(&o));
-                        if pass.parked().is_some() {
-                            break 'blockers;
-                        }
-                        if let Some(d) = fix::parse_reply(&o.text)
-                            .ok()
-                            .and_then(|v| serde_json::from_value::<fix::Decision>(v).ok())
-                        {
-                            decision = Some(d);
-                            break;
-                        }
-                    }
-                    let decision = decision.unwrap_or(fix::Decision {
-                        decision: fix::Verdict::Escalate,
-                        reason: "the judge's reply couldn't be read".into(),
-                        needs: Some("other".into()),
-                    });
-                    step = fix::judge(&step.ledger, decision)?;
-                }
-                fix::Next::Done | fix::Next::Escalate => break,
-            }
-        }
-        let summary = fix::summary(&step.ledger)?;
-        pass.log(summary.lines().next().unwrap_or(""));
-    }
-    pass.lap("fix", t);
-    Ok(())
-}
-
-/// Re-reviews one fix attempt: the verifier on the original finding, plus a reviewer per profile
-/// that raised it looking only for what the fix breaks; their blockers and majors are verified.
-fn rereview(
-    pass: &mut Pass,
-    system: &Path,
-    profiles: &Value,
-    finding: &Finding,
-    id: &str,
-    patch: &Path,
-) -> Result<fix::Review> {
-    let picked = profiles["picked"].as_array().cloned().unwrap_or_default();
-    let extra = format!(
-        "\nThis is a re-review of a fix for finding {id} ({}). The fix: {}. Raise only what the fix itself breaks.\n",
-        finding.title,
-        patch.display()
-    );
-    let mut specs = vec![pass.spec(
-        format!("fix-{id}-verifier"),
-        "verifier",
-        system,
-        finding.for_verifier(),
-        "sonnet",
-        "high",
-        Access::ReadOnly,
-    )];
-    let mut names = Vec::new();
-    for name in &finding.profiles {
-        if let Some(p) = picked.iter().find(|p| p["name"] == *name.as_str()) {
-            let plan = Plan::from_picked(p, true, String::new());
-            specs.push(pass.spec(
-                format!("fix-{id}-reviewer-{name}"),
-                "reviewer",
-                system,
-                pass.reviewer_prompt(&plan, &extra)?,
-                &plan.model,
-                &plan.effort,
-                Access::ReadOnly,
-            ));
-            names.push(name.clone());
-        }
-    }
-    let outcomes = pass.runner.run_all(specs);
-    pass.tally(&outcomes);
-    let original =
-        fix::parse_reply(&outcomes[0].text).unwrap_or_else(|_| json!({ "verdict": "unreadable" }));
-    let mut new = Vec::new();
-    for (name, o) in names.iter().zip(&outcomes[1..]) {
-        if let Ok(reply) = fix::parse_reply(&o.text) {
-            new.extend(
-                reply["findings"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|f| Finding::from_reply(name, f))
-                    .filter(|f| rank(&f.severity) <= 1),
-            );
-        }
-    }
-    let (confirmed, _) = pass.verify(system, &merge(new), |s| rank(s) <= 1);
-    Ok(fix::Review {
-        original,
-        new_findings: confirmed.into_iter().map(|(_, v)| v).collect(),
-    })
-}
-
 fn pr_pass(pass: &mut Pass) -> Result<Done> {
     let number = pass.opts.pr.unwrap();
     let prepared = pass.prepared.clone();
@@ -1834,7 +1585,7 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
             Access::ReadOnly,
         ));
         pass.tally(std::slice::from_ref(&o));
-        match fix::parse_reply(&o.text) {
+        match reply::parse_reply(&o.text) {
             Ok(r) => {
                 risk = r["risk"].clone();
                 assessment = r["assessment"].clone();
@@ -1926,7 +1677,7 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
     for ((name, plan, _), o) in runs.iter().zip(&outcomes) {
         let mut row = plan.json(None);
         row["name"] = json!(name);
-        match fix::parse_reply(&o.text) {
+        match reply::parse_reply(&o.text) {
             Ok(r) => {
                 let fs: Vec<Finding> = r["findings"]
                     .as_array()
@@ -2115,15 +1866,9 @@ pub fn summarize(report: &Value, path: &Path, fresh: bool) -> String {
                     .join(", ")
             })
             .unwrap_or_default();
-        let fix = match f["fix"]["status"].as_str() {
-            Some("resolved") => " — fixed by the fix loop",
-            Some("escalated") => " — the fix loop needs you",
-            Some("open") => " — fix loop open",
-            _ => "",
-        };
         out.push(String::new());
         out.push(format!(
-            "{}  {}  {}:{}  {}  [{profiles}]{fix}",
+            "{}  {}  {}:{}  {}  [{profiles}]",
             f["id"].as_str().unwrap_or("?"),
             f["severity"].as_str().unwrap_or("?"),
             f["file"].as_str().unwrap_or("?"),
@@ -2134,14 +1879,6 @@ pub fn summarize(report: &Value, path: &Path, fresh: bool) -> String {
         if let Some(how) = f["howItFails"].as_str() {
             for line in how.lines() {
                 out.push(format!("  {line}"));
-            }
-        }
-        if f["fix"]["status"] == "escalated" {
-            if let Some(ledger) = f["fix"]["ledger"].as_str() {
-                if let Ok(s) = fix::summary(Path::new(ledger)) {
-                    out.push(String::new());
-                    out.extend(s.lines().map(|l| format!("  {l}")));
-                }
             }
         }
     }
@@ -2507,13 +2244,12 @@ mod tests {
         assert_eq!(opts.base.as_deref(), Some("main"));
         assert_eq!(opts.intent.as_deref(), Some(Path::new("/s/intent.md")));
         assert_eq!(opts.state.as_deref(), Some(Path::new("/s/state")));
-        assert!(opts.no_fix);
         let p = opts.protocol.unwrap();
         assert_eq!(p.result, Path::new("/s/result.json"));
         assert!(p.previous.is_none());
 
         let by_hand = Options::default().with_protocol(|_| None);
-        assert!(by_hand.protocol.is_none() && !by_hand.no_fix);
+        assert!(by_hand.protocol.is_none());
         let pr = Options {
             pr: Some(7),
             ..Default::default()

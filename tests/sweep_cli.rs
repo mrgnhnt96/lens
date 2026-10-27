@@ -228,89 +228,6 @@ fn the_first_sweep_sets_the_watermark_and_an_empty_range_does_nothing() {
 }
 
 #[test]
-fn a_sweep_fixes_blockers_on_its_branch_opens_one_pr_and_moves_the_watermark() {
-    let fx = Fixture::new();
-    fx.sweep(&[], &[]);
-    fx.push(&[
-        ("src/a.rs", "pub fn a() {}\npub fn parse() {}\n"),
-        ("src/b.rs", "pub fn b() {}\n"),
-    ]);
-    let out = fx.sweep(&[], &[]);
-    assert!(
-        out.contains("Blockers: 1 (1 fixed), majors: 1, minors: 1"),
-        "{out}"
-    );
-    assert!(out.contains("PR: https://github.com/o/r/pull/7"), "{out}");
-    assert_eq!(fx.watermark(), Some(fx.origin_main()));
-
-    let report = &fx.reports()[0];
-    assert_eq!(report["pass"], "sweep");
-    assert_eq!(report["commits"], 1);
-    let areas: Vec<&str> = report["areas"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|a| a["title"].as_str().unwrap())
-        .collect();
-    assert_eq!(areas, ["parsing", "handles"]);
-    let findings = report["findings"].as_array().unwrap();
-    assert_eq!(findings.len(), 2);
-    assert_eq!(findings[0]["severity"], "blocker");
-    assert_eq!(findings[0]["area"], 1);
-    assert_eq!(findings[0]["fix"]["status"], "resolved");
-    assert!(findings[0]["commit"].is_string());
-    assert_eq!(findings[1]["file"], "src/b.rs");
-    assert_eq!(report["minors"][0]["id"], "M1");
-    assert_eq!(report["watermark"]["moved"], true);
-
-    // Each area's reviewers read their own change block, holding only that area's diff.
-    let calls: Vec<Value> = fs::read_to_string(fx.dir.path().join("calls.jsonl"))
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    let area_reviewer = calls
-        .iter()
-        .find(|c| {
-            c["role"] == "reviewer"
-                && c["prompt"]
-                    .as_str()
-                    .unwrap()
-                    .contains("This area (2/2): handles")
-        })
-        .unwrap();
-    let system = area_reviewer["system"].as_str().unwrap();
-    assert!(system.contains("src/b.rs") && !system.contains("+pub fn parse"));
-
-    // One commit per fix on the sweep's branch, pushed, and the PR body is the digest.
-    let branch = report["branch"].as_str().unwrap();
-    let log = git(
-        &fx.repo(),
-        &[
-            "log",
-            "--format=%B",
-            &format!("origin/main..origin/{branch}"),
-        ],
-    );
-    assert!(log.starts_with("fix: empty input accepted"), "{log}");
-    assert!(log.contains("Tests: cargo test parse"), "{log}");
-    let gh = fs::read_to_string(fx.dir.path().join("gh.log")).unwrap();
-    assert!(
-        gh.contains(&format!("pr create --base main --head {branch}")),
-        "{gh}"
-    );
-    let digest_path = gh.split("--body-file ").nth(1).unwrap().trim();
-    let digest = fs::read_to_string(digest_path).unwrap();
-    assert!(digest.contains("### Fixed"), "{digest}");
-    assert!(digest.contains("**M1** `src/a.rs:9` odd name"), "{digest}");
-    // The worktree is gone; the branch stays for the PR.
-    assert!(!fx
-        .repo()
-        .join(report["worktree"].as_str().unwrap())
-        .exists());
-}
-
-#[test]
 fn the_next_sweep_waits_and_skips_what_an_earlier_one_reported() {
     let fx = Fixture::new();
     fx.sweep(&[], &[]);
@@ -378,7 +295,7 @@ fn a_sweep_the_plan_turns_away_parks_until_the_window_resets() {
     fs::write(&gate, held.to_string()).unwrap();
     let out = fx.sweep(&["--now"], &[]);
     assert!(
-        out.contains("Blockers: 1 (1 fixed), majors: 1, minors: 1"),
+        out.contains("Blockers: 1 (0 fixed), majors: 1, minors: 1"),
         "{out}"
     );
     assert_eq!(fx.watermark(), Some(fx.origin_main()));

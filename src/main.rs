@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use lens::{config, cost, diff, fix, map, pr, profile, review, select, sweep, usage};
+use lens::{config, cost, diff, map, pr, profile, review, select, sweep, usage};
 
 /// Agent code review for Claude Code.
 #[derive(Parser)]
@@ -18,9 +18,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Review the change: run the reviewers, verify their findings, write the report to
-    /// <state>/<branch>.json (outside the repo) and take blockers through the fix loop. Each agent
+    /// <state>/<branch>.json (outside the repo). Each agent
     /// runs as its own headless `claude -p`. Progress goes to stderr, the summary to stdout. With
-    /// TASKBOARD_RESULT set it runs as a review-protocol reviewer: it fixes nothing and writes the
+    /// TASKBOARD_RESULT set it runs as a review-protocol reviewer: it writes the
     /// protocol's result there (docs/REVIEW.md).
     Review {
         /// The base ref. Defaults to origin's default branch, then main, then master.
@@ -28,18 +28,15 @@ enum Command {
         /// A ticket or spec the change implements, for intent-alignment.
         #[arg(long)]
         intent: Option<PathBuf>,
-        /// Report blockers without running the fix loop.
-        #[arg(long)]
-        no_fix: bool,
         /// Review the whole change, even when only part of it changed since the last review.
         #[arg(long)]
         full: bool,
         /// The per-PR floor: one Sonnet correctness reviewer, only when the change touches a
-        /// `[floor] risky` glob of .lens.toml; no fix loop.
+        /// `[floor] risky` glob of .lens.toml.
         #[arg(long, conflicts_with_all = ["pr", "full"])]
         floor: bool,
         /// Run the PR pass on this PR: every profile, all severities, posted on the PR.
-        #[arg(long, conflicts_with_all = ["base", "no_fix", "full"])]
+        #[arg(long, conflicts_with_all = ["base", "full"])]
         pr: Option<u64>,
         /// With --pr: build the review but don't post it.
         #[arg(long, requires = "pr")]
@@ -71,11 +68,6 @@ enum Command {
         /// The provider to use instead of .lens.toml's: "grep" (built in) or a program.
         #[arg(long)]
         provider: Option<String>,
-    },
-    /// The blocker fix loop's ledger: start it, record attempts and judgments, summarize it.
-    Fix {
-        #[command(subcommand)]
-        command: FixCommand,
     },
     /// Review everything pushed to origin's default branch since the last sweep (the
     /// refs/lens/swept watermark): reviewers per area, the verifier, the fix loop on blockers in
@@ -121,52 +113,6 @@ enum Command {
     Pr {
         #[command(subcommand)]
         command: PrCommand,
-    },
-}
-
-#[derive(Subcommand)]
-enum FixCommand {
-    /// Open the loop for one finding of a `lens review` report and snapshot the working tree.
-    Start {
-        /// The report, `<state>/<branch>.json`.
-        #[arg(long)]
-        report: PathBuf,
-        /// The finding's id, e.g. F1.
-        #[arg(long)]
-        finding: String,
-        /// Attempts before the loop escalates whatever the judge says.
-        #[arg(long, default_value_t = fix::DEFAULT_CAP)]
-        cap: u32,
-    },
-    /// Record the attempt the fixer just made and its re-review.
-    Record {
-        #[arg(long)]
-        ledger: PathBuf,
-        /// The fixer's reply (JSON, or text ending in a ```json block).
-        #[arg(long)]
-        fixer: Option<PathBuf>,
-        /// The re-review: {"original": <verifier reply>, "newFindings": [...]}. Leave it out
-        /// only when the fixer changed nothing.
-        #[arg(long)]
-        review: Option<PathBuf>,
-    },
-    /// Print the diff of the attempt in progress (empty when the fixer changed nothing).
-    Diff {
-        #[arg(long)]
-        ledger: PathBuf,
-    },
-    /// Record the escalation judge's call on the last failed attempt.
-    Judge {
-        #[arg(long)]
-        ledger: PathBuf,
-        /// The judge's reply: {"decision": "continue"|"escalate", "reason", "needs"}.
-        #[arg(long)]
-        decision: PathBuf,
-    },
-    /// Print the loop's summary for the human.
-    Summary {
-        #[arg(long)]
-        ledger: PathBuf,
     },
 }
 
@@ -248,7 +194,6 @@ fn main() -> Result<()> {
         Command::Review {
             base,
             intent,
-            no_fix,
             full,
             floor,
             pr,
@@ -259,7 +204,6 @@ fn main() -> Result<()> {
                 repo,
                 base,
                 intent,
-                no_fix,
                 full,
                 floor,
                 pr,
@@ -309,7 +253,6 @@ fn main() -> Result<()> {
                 })?
             );
         }
-        Command::Fix { command } => run_fix(command)?,
         Command::Pr { command } => run_pr(command)?,
     }
     Ok(())
@@ -357,46 +300,6 @@ fn run_pr(command: PrCommand) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn run_fix(command: FixCommand) -> Result<()> {
-    let step = match command {
-        FixCommand::Start {
-            report,
-            finding,
-            cap,
-        } => fix::start(&report, &finding, cap)?,
-        FixCommand::Record {
-            ledger,
-            fixer,
-            review,
-        } => {
-            let fixer = fixer.map(|p| read_reply(&p)).transpose()?;
-            let review = review
-                .map(|p| Ok::<_, anyhow::Error>(serde_json::from_value(read_reply(&p)?)?))
-                .transpose()?;
-            fix::record(&ledger, fixer, review)?
-        }
-        FixCommand::Judge { ledger, decision } => {
-            fix::judge(&ledger, serde_json::from_value(read_reply(&decision)?)?)?
-        }
-        FixCommand::Diff { ledger } => {
-            print!("{}", fix::pending_diff(&ledger)?);
-            return Ok(());
-        }
-        FixCommand::Summary { ledger } => {
-            print!("{}", fix::summary(&ledger)?);
-            return Ok(());
-        }
-    };
-    println!("{}", serde_json::to_string_pretty(&step)?);
-    Ok(())
-}
-
-fn read_reply(path: &Path) -> Result<serde_json::Value> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    fix::parse_reply(&text).with_context(|| format!("in {}", path.display()))
 }
 
 /// `$LENS_PROFILES_DIR`, else the profiles built into lens.

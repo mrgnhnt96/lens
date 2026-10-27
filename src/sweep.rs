@@ -190,7 +190,7 @@ pub fn run(opts: Options) -> Result<String> {
             Access::ReadOnly,
         ));
         pass.tally(std::slice::from_ref(&o));
-        match crate::fix::parse_reply(&o.text) {
+        match crate::reply::parse_reply(&o.text) {
             Ok(r) => {
                 risk = r["risk"].clone();
                 assessment = r["assessment"].clone();
@@ -298,7 +298,7 @@ pub fn run(opts: Options) -> Result<String> {
     for ((i, plan), o) in runs.iter().zip(&outcomes) {
         let mut row = plan.json(None);
         row["area"] = json!(i + 1);
-        match crate::fix::parse_reply(&o.text) {
+        match crate::reply::parse_reply(&o.text) {
             Ok(r) => {
                 let fs: Vec<Finding> = r["findings"]
                     .as_array()
@@ -409,7 +409,7 @@ pub fn run(opts: Options) -> Result<String> {
     review::finish(&mut pass, &mut report)?;
 
     // One fix at a time, each committed on the sweep's branch or thrown away.
-    let mut fixed: BTreeMap<String, String> = BTreeMap::new();
+    let fixed: BTreeMap<String, String> = BTreeMap::new();
     // The review stands once written; blockers the plan left no room to fix stay open in it.
     let mut unfixed: Vec<String> = Vec::new();
     if !opts.dry_run {
@@ -425,50 +425,8 @@ pub fn run(opts: Options) -> Result<String> {
                 )
             })
             .collect();
-        for (id, area) in blockers {
-            if pass.parked().is_some() {
-                unfixed.push(id);
-                continue;
-            }
-            let dir = work.join(format!("area-{area}"));
-            pass.work = dir.clone();
-            pass.runner.log_dir = dir.join("agents");
-            let current = read_json(&report_path)?;
-            if let Err(e) = review::fix_loop(&mut pass, &current, Some(&id)) {
-                pass.log(&format!("fixing {id} failed: {e:#}"));
-            }
-            let ledger = read_json(&work.join("fix").join(format!("{id}.json")));
-            let finding = current["findings"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|f| f["id"] == id.as_str())
-                .cloned()
-                .unwrap_or(Value::Null);
-            if pass.parked().is_some() && !ledger.as_ref().is_ok_and(|l| l["status"] == "resolved")
-            {
-                tree.reset();
-                unfixed.push(id);
-                continue;
-            }
-            match ledger {
-                Ok(l) if l["status"] == "resolved" => {
-                    match commit_fix(&tree.path, &stamp, &id, &finding, &l) {
-                        Ok(Some(sha)) => {
-                            fixed.insert(id, sha);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            pass.log(&format!("committing the fix for {id} failed: {e:#}"));
-                            tree.reset();
-                        }
-                    }
-                }
-                _ => tree.reset(),
-            }
-        }
-        pass.work = work.clone();
-        pass.runner.log_dir = work.join("agents");
+        // lens no longer fixes blockers: the board does. A sweep reports them.
+        unfixed.extend(blockers.into_iter().map(|(id, _)| id));
     }
 
     let mut report = read_json(&report_path)?;
@@ -587,12 +545,6 @@ impl Tree {
             head: head.to_string(),
         })
     }
-
-    /// Throws away what a failed fix left in the tree.
-    fn reset(&self) {
-        let _ = git(&self.path, &["reset", "--hard", "--quiet"]);
-        let _ = git(&self.path, &["clean", "-fdq"]);
-    }
 }
 
 impl Drop for Tree {
@@ -616,48 +568,6 @@ impl Drop for Tree {
             }
         }
     }
-}
-
-/// Commits a resolved fix; `None` when it left nothing to commit.
-fn commit_fix(
-    tree: &Path,
-    stamp: &str,
-    id: &str,
-    finding: &Value,
-    ledger: &Value,
-) -> Result<Option<String>> {
-    git(tree, &["add", "-A"])?;
-    if git(tree, &["diff", "--cached", "--quiet"]).is_ok() {
-        return Ok(None);
-    }
-    let tests = ledger["attempts"]
-        .as_array()
-        .and_then(|a| a.last())
-        .map(|a| &a["fixer"]["tests"])
-        .map(|t| match t {
-            Value::Array(items) => items
-                .iter()
-                .map(|i| i.as_str().map_or_else(|| i.to_string(), String::from))
-                .collect::<Vec<_>>()
-                .join("; "),
-            Value::String(s) => s.clone(),
-            Value::Null => String::new(),
-            other => other.to_string(),
-        })
-        .unwrap_or_default();
-    let msg = format!(
-        "fix: {}\n\nlens sweep {stamp}, finding {id} ({}:{}).\n\nTests: {}\n",
-        finding["title"].as_str().unwrap_or("lens finding"),
-        finding["file"].as_str().unwrap_or("?"),
-        finding["line"],
-        if tests.is_empty() {
-            "none reported"
-        } else {
-            &tests
-        },
-    );
-    git(tree, &["commit", "--quiet", "--no-verify", "-m", &msg])?;
-    Ok(Some(rev(tree, "HEAD")?))
 }
 
 /// Writes what a change block reads into `dir`: diff.patch, profiles.json and map.json (map.err

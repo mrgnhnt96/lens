@@ -112,8 +112,6 @@ pub struct ReviewConfig {
     pub parallel: usize,
     /// Minutes before an agent is stopped.
     pub timeout_mins: u64,
-    /// The fixer's `claude --permission-mode`: it edits the tree and runs tests, headless.
-    pub fixer_permission_mode: String,
 }
 
 impl Default for ReviewConfig {
@@ -122,7 +120,6 @@ impl Default for ReviewConfig {
             small_lines: 40,
             parallel: 4,
             timeout_mins: 20,
-            fixer_permission_mode: "bypassPermissions".into(),
         }
     }
 }
@@ -359,7 +356,6 @@ mod tests {
     fn review_settings_default_and_override() {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c.review.small_lines, 40);
-        assert_eq!(c.review.fixer_permission_mode, "bypassPermissions");
         let c: Config = toml::from_str("[review]\nsmall_lines = 10\n").unwrap();
         assert_eq!(c.review.small_lines, 10);
         assert_eq!(c.review.parallel, 4);
