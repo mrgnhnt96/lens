@@ -231,6 +231,11 @@ pub fn secs(iso: &str) -> Option<u64> {
     u64::try_from(days * 86400 + hh * 3600 + mm * 60 + ss).ok()
 }
 
+/// Every window reading recorded in `dir`.
+pub fn recorded(dir: &Path) -> Vec<Reading> {
+    load(&dir.join(READINGS))
+}
+
 /// Every line of a log that parses; a missing log is empty.
 fn load<T: DeserializeOwned>(path: &Path) -> Vec<T> {
     fs::read_to_string(path)

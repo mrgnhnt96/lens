@@ -27,6 +27,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::agent::{self, Access, Full, Gate, Outcome, Runner, Spec};
+use crate::backoff;
 use crate::config::{self, Config};
 use crate::diff::git;
 use crate::fix;
@@ -386,6 +387,8 @@ pub(crate) struct Pass {
     seconds: serde_json::Map<String, Value>,
     /// The plan's window that turned one of this pass's agents away, if one did.
     turned_away: Option<Full>,
+    /// Why `[backoff]` has this pass run the correctness reviewer only, when it does.
+    pub(crate) lighter: Option<String>,
 }
 
 impl Pass {
@@ -431,6 +434,7 @@ impl Pass {
             agents: Vec::new(),
             seconds: serde_json::Map::new(),
             turned_away: None,
+            lighter: None,
         })
     }
 
@@ -441,6 +445,27 @@ impl Pass {
     pub(crate) fn lap(&mut self, name: &str, since: Instant) {
         self.seconds
             .insert(name.into(), json!(since.elapsed().as_secs()));
+    }
+
+    /// With `[backoff]` saying the plan's usage runs high, every reviewer but correctness sits
+    /// this pass out.
+    pub(crate) fn lighten(&self, plans: &mut [Plan]) {
+        let Some(why) = &self.lighter else { return };
+        let mut skipped = Vec::new();
+        for p in plans
+            .iter_mut()
+            .filter(|p| p.run && p.name != "correctness")
+        {
+            p.run = false;
+            p.reason = "backoff".into();
+            skipped.push(p.name.clone());
+        }
+        if !skipped.is_empty() {
+            self.log(&format!(
+                "backoff: {why}; running correctness only, skipping {}",
+                skipped.join(", ")
+            ));
+        }
     }
 
     /// Why the pass stops here, once the plan has turned one of its agents away.
@@ -701,13 +726,13 @@ impl Pass {
 pub fn run(opts: Options) -> Result<Done> {
     let assets = crate::assets::root()?;
     let root = PathBuf::from(git(&opts.repo, &["rev-parse", "--show-toplevel"])?.trim());
+    let cfg = config::load(&root)?;
     if let Some(n) = opts.pr {
-        let cfg = config::load(&root)?.pr;
-        if !cfg.samples(n) {
+        if !cfg.pr.samples(n) {
             return Ok(Done {
                 summary: format!(
                     "lens: PR #{n} isn't in the sample ([pr] sample = {}), nothing to review.",
-                    cfg.sample
+                    cfg.pr.sample
                 ),
                 report: None,
             });
@@ -716,6 +741,24 @@ pub fn run(opts: Options) -> Result<Done> {
     let now = agent::now_secs();
     if let Some(full) = Gate::shared().full(now) {
         return Ok(parked(&full.message(now)));
+    }
+    let backoff = backoff::check(&cfg.backoff, &root.to_string_lossy(), now);
+    if backoff.lifted {
+        eprintln!("lens: {}", backoff::LIFTED);
+    }
+    if let Some((why, _)) = &backoff.pause {
+        return Ok(parked(why));
+    }
+    if let (Some(n), Some((share, why))) = (opts.pr, &backoff.share) {
+        if !config::in_share(n, cfg.pr.sample * share) {
+            return Ok(Done {
+                summary: format!(
+                    "lens: PR #{n} skipped: backoff: {why}, so lens reviews {}% of PRs until it eases. Nothing was reviewed.",
+                    (share * 100.0).round()
+                ),
+                report: None,
+            });
+        }
     }
     let prepared = prepare(&assets, &root, &opts)?;
     let work = PathBuf::from(
@@ -733,6 +776,7 @@ pub fn run(opts: Options) -> Result<Done> {
         .map(PathBuf::from)
         .unwrap_or_else(|| root.clone());
     let mut pass = Pass::new(opts, root, tree_dir, work, report_path, prepared)?;
+    pass.lighter = backoff.lighter;
     if let Some(intent) = &pass.opts.intent {
         fs::copy(intent, pass.work.join("intent.md"))
             .with_context(|| format!("copying {}", intent.display()))?;
@@ -1015,6 +1059,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
             p.run = true;
         }
     }
+    pass.lighten(&mut plans);
     if let Some(d) = &delta_info {
         pass.log(&format!(
             "reviewing the {} changed lines since the last review ({} tier)",
@@ -1065,10 +1110,15 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     let mut raised = Vec::new();
     let mut profile_rows = Vec::new();
     let mut failed = Vec::new();
+    // Reviewers backoff skipped: the report counts as incomplete, so a later review redoes them.
+    let mut lightened = Vec::new();
     let mut it = outcomes.iter();
     for plan in &plans {
         if !plan.run {
             profile_rows.push(plan.json(None));
+            if plan.reason == "backoff" {
+                lightened.push(plan.name.clone());
+            }
             continue;
         }
         let o = it.next().unwrap();
@@ -1141,8 +1191,8 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     if let Some(d) = delta_info {
         report["delta"] = d;
     }
-    if !failed.is_empty() {
-        report["incomplete"] = json!(failed);
+    if !failed.is_empty() || !lightened.is_empty() {
+        report["incomplete"] = json!(failed.iter().chain(&lightened).collect::<Vec<_>>());
     }
     finish(pass, &mut report)?;
 
@@ -1462,7 +1512,8 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         .iter()
         .filter_map(|f| f.as_str().map(String::from))
         .collect();
-    let plans = plan_pr(&profiles, &files);
+    let mut plans = plan_pr(&profiles, &files);
+    pass.lighten(&mut plans);
     let extra = format!(
         "\nRepo: {}  (the PR's head; read files there, not in the current directory)\nAlready posted on this PR (don't raise these again): {}\n",
         pass.tree_dir.display(),
