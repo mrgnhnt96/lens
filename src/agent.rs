@@ -908,6 +908,7 @@ echo '{{"type":"result","result":"ok","total_cost_usd":0.01}}'
     fn a_rejected_reading_starts_no_more_agents_until_the_window_resets() {
         let resets_at = now_secs() + 600;
         let gate = Gate::default();
+        let before = now_secs();
         let (log, outcomes, dir) = turned_away(
             gate.clone(),
             resets_at,
@@ -924,7 +925,12 @@ echo '{{"type":"result","result":"ok","total_cost_usd":0.01}}'
         };
         for o in &outcomes {
             assert_eq!(o.full.as_ref(), Some(&full), "{o:?}");
-            assert_eq!(o.error.as_deref(), Some(full.message(now_secs()).as_str()));
+            // The message names the day, so allow for the clock crossing midnight mid-run.
+            let error = o.error.clone().unwrap();
+            assert!(
+                [full.message(before), full.message(now_secs())].contains(&error),
+                "{error}"
+            );
         }
         // The reading is kept; the refused run isn't a row of spend.
         let usage = dir.path().join("usage");
@@ -946,6 +952,17 @@ echo '{{"type":"result","result":"ok","total_cost_usd":0.01}}'
             "status": "rejected", "rateLimitType": "seven_day", "resetsAt": now + 900}});
         assert_eq!(
             Full::of(&event, now),
+            Some(Full {
+                window: "seven_day".into(),
+                resets_at: now + 900
+            })
+        );
+        // Windows, none of them rejected: the top level still names the full window.
+        let none_rejected = json!({"rate_limit_info": {
+            "status": "rejected", "rateLimitType": "seven_day", "resetsAt": now + 900,
+            "unifiedWindows": {"five_hour": {"status": "allowed", "resetsAt": now + 100}}}});
+        assert_eq!(
+            Full::of(&none_rejected, now),
             Some(Full {
                 window: "seven_day".into(),
                 resets_at: now + 900

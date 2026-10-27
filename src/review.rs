@@ -786,14 +786,9 @@ pub fn run(opts: Options) -> Result<Done> {
             });
         }
     }
+    // A held plan window isn't checked here: a review that starts no agent (the last one still
+    // matches the tree) shows the stored report, and one that does is turned away by the runner.
     let now = agent::now_secs();
-    if let Some(full) = Gate::shared().full(now) {
-        let why = full.message(now);
-        if opts.protocol.is_some() {
-            bail!("paused: {why}");
-        }
-        return Ok(parked(&why));
-    }
     let backoff = backoff::check(&cfg.backoff, &root.to_string_lossy(), now);
     if backoff.lifted {
         eprintln!("lens: {}", backoff::LIFTED);
