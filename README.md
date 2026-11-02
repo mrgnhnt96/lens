@@ -38,7 +38,7 @@ docs/PROVIDERS.md            the change-map provider contract
 docs/REVIEW.md               the report and protocol result formats, and where state is kept
 ```
 
-## `lens review [<base>] [--intent <file>] [--full]`, `lens review --floor`, `lens review --pr <n>`
+## `lens review [<base>] [--intent <file>] [--full]`, `lens review --floor`, `lens review --pr <n> [--full]`
 
 Runs a pass and prints its summary; the report goes to `<state>/<branch>.json` (format in
 [docs/REVIEW.md](docs/REVIEW.md)). Nothing is written to the repo: `<state>` is

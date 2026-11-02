@@ -47,6 +47,14 @@ pub fn root() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// What a report records of the lens that wrote it: the version and a hash of its prompts and
+/// profiles, so a later run can tell whether the report would come out the same way.
+pub fn fingerprint() -> String {
+    let mut hasher = DefaultHasher::new();
+    FILES.hash(&mut hasher);
+    format!("{}+{:016x}", env!("CARGO_PKG_VERSION"), hasher.finish())
+}
+
 /// The user's cache: `$XDG_CACHE_HOME`, else `~/.cache`.
 pub fn cache() -> Result<PathBuf> {
     Ok(match std::env::var_os("XDG_CACHE_HOME") {

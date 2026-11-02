@@ -596,6 +596,12 @@ impl Pass {
             )),
             Err(_) => s.push_str("\n## The change map\n\nNone: the map provider failed. Grep for callers and tests yourself.\n"),
         }
+        if let Some(list) = fs::read_to_string(self.work.join("map.json"))
+            .ok()
+            .and_then(|m| untested(&m))
+        {
+            s.push_str(&format!("\n## Changed code no test names\n\nChanged symbols outside test files that no test file mentions. Each is a likely coverage gap; a symbol missing here may still be untested, since a mention isn't an assertion.\n\n{list}"));
+        }
         for name in ["task.json", "intent.md"] {
             if let Ok(text) = fs::read_to_string(self.work.join(name)) {
                 s.push_str(&format!("\n## The task ({name})\n\n{}\n", text.trim()));
@@ -1540,6 +1546,15 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
             report: None,
         });
     }
+    if !pass.opts.full {
+        if let Some(prev) = reusable(&pass.report_path, &prepared) {
+            pass.log(&format!(
+                "PR #{number}'s head is unchanged since the last review; reusing it (--full reviews again)"
+            ));
+            let summary = summarize(&prev, &pass.report_path, true);
+            return Ok(post_pr(pass, number, &prev, summary, &[]));
+        }
+    }
     let _ = fs::remove_dir_all(pass.work.join("agents"));
     let profiles: Value =
         serde_json::from_str(&fs::read_to_string(pass.work.join("profiles.json"))?)?;
@@ -1719,11 +1734,43 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         "profiles": rows,
         "findings": number_all(confirmed),
         "dropped": dropped,
+        "lens": crate::assets::fingerprint(),
     });
     finish(pass, &mut report)?;
 
-    let mut summary = summarize(&report, &pass.report_path, false);
-    let cfg = config::load(&pass.root)?.pr;
+    let summary = summarize(&report, &pass.report_path, false);
+    Ok(post_pr(pass, number, &report, summary, &failed))
+}
+
+/// The last PR pass's report, when it reviewed the same head against the same base with the same
+/// lens: running the agents again would only add noise.
+fn reusable(path: &Path, prepared: &Value) -> Option<Value> {
+    let prev: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    (prev["pass"] == "pr"
+        && prev["head"] == prepared["head"]
+        && prev["base"] == prepared["base"]
+        && prev["lens"] == crate::assets::fingerprint().as_str())
+    .then_some(prev)
+}
+
+/// Posts a PR pass's report (unless it's a dry run) and adds what happened to `summary`.
+fn post_pr(
+    pass: &Pass,
+    number: u64,
+    report: &Value,
+    mut summary: String,
+    failed: &[String],
+) -> Done {
+    let cfg = match config::load(&pass.root) {
+        Ok(c) => c.pr,
+        Err(e) => {
+            summary.push_str(&format!("\nPosting failed: {e:#}."));
+            return Done {
+                summary,
+                report: Some(pass.report_path.clone()),
+            };
+        }
+    };
     let posted = (|| -> Result<String> {
         let forge = forge::open(&pass.root, &cfg)?;
         let parsed: pr::Report = serde_json::from_value(report.clone())?;
@@ -1781,10 +1828,34 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
             failed.join(", ")
         ));
     }
-    Ok(Done {
+    Done {
         summary,
         report: Some(pass.report_path.clone()),
-    })
+    }
+}
+
+/// The change map's added and modified symbols outside test files that no test mentions, one
+/// `- name (kind, file:line)` line each, or `None` when there are none.
+fn untested(map: &str) -> Option<String> {
+    let map: Value = serde_json::from_str(map).ok()?;
+    let lines: Vec<String> = map["symbols"]
+        .as_array()?
+        .iter()
+        .filter(|sym| sym["change"] != "removed")
+        .filter(|sym| sym["tests"].as_array().is_none_or(Vec::is_empty))
+        .filter_map(|sym| {
+            let file = sym["file"].as_str()?;
+            (!crate::map::grep::is_test_path(file)).then(|| {
+                format!(
+                    "- `{}` ({}, {file}:{})\n",
+                    sym["name"].as_str().unwrap_or("?"),
+                    sym["kind"].as_str().unwrap_or("symbol"),
+                    sym["line"]
+                )
+            })
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.concat())
 }
 
 pub(crate) fn number_all(confirmed: Vec<(Finding, Value)>) -> Vec<Value> {
@@ -1968,6 +2039,21 @@ mod tests {
 
     fn git_in(dir: &Path, args: &[&str]) {
         git(dir, args).unwrap();
+    }
+
+    #[test]
+    fn untested_lists_changed_code_outside_tests_that_no_test_names() {
+        let map = json!({"symbols": [
+            {"name": "covered", "kind": "function", "file": "src/a.go", "line": 3, "change": "modified", "tests": [{"file": "a_test.go", "line": 1}]},
+            {"name": "bare", "kind": "function", "file": "src/a.go", "line": 9, "change": "added", "tests": []},
+            {"name": "gone", "kind": "function", "file": "src/a.go", "line": 12, "change": "removed"},
+            {"name": "TestBare", "kind": "function", "file": "src/a_test.go", "line": 5, "change": "added"}
+        ]});
+        assert_eq!(
+            untested(&map.to_string()).as_deref(),
+            Some("- `bare` (function, src/a.go:9)\n")
+        );
+        assert_eq!(untested(&json!({"symbols": []}).to_string()), None);
     }
 
     #[test]

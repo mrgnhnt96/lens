@@ -704,6 +704,32 @@ fn the_pr_pass_runs_the_lead_and_its_focus_areas_and_posts() {
 }
 
 #[test]
+fn a_pr_whose_head_is_unchanged_reuses_its_last_review() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let first = read_json(&fx.state().join("pr-7.json"));
+    assert!(first["lens"].as_str().is_some_and(|l| !l.is_empty()));
+    assert!(!fx.calls().is_empty());
+
+    // Same head, same lens: no agent runs and the findings are the same ones.
+    let out = fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    assert!(fx.calls().is_empty(), "{out}");
+    assert!(out.contains("unchanged since the last review"), "{out}");
+    assert_eq!(
+        read_json(&fx.state().join("pr-7.json"))["findings"],
+        first["findings"]
+    );
+
+    // --full reviews it again.
+    fx.review_with(&[], &["--pr", "7", "--dry-run", "--full"], &env);
+    assert!(!fx.calls().is_empty());
+}
+
+#[test]
 fn a_pr_outside_the_sample_runs_nothing() {
     let fx = Fixture::new(60);
     let d = fx.repo();

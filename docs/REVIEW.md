@@ -197,6 +197,12 @@ The format is the same, except:
   in `profiles` as `focus: <title>`, and it has no `tree`, `mode` or `tier`.
 - `findings` holds every confirmed finding, `minor` and `nit` included; `dropped` only the
   unverified ones. Every profile lens picked is listed in `profiles`.
+- `lens` is the lens that wrote it: its version and a hash of its prompts and profiles.
+
+A PR pass whose `head` and `base` match the last report's, written by the same `lens`, runs no
+agents: it reuses that report and posts what's left to post. `--full` reviews it again. A PR
+gets one review per commit, and a rerun can't turn up a different set of findings for the same
+code.
 
 `lens pr post` reads the report and posts it; it uses `pr.url`, `head` and `findings`, and
 ignores the rest. It posts `blocker`, `major` and `minor` findings; `nit`s are counted in the
