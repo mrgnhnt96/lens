@@ -858,6 +858,9 @@ pub fn run(opts: Options) -> Result<Done> {
     };
     fs::create_dir_all(&state).with_context(|| format!("making {}", state.display()))?;
     let state = state.canonicalize()?;
+    let repo_state = crate::outcome::state_of(&root).ok();
+    let states: Vec<PathBuf> = repo_state.into_iter().chain([state.clone()]).collect();
+    crate::outcome::before_review(&root, &states, &cfg);
     let prepared = prepare(&assets, &root, &state, &opts)?;
     let work = PathBuf::from(
         prepared["work"]
@@ -889,7 +892,7 @@ pub fn run(opts: Options) -> Result<Done> {
 /// A repo's state folder under `state_root`: its name, then a hash of its path, so two checkouts
 /// of one repo keep apart. The hash is FNV-1a, which no toolchain update changes, so a rebuilt
 /// lens still finds the last report.
-fn state_dir(state_root: &Path, root: &Path) -> PathBuf {
+pub(crate) fn state_dir(state_root: &Path, root: &Path) -> PathBuf {
     let hash = root
         .as_os_str()
         .as_encoded_bytes()

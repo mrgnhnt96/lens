@@ -1,5 +1,6 @@
 //! [`Forge`] for GitHub, through the `gh` CLI.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,6 +10,7 @@ use serde_json::{json, Value};
 
 use super::{Forge, PrView};
 use crate::config::{PostAs, PrConfig};
+use crate::outcome::{self, Discussion};
 use crate::pr::{earlier_from, Earlier, Markup, Review};
 
 /// GitHub, through `gh` (or `$LENS_GH`) run in the repo with the identity `.lens.toml` picks.
@@ -126,6 +128,35 @@ impl Forge for GitHub {
         let comments = self.list(&format!("repos/{{owner}}/{{repo}}/pulls/{pr}/comments"))?;
         let reviews = self.list(&format!("repos/{{owner}}/{{repo}}/pulls/{pr}/reviews"))?;
         Ok(earlier_from(&comments, &reviews))
+    }
+
+    /// One GraphQL query per [`outcome::GITHUB_BATCH`] PRs, then one fetch of all their heads.
+    fn discussions(&self, prs: &[u64]) -> Result<BTreeMap<u64, Discussion>> {
+        let mut all = BTreeMap::new();
+        for batch in prs.chunks(outcome::GITHUB_BATCH) {
+            let query = format!("query={}", outcome::github_query(batch));
+            let owner = ["-F", "owner={owner}", "-F", "name={repo}"];
+            let text = self.api(&[&["graphql"][..], &owner, &["-f", &query]].concat(), None)?;
+            let answer: Value =
+                serde_json::from_str(&text).context("parsing gh api graphql's answer")?;
+            all.extend(outcome::github_discussions(&answer, batch));
+        }
+        if all.is_empty() {
+            return Ok(all);
+        }
+        // A missing head only leaves a finding's code uncompared, so a failed fetch is no error.
+        let _ = Command::new("git")
+            .args(["fetch", "--quiet", "origin"])
+            .args(
+                all.keys()
+                    .map(|n| format!("+refs/pull/{n}/head:refs/lens/pr/{n}")),
+            )
+            .current_dir(&self.repo)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        Ok(all)
     }
 
     fn markup(&self) -> Markup {
