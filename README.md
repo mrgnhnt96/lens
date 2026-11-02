@@ -192,8 +192,8 @@ and the rest go in the post. A review is never just comments: it requests change
 or major is unfixed, and approves otherwise. A clean review approves with an empty body. Findings
 an earlier run posted (same finding, or the same file within 3 lines) are skipped, in either mode
 and across a change of mode, and a rerun with nothing new and the same verdict posts nothing. GitHub doesn't let a PR's author approve or
-request changes on it, so posting as the author falls back to a plain review with the findings,
-or posts nothing for a clean one. `--dry-run` prints the payload instead.
+request changes on it, so posting as the author posts nothing: a clean review is skipped, and
+one with findings fails and says to post as a bot (`post_as = "bot"`). `--dry-run` prints the payload instead.
 
 Which PRs `lens review --pr` reviews, and who posts, are set in `.lens.toml`:
 

@@ -136,26 +136,22 @@ impl Forge for GitHub {
         payload(review)
     }
 
-    /// GitHub won't let anyone approve or request changes on their own PR, so posting as its
-    /// author falls back to a plain review: the findings still land, and an approval with none
-    /// posts nothing.
+    /// GitHub won't let anyone approve or request changes on their own PR. lens never posts a
+    /// review without a verdict, so posting as its author posts nothing: a clean approval quietly,
+    /// a review with findings as an error that says to post as a bot.
     fn post(&self, pr: u64, review: &Review) -> Result<Option<String>> {
         let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{pr}/reviews");
-        let send = |review: &Value| {
-            self.api(
-                &["--method", "POST", &endpoint, "--input", "-"],
-                Some(&review.to_string()),
-            )
-        };
-        let request = payload(review);
-        let out = match send(&request) {
+        let out = match self.api(
+            &["--method", "POST", &endpoint, "--input", "-"],
+            Some(&payload(review).to_string()),
+        ) {
             Err(e) if format!("{e:#}").contains("your own pull request") => {
                 if review.event == "APPROVE" && !review.raises_findings() {
                     return Ok(None);
                 }
-                let mut plain = request.clone();
-                plain["event"] = "COMMENT".into();
-                send(&plain)?
+                bail!(
+                    "GitHub wouldn't take lens's verdict on PR {pr}, so nothing was posted (lens never posts a review without one). On your own PR, post as a bot (post_as = \"bot\") to give it one"
+                );
             }
             out => out?,
         };
