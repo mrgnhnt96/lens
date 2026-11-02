@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use super::{Forge, PrView};
 use crate::config::{PostAs, PrConfig};
-use crate::pr::{earlier_from, Earlier, Review};
+use crate::pr::{earlier_from, Earlier, Markup, Review};
 
 /// GitHub, through `gh` (or `$LENS_GH`) run in the repo with the identity `.lens.toml` picks.
 pub struct GitHub {
@@ -149,7 +149,11 @@ impl Forge for GitHub {
         Ok(earlier_from(&comments, &reviews))
     }
 
-    fn payload(&self, review: &Review) -> Value {
+    fn markup(&self) -> Markup {
+        Markup::GitHub
+    }
+
+    fn payload(&self, _pr: u64, review: &Review) -> Value {
         payload(review)
     }
 

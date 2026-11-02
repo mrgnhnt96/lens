@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{ForgeKind, PrConfig};
-use crate::pr::{Earlier, Review};
+use crate::pr::{Earlier, Markup, Review};
 
 mod bitbucket;
 mod github;
@@ -53,8 +53,11 @@ pub trait Forge {
     /// The findings earlier lens runs posted on PR `pr`, and the verdict the latest one gave.
     fn earlier(&self, pr: u64) -> Result<Earlier>;
 
-    /// The request [`Forge::post`] sends, for a dry run to show.
-    fn payload(&self, review: &Review) -> Value;
+    /// How this forge renders what lens posts.
+    fn markup(&self) -> Markup;
+
+    /// What [`Forge::post`] sends for PR `pr`, for a dry run to show.
+    fn payload(&self, pr: u64, review: &Review) -> Value;
 
     /// Posts `review` on PR `pr` with its verdict and returns where it landed; `None` when the
     /// forge took nothing (an approval it wouldn't accept, with no findings to fall back on).

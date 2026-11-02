@@ -9,7 +9,8 @@
 //!
 //! Every finding lens posts ends in a marker, `<!-- lens:finding key=<key> -->`, and the review
 //! body in `<!-- lens:review head=<sha> verdict=<event> -->`. The key is a hash of the file and the normalized
-//! title, so a later run can tell which findings it already posted.
+//! title, so a later run can tell which findings it already posted. Bitbucket shows HTML comments,
+//! so there the markers are link-reference lines it hides instead (see [`Markup`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -34,6 +35,41 @@ const REVIEW_MARKS: [&str; 2] = [REVIEW_MARK, "[//]: # (lens:review"];
 
 fn has_mark(body: &str, marks: &[&str]) -> bool {
     marks.iter().any(|m| body.contains(m))
+}
+
+/// How a forge renders what lens posts: its hidden markers, folded sections and file links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Markup {
+    /// HTML-comment markers, `<details>` folds, links into the PR's diff.
+    GitHub,
+    /// `[//]: # (lens:…)` markers on their own line, bold headings for folds (Bitbucket renders
+    /// no `<details>`), links to the file at the reviewed commit.
+    Bitbucket,
+}
+
+impl Markup {
+    fn finding_mark(self, key: &str) -> String {
+        match self {
+            Markup::GitHub => format!("{FINDING_MARK}{key} -->"),
+            Markup::Bitbucket => format!("{}{key})", FINDING_MARKS[1]),
+        }
+    }
+
+    fn review_mark(self, head: &str, event: &str) -> String {
+        match self {
+            Markup::GitHub => format!("{REVIEW_MARK} head={head} verdict={event} -->"),
+            Markup::Bitbucket => format!("{} head={head} verdict={event})", REVIEW_MARKS[1]),
+        }
+    }
+
+    fn fold(self, title: &str, text: &str) -> String {
+        match self {
+            Markup::GitHub => {
+                format!("<details><summary>{title}</summary>\n\n{text}\n\n</details>\n\n")
+            }
+            Markup::Bitbucket => format!("**{title}**\n\n{text}\n\n"),
+        }
+    }
 }
 
 /// The parts of a PR pass's report (`<state>/pr-<n>.json`) posting needs (the format is in docs/REVIEW.md).
@@ -331,6 +367,7 @@ pub fn plan(
     earlier: &Earlier,
     lines: &BTreeMap<String, BTreeSet<u32>>,
     mode: Comments,
+    markup: Markup,
 ) -> Plan {
     let mut inline = Vec::new();
     let mut in_body = Vec::new();
@@ -365,7 +402,7 @@ pub fn plan(
             comments.push(LineComment {
                 path: f.file.clone(),
                 line: f.line,
-                body: comment_body(f, &key),
+                body: comment_body(f, &key, markup),
             });
             inline.push(f.id.clone());
         } else {
@@ -385,8 +422,10 @@ pub fn plan(
     };
     let changed = earlier.verdict.as_deref() != Some(event);
     let review = (new || changed).then(|| {
-        // An approval with nothing new to raise says nothing: the marker alone renders empty.
-        let body = if new || event == "REQUEST_CHANGES" || !left_out.is_empty() {
+        // On GitHub an approval with nothing new to raise says nothing: the marker alone renders
+        // empty. Bitbucket's verdict carries no text, so its summary comment always says something.
+        let full = new || event == "REQUEST_CHANGES" || !left_out.is_empty();
+        let body = if full || markup == Markup::Bitbucket {
             review_body(
                 report,
                 &BodyParts {
@@ -394,11 +433,12 @@ pub fn plan(
                     skipped: skipped.len(),
                     left_out: left_out.len(),
                     mode,
+                    markup,
                 },
                 event,
             )
         } else {
-            review_mark(report, event)
+            markup.review_mark(&report.head, event)
         };
         Review {
             head: report.head.clone(),
@@ -425,13 +465,13 @@ fn by(f: &Finding) -> String {
     }
 }
 
-pub fn comment_body(f: &Finding, key: &str) -> String {
-    finding_text(f, key, None)
+pub fn comment_body(f: &Finding, key: &str, markup: Markup) -> String {
+    finding_text(f, key, None, markup)
 }
 
 /// A finding as lens posts it: severity and title, where it is when that isn't the comment's own
 /// line, the failure scenario, how it fails folded away, and its marker.
-fn finding_text(f: &Finding, key: &str, location: Option<&str>) -> String {
+fn finding_text(f: &Finding, key: &str, location: Option<&str>, markup: Markup) -> String {
     let mut s = format!("**{}** · {}{}\n\n", f.severity, f.title, by(f));
     if let Some(at) = location {
         s.push_str(&format!("{at}\n\n"));
@@ -442,17 +482,16 @@ fn finding_text(f: &Finding, key: &str, location: Option<&str>) -> String {
     }
     let how = f.how_it_fails.as_deref().unwrap_or("").trim();
     if !how.is_empty() {
-        s.push_str(&format!(
-            "<details><summary>How it fails</summary>\n\n{how}\n\n</details>\n\n"
-        ));
+        s.push_str(&markup.fold("How it fails", how));
     }
-    s.push_str(&format!("{FINDING_MARK}{key} -->"));
+    s.push_str(&markup.finding_mark(key));
     s
 }
 
-/// `file:line`, linked to the line in the PR's diff when the diff shows it, else to the file at
-/// the reviewed commit. Unlinked when the report doesn't name the PR's URL.
-fn location(report: &Report, f: &Finding, on_diff: bool) -> String {
+/// `file:line`, linked to the line in the PR's diff when the diff shows it and the forge links
+/// into diffs by line (GitHub), else to the file at the reviewed commit. Unlinked when the report
+/// doesn't name the PR's URL.
+fn location(report: &Report, f: &Finding, on_diff: bool, markup: Markup) -> String {
     let text = format!("`{}:{}`", f.file, f.line);
     let Some(pr) = report
         .pr
@@ -462,12 +501,23 @@ fn location(report: &Report, f: &Finding, on_diff: bool) -> String {
     else {
         return text;
     };
-    let url = if on_diff {
-        let anchor = hex(&Sha256::digest(f.file.as_bytes()));
-        Some(format!("{pr}/files#diff-{anchor}R{}", f.line))
-    } else {
-        pr.rfind("/pull/")
-            .map(|i| format!("{}/blob/{}/{}#L{}", &pr[..i], report.head, f.file, f.line))
+    let url = match markup {
+        Markup::GitHub if on_diff => {
+            let anchor = hex(&Sha256::digest(f.file.as_bytes()));
+            Some(format!("{pr}/files#diff-{anchor}R{}", f.line))
+        }
+        Markup::GitHub => pr
+            .rfind("/pull/")
+            .map(|i| format!("{}/blob/{}/{}#L{}", &pr[..i], report.head, f.file, f.line)),
+        Markup::Bitbucket => pr.rfind("/pull-requests/").map(|i| {
+            format!(
+                "{}/src/{}/{}#lines-{}",
+                &pr[..i],
+                report.head,
+                f.file,
+                f.line
+            )
+        }),
     };
     match url {
         Some(url) => format!("[{text}]({url})"),
@@ -498,6 +548,7 @@ pub struct BodyParts<'a> {
     /// Minor and nit findings, counted but not posted.
     pub left_out: usize,
     pub mode: Comments,
+    pub markup: Markup,
 }
 
 pub fn review_body(report: &Report, parts: &BodyParts, event: &str) -> String {
@@ -536,8 +587,8 @@ pub fn review_body(report: &Report, parts: &BodyParts, event: &str) -> String {
             Comments::Inline => "Findings on lines outside the diff:\n\n",
         });
         for b in parts.findings {
-            let at = location(report, b.finding, b.on_diff);
-            s.push_str(&finding_text(b.finding, &b.key, Some(&at)));
+            let at = location(report, b.finding, b.on_diff, parts.markup);
+            s.push_str(&finding_text(b.finding, &b.key, Some(&at), parts.markup));
             s.push_str("\n\n");
         }
     }
@@ -546,10 +597,7 @@ pub fn review_body(report: &Report, parts: &BodyParts, event: &str) -> String {
         .as_deref()
         .filter(|a| !a.trim().is_empty())
     {
-        s.push_str(&format!(
-            "<details><summary>Impact assessment</summary>\n\n{}\n\n</details>\n\n",
-            a.trim()
-        ));
+        s.push_str(&parts.markup.fold("Impact assessment", a.trim()));
     }
     let ran: Vec<&str> = report
         .profiles
@@ -579,12 +627,11 @@ pub fn review_body(report: &Report, parts: &BodyParts, event: &str) -> String {
             report.dropped.len()
         ));
     }
-    s.push_str(&format!("\n\n{}", review_mark(report, event)));
+    s.push_str(&format!(
+        "\n\n{}",
+        parts.markup.review_mark(&report.head, event)
+    ));
     s
-}
-
-fn review_mark(report: &Report, event: &str) -> String {
-    format!("{REVIEW_MARK} head={} verdict={event} -->", report.head)
 }
 
 #[cfg(test)]
@@ -595,6 +642,16 @@ mod tests {
     /// What GitHub is sent for a review.
     fn github(review: Review) -> Value {
         crate::forge::github_payload(&review)
+    }
+
+    /// [`super::plan`] for GitHub.
+    fn plan(
+        report: &Report,
+        earlier: &Earlier,
+        lines: &BTreeMap<String, BTreeSet<u32>>,
+        mode: Comments,
+    ) -> Plan {
+        super::plan(report, earlier, lines, mode, Markup::GitHub)
     }
 
     fn finding(id: &str, file: &str, line: u32, severity: &str, title: &str) -> Finding {
@@ -983,7 +1040,7 @@ diff --git a/gone.rs b/gone.rs
     #[test]
     fn blocker_comments_lead_with_severity_and_hide_the_trace() {
         let f = finding("F1", "a.rs", 1, "blocker", "breaks");
-        let b = comment_body(&f, "k");
+        let b = comment_body(&f, "k", Markup::GitHub);
         assert!(
             b.starts_with("**blocker** · breaks · _correctness_\n\nx happens"),
             "{b}"

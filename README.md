@@ -233,10 +233,19 @@ PR was read. Fetches use git's own credentials for origin (an SSH key or a crede
 the token. Bitbucket shows HTML comments, so lens's markers there are link-reference lines
 (`[//]: # (lens:finding key=…)`), which it reads alongside the HTML-comment form.
 
-Reading a Bitbucket PR (`lens pr view`, `lens pr earlier`, `lens pr post --dry-run`) works today;
-posting the review to Bitbucket is coming next, so until then `lens review --pr` there reviews but
-ends with "Posting failed". `LENS_BITBUCKET_API` points lens at another API base (default
-`https://api.bitbucket.org/2.0`), for tests.
+Bitbucket has no reviews, so lens posts one as a verdict and comments, in this order: it clears
+the opposite verdict it may have given before, approves or requests changes, comments on each
+inline finding's line (with `comments = "inline"`), and last posts the summary comment with every
+other finding, each `file:line` linked to the file at the reviewed commit
+(`…/src/<head>/<file>#lines-<n>`). The verdict goes first so lens never leaves comments without
+one: when Bitbucket refuses it, nothing is posted and lens says so. Bitbucket doesn't let a PR's
+author approve or request changes on it, so on your own PR post as a bot. Since a verdict carries
+no text, the summary comment says what the review found even when it only approves. A rerun with
+nothing new and the same verdict posts nothing; a changed verdict replaces the old one.
+`lens pr post --dry-run` prints the requests it would send, in order.
+
+`LENS_BITBUCKET_API` points lens at another API base (default `https://api.bitbucket.org/2.0`),
+for tests.
 
 ## License
 
