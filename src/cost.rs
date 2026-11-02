@@ -34,6 +34,10 @@ pub struct Entry {
     /// Present only when the report carries them.
     pub cache_creation: Option<u64>,
     pub cache_read: Option<u64>,
+    /// Which run it was: its start time, pass and reviewed commit (or the file, for an older
+    /// report without them). A run kept in `reports/` and also written as the latest report
+    /// counts once.
+    pub run: String,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -105,6 +109,7 @@ pub fn entry(repo: &str, report: &Value) -> Option<Entry> {
             "creation",
         ),
         cache_read: cache("cacheReadInputTokens", "cacheReadTokens", "read"),
+        run: String::new(),
     })
 }
 
@@ -114,7 +119,17 @@ pub fn entry(repo: &str, report: &Value) -> Option<Entry> {
 pub fn collect(root: &Path, cutoff: Option<&str>, with_prev: bool) -> Vec<Entry> {
     let mut out = Vec::new();
     walk(root, None, cutoff, with_prev, &mut out);
-    out
+    once_per_run(out)
+}
+
+/// Drops the copies of a run already counted: the latest report and its copy in `reports/`
+/// are one run.
+fn once_per_run(entries: Vec<Entry>) -> Vec<Entry> {
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .into_iter()
+        .filter(|e| seen.insert((e.repo.clone(), e.run.clone())))
+        .collect()
 }
 
 /// Every report in the state folders under `state_root`, one `<repo>-<hash>` folder per repo.
@@ -137,7 +152,7 @@ pub fn collect_states(state_root: &Path, cutoff: Option<&str>, with_prev: bool) 
         };
         walk(dir, Some(repo), cutoff, with_prev, &mut out);
     }
-    out
+    once_per_run(out)
 }
 
 fn walk(
@@ -174,8 +189,17 @@ fn walk(
             else {
                 continue;
             };
-            let Some(e) = entry(repo, &report) else {
+            let Some(mut e) = entry(repo, &report) else {
                 continue;
+            };
+            e.run = match report["head"].as_str().filter(|h| !h.is_empty()) {
+                Some(head) => format!(
+                    "{}|{}|{head}",
+                    report["startedAt"].as_str().unwrap_or(""),
+                    report["pass"].as_str().unwrap_or("")
+                ),
+                // An older report without its commit: count each file.
+                None => path.display().to_string(),
             };
             let started = report["startedAt"].as_str().unwrap_or(&e.day);
             if cutoff.is_none_or(|c| started >= c) {
@@ -273,6 +297,26 @@ mod tests {
         let p = root.join(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, v.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_kept_copy_of_the_latest_report_counts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = |at: &str| json!({"costUsd": 1.0, "pass": "pr", "head": "abc", "startedAt": at});
+        write(dir.path(), "a/.review/pr-7.json", r("2026-11-02T20:00:00Z"));
+        write(
+            dir.path(),
+            "a/.review/pr-7/reports/1.json",
+            r("2026-11-02T20:00:00Z"),
+        );
+        write(
+            dir.path(),
+            "a/.review/pr-7/reports/0.json",
+            r("2026-11-02T19:00:00Z"),
+        );
+        let e = collect(dir.path(), None, false);
+        assert_eq!(e.len(), 2);
+        assert_eq!(group(&e, |e| &e.repo)["a"].cost, 2.0);
     }
 
     #[test]

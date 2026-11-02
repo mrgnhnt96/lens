@@ -90,6 +90,7 @@ Each agent's reply is saved in `<state>/<branch>/agents/`, and the report record
 small_lines = 40                            # at most this many changed lines: correctness only
 parallel = 4                                # agents running at once
 timeout_mins = 20                           # per agent
+keep_reports = true                         # keep every run's report in reports/; false: latest only
 ```
 
 **The floor.** Deep review runs elsewhere (the board's pre-PR review), so each PR keeps only a cheap check:
@@ -143,8 +144,9 @@ What reviews spent. lens's `claude -p` agents never show in session transcripts,
 the reports in lens's state folders and any an older lens left under `<root>/**/.review/`
 (default `~/Development`): `costUsd`, agents and findings
 per repo and per day, plus cache creation/read tokens when the reports carry them. `--since`
-takes a span (`1d`) or a date (`2026-10-19`). Archived earlier passes (`prev/`) are left out
-unless you pass `--with-prev`.
+takes a span (`1d`) or a date (`2026-10-19`). Each run counts once, whether it's the latest
+report or a copy kept in `reports/`. Archived earlier passes (`prev/`) are left out unless you
+pass `--with-prev`.
 
 ## Usage log
 

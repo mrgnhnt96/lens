@@ -12,7 +12,10 @@ so a review writes nothing to the checkout:
 The pass's inputs sit beside the report in `<state>/<branch>/`: `diff.patch`, `map.json`,
 `profiles.json`, `task.json`, `intent.md`; `agents/` holds the shared system prompt
 (`change-<hash>.system.md`) and each agent's reply, and `prev/` the report this
-one replaced.
+one replaced. `reports/` keeps a copy of every report a pass wrote, named
+`<startedAt>-<head>.json` (e.g. `20261102T204105Z-3cd14fc.json`), so earlier runs stay readable;
+`[review] keep_reports = false` turns that off. A PR pass works the same way in `<state>/pr-<n>/`,
+its latest report in `<state>/pr-<n>.json`.
 
 ```json
 {
