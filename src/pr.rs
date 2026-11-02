@@ -153,6 +153,8 @@ pub struct Earlier {
     pub reviews: usize,
     /// The verdict the latest lens review gave, `APPROVE` or `REQUEST_CHANGES`, from its marker.
     pub verdict: Option<String>,
+    /// The commit the latest lens review was for, from its marker.
+    pub head: Option<String>,
     pub findings: Vec<Posted>,
 }
 
@@ -203,6 +205,7 @@ pub fn earlier_from(comments: &[Value], reviews: &[Value]) -> Earlier {
         }
         out.reviews += 1;
         out.verdict = verdict_in(body);
+        out.head = head_in(body);
         for key in keys_in(body) {
             out.findings.push(Posted {
                 key,
@@ -224,6 +227,14 @@ fn verdict_in(body: &str) -> Option<String> {
         .take_while(|c| c.is_ascii_uppercase() || *c == '_')
         .collect();
     (!v.is_empty()).then_some(v)
+}
+
+fn head_in(body: &str) -> Option<String> {
+    let at = REVIEW_MARKS.iter().filter_map(|m| body.rfind(m)).max()?;
+    let mark = &body[at..];
+    let rest = &mark[mark.find(" head=")? + " head=".len()..];
+    let h: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+    (!h.is_empty()).then_some(h)
 }
 
 fn keys_in(body: &str) -> Vec<String> {
@@ -689,6 +700,7 @@ diff --git a/gone.rs b/gone.rs
         let e = earlier_from(&comments, &reviews);
         assert_eq!(e.reviews, 1);
         assert_eq!(e.verdict.as_deref(), Some("APPROVE"));
+        assert_eq!(e.head.as_deref(), Some("1"));
         let keys: Vec<&str> = e.findings.iter().map(|p| p.key.as_str()).collect();
         assert_eq!(keys, vec!["aaaa", "bbbb", "cccc"]);
     }
@@ -810,6 +822,7 @@ diff --git a/gone.rs b/gone.rs
         let earlier = Earlier {
             reviews: 1,
             verdict: Some("REQUEST_CHANGES".into()),
+            head: None,
             findings: vec![
                 Posted {
                     key: key("src/a.rs", "BREAKS"),
@@ -932,6 +945,7 @@ diff --git a/gone.rs b/gone.rs
         let earlier = Earlier {
             reviews: 1,
             verdict: Some("REQUEST_CHANGES".into()),
+            head: None,
             findings: vec![],
         };
         let review = plan(
@@ -951,6 +965,7 @@ diff --git a/gone.rs b/gone.rs
         let earlier = Earlier {
             reviews: 1,
             verdict: Some("APPROVE".into()),
+            head: None,
             findings: vec![],
         };
         assert!(plan(
@@ -965,6 +980,7 @@ diff --git a/gone.rs b/gone.rs
         let earlier = Earlier {
             reviews: 1,
             verdict: Some("REQUEST_CHANGES".into()),
+            head: None,
             findings: vec![Posted {
                 key: key("src/a.rs", "breaks"),
                 path: Some("src/a.rs".into()),

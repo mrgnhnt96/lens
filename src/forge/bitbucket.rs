@@ -888,6 +888,7 @@ diff --git a/src/a.rs b/src/a.rs
         let earlier = Earlier {
             reviews: 1,
             verdict: Some("REQUEST_CHANGES".into()),
+            head: None,
             findings: vec![],
         };
         let review = review_of(&report(vec![]), &earlier, Comments::Single).unwrap();

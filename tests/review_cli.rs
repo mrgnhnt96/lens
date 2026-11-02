@@ -630,6 +630,9 @@ if args[:2] == ["pr", "view"]:
 elif args[0] == "api" and "POST" in args:
     open(os.path.join(fake, "posted.json"), "w").write(sys.stdin.read())
     print(json.dumps({"html_url": "https://github.test/pr/7#review-1"}))
+elif args[0] == "api" and args[-1].endswith("/reviews") and os.path.exists(os.path.join(fake, "posted.json")):
+    review = json.load(open(os.path.join(fake, "posted.json")))
+    print(json.dumps([{"body": review["body"], "html_url": "https://github.test/pr/7#review-1"}]))
 elif args[0] == "api":
     print("[]")
 else:
@@ -733,6 +736,79 @@ fn a_pr_whose_head_is_unchanged_reuses_its_last_review() {
         .unwrap()
         .count();
     assert_eq!(kept, 2);
+}
+
+#[test]
+fn a_rereview_reviews_only_what_changed_since_the_last_posted_review() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    let first = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(first["mode"], "full");
+    fx.calls();
+
+    // A new commit on the PR.
+    write(
+        &d,
+        "src/a.rs",
+        &(fs::read_to_string(d.join("src/a.rs")).unwrap() + "// a fix\n"),
+    );
+    git(&d, &["commit", "-qam", "fix"]);
+    git(
+        &d,
+        &["push", "-q", "-f", "origin", "feature:refs/pull/7/head"],
+    );
+    let head = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&d)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let mut pr: Value = read_json(&fake.join("pr.json"));
+    pr["headRefOid"] = json!(head.trim());
+    fs::write(fake.join("pr.json"), pr.to_string()).unwrap();
+
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "delta");
+    assert_eq!(report["delta"]["from"], first["head"]);
+    assert_eq!(report["delta"]["changedLines"], 1);
+    let calls = fx.calls();
+    let system = calls[0]["system"].as_str().unwrap();
+    assert!(
+        system.contains("What changed since the last review"),
+        "{system}"
+    );
+    assert!(system.contains("+// a fix"), "{system}");
+    assert!(!system.contains("Changed code no test names"), "{system}");
+    // The first review's blockers and majors are verified again at the new head.
+    let carried = calls
+        .iter()
+        .filter(|c| {
+            c["prompt"]
+                .as_str()
+                .unwrap_or("")
+                .contains("an earlier review raised it")
+        })
+        .count();
+    let serious = first["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["severity"] == "blocker" || f["severity"] == "major")
+        .count();
+    assert!(serious > 0 && carried >= 1, "{carried} of {serious}");
+
+    // --full reviews the whole change again.
+    fx.review_with(&[], &["--pr", "7", "--dry-run", "--full"], &env);
+    assert_eq!(read_json(&fx.state().join("pr-7.json"))["mode"], "full");
 }
 
 #[test]
