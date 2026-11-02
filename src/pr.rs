@@ -1,5 +1,6 @@
-//! The PR pass's GitHub side: reading the comments earlier lens runs left on a PR, and posting a
-//! review's verified blocker and major findings as one review. `[pr] comments` picks where they
+//! What the PR pass posts, whatever the forge: reading the markers earlier lens runs left on a
+//! PR, and planning one review of the verified blocker and major findings. Reading and posting
+//! go through [`crate::forge`]. `[pr] comments` picks where they
 //! go: all in the review's post (`single`, the default) or inline on the lines the diff shows.
 //! Minor and nit findings are never posted; the review says how many it left out.
 //!
@@ -11,17 +12,13 @@
 //! title, so a later run can tell which findings it already posted.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
-use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use sha2::{Digest, Sha256};
 
-use crate::config::{Comments, PostAs, PrConfig};
+use crate::config::Comments;
 
 /// A finding within this many lines of an earlier lens comment on the same file counts as the
 /// same finding.
@@ -122,144 +119,31 @@ pub struct Earlier {
     pub findings: Vec<Posted>,
 }
 
-/// `gh`, or `$LENS_GH`, run in the repo with the identity `.lens.toml` picks.
-pub struct Gh {
-    program: PathBuf,
-    repo: PathBuf,
-    token: Option<String>,
+/// What a run posts on a PR, whatever the forge: a verdict with a body, and comments on lines
+/// the diff shows. Each forge sends it its own way.
+#[derive(Debug, Clone)]
+pub struct Review {
+    /// The commit the review is for.
+    pub head: String,
+    /// `REQUEST_CHANGES` while a blocker or major is unfixed, else `APPROVE`.
+    pub event: &'static str,
+    pub body: String,
+    pub comments: Vec<LineComment>,
 }
 
-impl Gh {
-    pub fn new(repo: &Path, config: &PrConfig) -> Result<Gh> {
-        let token = match config.post_as {
-            PostAs::Owner => None,
-            PostAs::Bot => {
-                let var = config.bot_token_env();
-                match std::env::var(var) {
-                    Ok(t) if !t.is_empty() => Some(t),
-                    _ => bail!(
-                        ".lens.toml posts as a bot, but ${var} holds no token; set it or use post_as = \"owner\""
-                    ),
-                }
-            }
-        };
-        Ok(Gh {
-            program: std::env::var_os("LENS_GH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| "gh".into()),
-            repo: repo.to_path_buf(),
-            token,
-        })
+impl Review {
+    /// Whether it raises anything: comments, or a finding in its body.
+    pub fn raises_findings(&self) -> bool {
+        !self.comments.is_empty() || self.body.contains(FINDING_MARK)
     }
+}
 
-    fn api(&self, args: &[&str], stdin: Option<&str>) -> Result<String> {
-        self.run(&[&["api"], args].concat(), stdin)
-    }
-
-    fn run(&self, args: &[&str], stdin: Option<&str>) -> Result<String> {
-        let mut cmd = Command::new(&self.program);
-        cmd.args(args)
-            .current_dir(&self.repo)
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(token) = &self.token {
-            cmd.env("GH_TOKEN", token);
-        }
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("running {}", self.program.display()))?;
-        if let Some(input) = stdin {
-            child
-                .stdin
-                .take()
-                .expect("piped stdin")
-                .write_all(input.as_bytes())?;
-        }
-        let out = child.wait_with_output()?;
-        if !out.status.success() {
-            bail!(
-                "gh {}: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        String::from_utf8(out.stdout).context("gh printed non-UTF-8")
-    }
-
-    /// Opens a PR from `head` into `base` and returns its URL.
-    pub fn create_pr(&self, base: &str, head: &str, title: &str, body: &Path) -> Result<String> {
-        let body = body.display().to_string();
-        let out = self.run(
-            &[
-                "pr",
-                "create",
-                "--base",
-                base,
-                "--head",
-                head,
-                "--title",
-                title,
-                "--body-file",
-                &body,
-            ],
-            None,
-        )?;
-        Ok(out.trim().lines().last().unwrap_or("").to_string())
-    }
-
-    /// Every page of a list endpoint.
-    fn list(&self, endpoint: &str) -> Result<Vec<Value>> {
-        let text = self.api(&["--paginate", endpoint], None)?;
-        // --paginate prints one JSON array per page, back to back.
-        let mut all = Vec::new();
-        for page in serde_json::Deserializer::from_str(&text).into_iter::<Vec<Value>>() {
-            all.extend(page.with_context(|| format!("parsing gh api {endpoint}"))?);
-        }
-        Ok(all)
-    }
-
-    /// The findings earlier lens runs posted on PR `pr`, inline or in a review body.
-    pub fn earlier(&self, pr: u64) -> Result<Earlier> {
-        let comments = self.list(&format!("repos/{{owner}}/{{repo}}/pulls/{pr}/comments"))?;
-        let reviews = self.list(&format!("repos/{{owner}}/{{repo}}/pulls/{pr}/reviews"))?;
-        Ok(earlier_from(&comments, &reviews))
-    }
-
-    /// Posts `review` (from [`plan`]) on PR `pr` and returns the review's URL.
-    ///
-    /// GitHub won't let anyone approve or request changes on their own PR, so posting as its
-    /// author falls back to a plain review: the findings still land, and an approval with none
-    /// posts nothing.
-    pub fn post(&self, pr: u64, review: &Value) -> Result<Option<String>> {
-        let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{pr}/reviews");
-        let send = |review: &Value| {
-            self.api(
-                &["--method", "POST", &endpoint, "--input", "-"],
-                Some(&review.to_string()),
-            )
-        };
-        let out = match send(review) {
-            Err(e) if format!("{e:#}").contains("your own pull request") => {
-                if review["event"] == "APPROVE"
-                    && review["comments"].as_array().is_none_or(Vec::is_empty)
-                    && !review["body"].as_str().unwrap_or("").contains(FINDING_MARK)
-                {
-                    return Ok(None);
-                }
-                let mut plain = review.clone();
-                plain["event"] = "COMMENT".into();
-                send(&plain)?
-            }
-            out => out?,
-        };
-        let v: Value = serde_json::from_str(&out).context("parsing the posted review")?;
-        Ok(v["html_url"].as_str().map(str::to_string))
-    }
+/// A comment on a line of the PR's new side.
+#[derive(Debug, Clone)]
+pub struct LineComment {
+    pub path: String,
+    pub line: u32,
+    pub body: String,
 }
 
 pub fn earlier_from(comments: &[Value], reviews: &[Value]) -> Earlier {
@@ -402,7 +286,8 @@ pub struct Plan {
     pub event: &'static str,
     /// The review to post; `None` when there's nothing new to raise and an earlier lens review
     /// already gave this verdict.
-    pub review: Option<Value>,
+    #[serde(skip)]
+    pub review: Option<Review>,
 }
 
 fn already_posted(f: &Finding, key: &str, earlier: &[Posted]) -> Option<String> {
@@ -460,12 +345,11 @@ pub fn plan(
         seen.push(key.clone());
         let on_diff = lines.get(&f.file).is_some_and(|ls| ls.contains(&f.line));
         if on_diff && mode == Comments::Inline {
-            comments.push(json!({
-                "path": f.file,
-                "line": f.line,
-                "side": "RIGHT",
-                "body": comment_body(f, &key),
-            }));
+            comments.push(LineComment {
+                path: f.file.clone(),
+                line: f.line,
+                body: comment_body(f, &key),
+            });
             inline.push(f.id.clone());
         } else {
             body_findings.push(InBody {
@@ -499,12 +383,12 @@ pub fn plan(
         } else {
             review_mark(report, event)
         };
-        json!({
-            "commit_id": report.head,
-            "event": event,
-            "body": body,
-            "comments": comments,
-        })
+        Review {
+            head: report.head.clone(),
+            event,
+            body,
+            comments,
+        }
     });
     Plan {
         inline,
@@ -689,6 +573,12 @@ fn review_mark(report: &Report, event: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// What GitHub is sent for a review.
+    fn github(review: Review) -> Value {
+        crate::forge::github_payload(&review)
+    }
 
     fn finding(id: &str, file: &str, line: u32, severity: &str, title: &str) -> Finding {
         Finding {
@@ -803,7 +693,7 @@ diff --git a/gone.rs b/gone.rs
         assert!(p.inline.is_empty());
         assert_eq!(p.in_body, vec!["F1", "F2"]);
         assert_eq!(p.left_out, vec!["F3", "F4"]);
-        let review = p.review.unwrap();
+        let review = p.review.map(github).unwrap();
         assert_eq!(review["commit_id"], "abcdef1234");
         assert_eq!(review["event"], "REQUEST_CHANGES");
         assert!(review["comments"].as_array().unwrap().is_empty());
@@ -843,7 +733,7 @@ diff --git a/gone.rs b/gone.rs
         assert_eq!(p.inline, vec!["F1"]);
         assert_eq!(p.in_body, vec!["F2"]);
         assert_eq!(p.left_out, vec!["F3", "F4"]);
-        let review = p.review.unwrap();
+        let review = p.review.map(github).unwrap();
         assert_eq!(review["event"], "REQUEST_CHANGES");
         let comments = review["comments"].as_array().unwrap();
         assert_eq!(comments.len(), 1);
@@ -869,7 +759,10 @@ diff --git a/gone.rs b/gone.rs
             &commentable(PATCH),
             Comments::Single,
         );
-        let body = p.review.unwrap()["body"].as_str().unwrap().to_string();
+        let body = p.review.map(github).unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(body.contains("\n\n`src/a.rs:2`\n\n"), "{body}");
         assert!(!body.contains("]("), "{body}");
     }
@@ -928,6 +821,7 @@ diff --git a/gone.rs b/gone.rs
                 let lines = commentable(PATCH);
                 let review = plan(&sample(), &Earlier::default(), &lines, first)
                     .review
+                    .map(github)
                     .unwrap();
                 let earlier = as_posted(&review);
                 assert_eq!(earlier.verdict.as_deref(), Some("REQUEST_CHANGES"));
@@ -950,7 +844,7 @@ diff --git a/gone.rs b/gone.rs
             assert_eq!(p.event, "APPROVE");
             assert!(p.inline.is_empty() && p.in_body.is_empty());
             assert_eq!(p.left_out, vec!["F1", "F2"]);
-            let review = p.review.unwrap();
+            let review = p.review.map(github).unwrap();
             assert!(review["comments"].as_array().unwrap().is_empty());
             let body = review["body"].as_str().unwrap();
             assert!(
@@ -991,6 +885,7 @@ diff --git a/gone.rs b/gone.rs
             Comments::Single,
         )
         .review
+        .map(github)
         .unwrap();
         assert_eq!(review["event"], "APPROVE");
         assert_eq!(
@@ -1014,6 +909,7 @@ diff --git a/gone.rs b/gone.rs
             Comments::Single,
         )
         .review
+        .map(github)
         .unwrap();
         assert_eq!(review["event"], "APPROVE");
     }

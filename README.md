@@ -172,10 +172,13 @@ Reads the two logs back:
   since other sessions' usage is in the rise too. The tightest stretch gives the floor, and from it
   the least lens work the rest of the window holds if nothing else ran.
 
-## `lens pr earlier --pr <n>` and `lens pr post --pr <n> --report <file> --diff <patch>`
+## `lens pr view`, `lens pr earlier` and `lens pr post`
 
-The PR pass's GitHub side, through `gh`. `earlier` lists the lens findings already posted on the
-PR, in the review's post or inline. `post` posts a report as one review at the reviewed commit.
+The PR pass's forge side: GitHub today, through `gh`. `lens pr view --pr <n>` prints the PR's
+metadata as JSON (number, url, title, body, base and head branch, head commit) and fetches its head
+to `refs/lens/pr/<n>`; `--out <dir>` also writes `pr.json` and `intent.md` there, and each
+`--field <name>` prints just that value on its own line. `lens pr earlier --pr <n>` lists the lens findings already posted on the
+PR, in the review's post or inline. `lens pr post --pr <n> --report <file> --diff <patch>` posts a report as one review at the reviewed commit.
 Only blocker and major findings are posted: minor and nit findings never are, and never block; the
 review says how many it left out. By default every new finding goes in the review's post, each
 with its severity, title, `file:line` linked to that line in the PR's diff, and failure scenario;
@@ -195,7 +198,12 @@ sample = 0.5                      # the share of PRs reviewed, 0 to 1 (default 1
 comments = "inline"               # "single" (default): every finding in the review's one post
 post_as = "bot"                   # "owner" (default): whoever `gh` is logged in as
 bot_token_env = "LENS_BOT_TOKEN"  # the env var holding the bot's token (this is the default)
+forge = "github"                  # where the PRs live: "github" or "bitbucket"
 ```
+
+`forge` unset, lens tells from origin's URL: `bitbucket.org` is Bitbucket, anything else (or no
+origin) GitHub. Bitbucket isn't supported yet, so a Bitbucket repo fails until lens can review
+there; set `forge = "github"` for a repo whose origin only looks like Bitbucket.
 
 `sample` picks PRs by a hash of the PR number, so a rerun on the same PR makes the same choice. A
 PR outside the sample runs nothing and prints so; `sample = 0.5` reviews about half.

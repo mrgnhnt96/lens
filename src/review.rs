@@ -30,6 +30,7 @@ use crate::agent::{self, Access, Full, Gate, Outcome, Runner, Spec};
 use crate::backoff;
 use crate::config::{self, Config};
 use crate::diff::git;
+use crate::forge;
 use crate::pr;
 use crate::reply;
 use crate::usage;
@@ -1724,12 +1725,12 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
     let mut summary = summarize(&report, &pass.report_path, false);
     let cfg = config::load(&pass.root)?.pr;
     let posted = (|| -> Result<String> {
-        let gh = pr::Gh::new(&pass.root, &cfg)?;
+        let forge = forge::open(&pass.root, &cfg)?;
         let parsed: pr::Report = serde_json::from_value(report.clone())?;
         let patch = fs::read_to_string(pass.work.join("diff.patch"))?;
         let plan = pr::plan(
             &parsed,
-            &gh.earlier(number)?,
+            &forge.earlier(number)?,
             &pr::commentable(&patch),
             cfg.comments,
         );
@@ -1738,7 +1739,7 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
             n => format!("; {n} minor/nit left out"),
         };
         let url = match (&plan.review, pass.opts.dry_run) {
-            (Some(review), false) => gh.post(number, review)?,
+            (Some(review), false) => forge.post(number, review)?,
             _ => None,
         };
         let verdict = if plan.event == "APPROVE" {

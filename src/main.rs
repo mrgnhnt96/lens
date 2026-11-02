@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
+use serde_json::Value;
 
-use lens::{config, cost, diff, map, pr, profile, review, select, usage};
+use lens::{config, cost, diff, forge, map, pr, profile, review, select, usage};
 
 /// Agent code review for Claude Code.
 #[derive(Parser)]
@@ -91,7 +92,8 @@ enum Command {
         #[arg(long)]
         since: Option<String>,
     },
-    /// The PR pass's GitHub side, through `gh` (posting as .lens.toml's `[pr] post_as`).
+    /// The PR pass's forge side: GitHub through `gh`, picked by `[pr] forge` or origin's URL
+    /// (posting as .lens.toml's `[pr] post_as`).
     Pr {
         #[command(subcommand)]
         command: PrCommand,
@@ -100,6 +102,23 @@ enum Command {
 
 #[derive(Subcommand)]
 enum PrCommand {
+    /// Fetch a PR's base branch to origin/<base> and its head to refs/lens/pr/<n>, and print its
+    /// metadata as JSON (number, url, title, body, baseRefName, headRefName, headRefOid).
+    View {
+        /// The PR number.
+        #[arg(long)]
+        pr: u64,
+        /// The repo the PR belongs to. Defaults to the current directory.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Also write the metadata to <dir>/pr.json and the PR's title and description to
+        /// <dir>/intent.md.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Print just these fields' values, one a line, instead of the JSON.
+        #[arg(long)]
+        field: Vec<String>,
+    },
     /// Print the findings earlier lens runs posted on a PR, as JSON.
     Earlier {
         /// The PR number.
@@ -226,9 +245,37 @@ fn main() -> Result<()> {
 
 fn run_pr(command: PrCommand) -> Result<()> {
     match command {
+        PrCommand::View {
+            pr,
+            repo,
+            out,
+            field,
+        } => {
+            let forge = forge::open(&repo, &config::load(&repo)?.pr)?;
+            let view = forge.view(pr)?;
+            forge.fetch(&view)?;
+            let json = serde_json::to_value(&view)?;
+            let pretty = serde_json::to_string_pretty(&json)?;
+            if let Some(dir) = out {
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("creating {}", dir.display()))?;
+                std::fs::write(dir.join("pr.json"), format!("{pretty}\n"))?;
+                std::fs::write(dir.join("intent.md"), view.intent())?;
+            }
+            if field.is_empty() {
+                println!("{pretty}");
+            }
+            for name in field {
+                match &json[&name] {
+                    Value::String(s) => println!("{s}"),
+                    Value::Null => anyhow::bail!("a PR has no field {name}"),
+                    v => println!("{v}"),
+                }
+            }
+        }
         PrCommand::Earlier { pr, repo } => {
-            let gh = pr::Gh::new(&repo, &config::load(&repo)?.pr)?;
-            println!("{}", serde_json::to_string_pretty(&gh.earlier(pr)?)?);
+            let forge = forge::open(&repo, &config::load(&repo)?.pr)?;
+            println!("{}", serde_json::to_string_pretty(&forge.earlier(pr)?)?);
         }
         PrCommand::Post {
             pr: number,
@@ -238,7 +285,7 @@ fn run_pr(command: PrCommand) -> Result<()> {
             dry_run,
         } => {
             let cfg = config::load(&repo)?.pr;
-            let gh = pr::Gh::new(&repo, &cfg)?;
+            let forge = forge::open(&repo, &cfg)?;
             let text = std::fs::read_to_string(&report)
                 .with_context(|| format!("reading {}", report.display()))?;
             let report: pr::Report = serde_json::from_str(&text)
@@ -247,12 +294,12 @@ fn run_pr(command: PrCommand) -> Result<()> {
                 .with_context(|| format!("reading {}", diff.display()))?;
             let plan = pr::plan(
                 &report,
-                &gh.earlier(number)?,
+                &forge.earlier(number)?,
                 &pr::commentable(&patch),
                 cfg.comments,
             );
             let url = match (&plan.review, dry_run) {
-                (Some(review), false) => gh.post(number, review)?,
+                (Some(review), false) => forge.post(number, review)?,
                 _ => None,
             };
             let out = serde_json::json!({
@@ -267,7 +314,7 @@ fn run_pr(command: PrCommand) -> Result<()> {
                 "inBody": plan.in_body,
                 "skipped": plan.skipped,
                 "leftOut": plan.left_out,
-                "payload": if dry_run { plan.review } else { None },
+                "payload": plan.review.as_ref().filter(|_| dry_run).map(|r| forge.payload(r)),
             });
             println!("{}", serde_json::to_string_pretty(&out)?);
         }

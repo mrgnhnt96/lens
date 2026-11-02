@@ -257,3 +257,33 @@ fn a_clean_review_of_the_posters_own_pr_posts_nothing() {
     assert_eq!(out["event"], "APPROVE");
     assert!(!dir.path().join("posted.json").exists());
 }
+
+#[test]
+fn a_bitbucket_origin_is_refused_until_lens_supports_it() {
+    let dir = tempfile::tempdir().unwrap();
+    setup(dir.path(), json!([]));
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "--quiet"]);
+    git(&["remote", "add", "origin", "git@bitbucket.org:team/repo.git"]);
+
+    let out = lens(dir.path(), &["pr", "earlier", "--pr", "7"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Bitbucket"));
+
+    fs::write(dir.path().join(".lens.toml"), "[pr]\nforge = \"github\"\n").unwrap();
+    let out = lens(dir.path(), &["pr", "earlier", "--pr", "7"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
