@@ -174,9 +174,9 @@ Reads the two logs back:
 
 ## `lens pr view`, `lens pr earlier` and `lens pr post`
 
-The PR pass's forge side: GitHub today, through `gh`. `lens pr view --pr <n>` prints the PR's
-metadata as JSON (number, url, title, body, base and head branch, head commit) and fetches its head
-to `refs/lens/pr/<n>`; `--out <dir>` also writes `pr.json` and `intent.md` there, and each
+The PR pass's forge side: GitHub through `gh`, or Bitbucket Cloud through its API (see
+[Bitbucket](#bitbucket)). `lens pr view --pr <n>` prints the PR's metadata as JSON (number, url,
+title, body, base and head branch, head commit) and fetches its head to `refs/lens/pr/<n>`; `--out <dir>` also writes `pr.json` and `intent.md` there, and each
 `--field <name>` prints just that value on its own line. `lens pr earlier --pr <n>` lists the lens findings already posted on the
 PR, in the review's post or inline. `lens pr post --pr <n> --report <file> --diff <patch>` posts a report as one review at the reviewed commit.
 Only blocker and major findings are posted: minor and nit findings never are, and never block; the
@@ -202,13 +202,41 @@ forge = "github"                  # where the PRs live: "github" or "bitbucket"
 ```
 
 `forge` unset, lens tells from origin's URL: `bitbucket.org` is Bitbucket, anything else (or no
-origin) GitHub. Bitbucket isn't supported yet, so a Bitbucket repo fails until lens can review
-there; set `forge = "github"` for a repo whose origin only looks like Bitbucket.
+origin) GitHub; set `forge = "github"` for a repo whose origin only looks like Bitbucket.
 
 `sample` picks PRs by a hash of the PR number, so a rerun on the same PR makes the same choice. A
 PR outside the sample runs nothing and prints so; `sample = 0.5` reviews about half.
 
 With `post_as = "bot"`, `lens pr` fails rather than post as the owner when the variable is unset.
+
+### Bitbucket
+
+lens talks to Bitbucket Cloud (`bitbucket.org`) through its REST API; Bitbucket Data Center isn't
+supported. The workspace and repo come from origin's URL (`git@bitbucket.org:<workspace>/<repo>.git`
+or `https://bitbucket.org/<workspace>/<repo>.git`).
+
+- **As you** (`post_as = "owner"`, the default): make an Atlassian API token at
+  [id.atlassian.com](https://id.atlassian.com/manage-profile/security/api-tokens) (Security, API
+  tokens, "Create API token with scopes", app Bitbucket) with `read:repository:bitbucket`,
+  `read:pullrequest:bitbucket` and `write:pullrequest:bitbucket`, then set
+  `LENS_BITBUCKET_EMAIL` to your Atlassian email and `LENS_BITBUCKET_TOKEN` to the token. App
+  passwords are gone from Bitbucket and don't work.
+- **As a bot** (`post_as = "bot"`): make a repository access token (Repository settings, Access
+  tokens) with `pullrequest:write`, and put it in the variable `bot_token_env` names
+  (`LENS_BOT_TOKEN` by default). Its reviews show under the token's own name. Bitbucket may not
+  count a bot's approval towards a branch's merge checks.
+
+Bitbucket has no pull refs, so `lens pr view` fetches the PR's source branch to
+`refs/lens/pr/<n>`, from the fork when the PR comes from one (`headRepo` in the JSON names it;
+its URL is origin's with the fork's `workspace/repo`), and stops if the branch has moved since the
+PR was read. Fetches use git's own credentials for origin (an SSH key or a credential helper), not
+the token. Bitbucket shows HTML comments, so lens's markers there are link-reference lines
+(`[//]: # (lens:finding key=…)`), which it reads alongside the HTML-comment form.
+
+Reading a Bitbucket PR (`lens pr view`, `lens pr earlier`, `lens pr post --dry-run`) works today;
+posting the review to Bitbucket is coming next, so until then `lens review --pr` there reviews but
+ends with "Posting failed". `LENS_BITBUCKET_API` points lens at another API base (default
+`https://api.bitbucket.org/2.0`), for tests.
 
 ## License
 

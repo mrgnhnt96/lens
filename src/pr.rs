@@ -27,6 +27,15 @@ pub const NEAR_LINES: u32 = 3;
 const FINDING_MARK: &str = "<!-- lens:finding key=";
 const REVIEW_MARK: &str = "<!-- lens:review";
 
+/// Every form a marker is read in: the HTML comment GitHub hides, and the link-reference line
+/// (`[//]: # (lens:…)`) Bitbucket hides, since it shows HTML comments.
+const FINDING_MARKS: [&str; 2] = [FINDING_MARK, "[//]: # (lens:finding key="];
+const REVIEW_MARKS: [&str; 2] = [REVIEW_MARK, "[//]: # (lens:review"];
+
+fn has_mark(body: &str, marks: &[&str]) -> bool {
+    marks.iter().any(|m| body.contains(m))
+}
+
 /// The parts of a PR pass's report (`<state>/pr-<n>.json`) posting needs (the format is in docs/REVIEW.md).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,7 +143,7 @@ pub struct Review {
 impl Review {
     /// Whether it raises anything: comments, or a finding in its body.
     pub fn raises_findings(&self) -> bool {
-        !self.comments.is_empty() || self.body.contains(FINDING_MARK)
+        !self.comments.is_empty() || has_mark(&self.body, &FINDING_MARKS)
     }
 }
 
@@ -161,7 +170,7 @@ pub fn earlier_from(comments: &[Value], reviews: &[Value]) -> Earlier {
     }
     for r in reviews {
         let body = r["body"].as_str().unwrap_or("");
-        if !body.contains(REVIEW_MARK) {
+        if !has_mark(body, &REVIEW_MARKS) {
             continue;
         }
         out.reviews += 1;
@@ -179,7 +188,8 @@ pub fn earlier_from(comments: &[Value], reviews: &[Value]) -> Earlier {
 }
 
 fn verdict_in(body: &str) -> Option<String> {
-    let mark = &body[body.rfind(REVIEW_MARK)?..];
+    let at = REVIEW_MARKS.iter().filter_map(|m| body.rfind(m)).max()?;
+    let mark = &body[at..];
     let rest = &mark[mark.find(" verdict=")? + " verdict=".len()..];
     let v: String = rest
         .chars()
@@ -189,9 +199,16 @@ fn verdict_in(body: &str) -> Option<String> {
 }
 
 fn keys_in(body: &str) -> Vec<String> {
-    body.match_indices(FINDING_MARK)
-        .filter_map(|(i, _)| {
-            let rest = &body[i + FINDING_MARK.len()..];
+    let mut at: Vec<(usize, &str)> = FINDING_MARKS
+        .iter()
+        .flat_map(|m| {
+            body.match_indices(m)
+                .map(|(i, _)| (i, &body[i + m.len()..]))
+        })
+        .collect();
+    at.sort_by_key(|(i, _)| *i);
+    at.into_iter()
+        .filter_map(|(_, rest)| {
             let key: String = rest
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric())
@@ -671,6 +688,22 @@ diff --git a/gone.rs b/gone.rs
         let keys: Vec<&str> = e.findings.iter().map(|p| p.key.as_str()).collect();
         assert_eq!(keys, vec![k.as_str(), "ffff"]);
         assert_eq!(e.findings[0].line, Some(3));
+    }
+
+    #[test]
+    fn earlier_reads_the_link_reference_markers_too() {
+        let comments = vec![
+            json!({"path": "src/a.rs", "line": 3, "body": "x\n\n[//]: # (lens:finding key=aaaa)"}),
+        ];
+        let reviews = vec![
+            json!({"body": "- y [//]: # (lens:finding key=bbbb)\n- z <!-- lens:finding key=cccc -->\n\n[//]: # (lens:review head=1 verdict=APPROVE)"}),
+            json!({"body": "quoting [//]: # (lens:finding key=eeee)"}),
+        ];
+        let e = earlier_from(&comments, &reviews);
+        assert_eq!(e.reviews, 1);
+        assert_eq!(e.verdict.as_deref(), Some("APPROVE"));
+        let keys: Vec<&str> = e.findings.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(keys, vec!["aaaa", "bbbb", "cccc"]);
     }
 
     fn sample() -> Report {
