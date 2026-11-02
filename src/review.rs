@@ -1727,7 +1727,16 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         let gh = pr::Gh::new(&pass.root, &cfg)?;
         let parsed: pr::Report = serde_json::from_value(report.clone())?;
         let patch = fs::read_to_string(pass.work.join("diff.patch"))?;
-        let plan = pr::plan(&parsed, &gh.earlier(number)?, &pr::commentable(&patch));
+        let plan = pr::plan(
+            &parsed,
+            &gh.earlier(number)?,
+            &pr::commentable(&patch),
+            cfg.comments,
+        );
+        let left_out = match plan.left_out.len() {
+            0 => String::new(),
+            n => format!("; {n} minor/nit left out"),
+        };
         let url = match (&plan.review, pass.opts.dry_run) {
             (Some(review), false) => gh.post(number, review)?,
             _ => None,
@@ -1739,13 +1748,13 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         };
         Ok(match (url, &plan.review) {
             (Some(url), _) => format!(
-                "Posted ({verdict}): {url} ({} inline, {} in the body; {} already posted)",
+                "Posted ({verdict}): {url} ({} inline, {} in the body; {} already posted{left_out})",
                 plan.inline.len(),
                 plan.in_body.len(),
                 plan.skipped.len()
             ),
             (None, Some(_)) if pass.opts.dry_run => format!(
-                "Dry run: would {verdict}, {} inline, {} in the body.",
+                "Dry run: would {verdict}, {} inline, {} in the body{left_out}.",
                 plan.inline.len(),
                 plan.in_body.len()
             ),

@@ -50,6 +50,7 @@ fn setup(dir: &Path, comments: Value) {
     let report = json!({
         "version": 1,
         "pass": "pr",
+        "pr": {"number": 7, "url": "https://github.test/o/r/pull/7"},
         "head": "0123456789abcdef",
         "base": "origin/main",
         "risk": "low",
@@ -101,25 +102,57 @@ fn post(dir: &Path, extra: &[&str]) -> Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+fn sent(dir: &Path) -> Value {
+    serde_json::from_str(&fs::read_to_string(dir.join("posted.json")).unwrap()).unwrap()
+}
+
 #[test]
-fn posts_one_review_inline_where_it_can() {
+fn posts_one_review_with_every_finding_in_its_body_by_default() {
     let dir = tempfile::tempdir().unwrap();
     setup(dir.path(), json!([]));
     let out = post(dir.path(), &[]);
     assert_eq!(out["posted"], true);
     assert_eq!(out["postAs"], "owner");
+    assert_eq!(out["comments"], "single");
     assert_eq!(out["review"], "https://github.test/pr/7#review-1");
-    assert_eq!(out["inline"], json!(["F1"]));
-    assert_eq!(out["inBody"], json!(["F2"]));
+    assert_eq!(out["inline"], json!([]));
+    assert_eq!(out["inBody"], json!(["F1"]));
+    assert_eq!(out["leftOut"], json!(["F2"]));
 
-    let sent: Value =
-        serde_json::from_str(&fs::read_to_string(dir.path().join("posted.json")).unwrap()).unwrap();
+    let sent = sent(dir.path());
     assert_eq!(sent["commit_id"], "0123456789abcdef");
+    assert_eq!(sent["event"], "REQUEST_CHANGES");
+    assert!(sent["comments"].as_array().unwrap().is_empty());
+    let body = sent["body"].as_str().unwrap();
+    assert!(
+        body.contains("[`src/a.rs:2`](https://github.test/o/r/pull/7/files#diff-"),
+        "{body}"
+    );
+    assert!(body.contains("1 minor/nit left out"), "{body}");
+    assert!(!body.contains("misleading name"), "{body}");
+    assert_eq!(fs::read_to_string(dir.path().join("token")).unwrap(), "");
+}
+
+#[test]
+fn inline_posts_a_comment_on_each_line_the_diff_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    setup(dir.path(), json!([]));
+    fs::write(
+        dir.path().join(".lens.toml"),
+        "[pr]\ncomments = \"inline\"\n",
+    )
+    .unwrap();
+    let out = post(dir.path(), &[]);
+    assert_eq!(out["comments"], "inline");
+    assert_eq!(out["inline"], json!(["F1"]));
+    assert_eq!(out["inBody"], json!([]));
+    assert_eq!(out["leftOut"], json!(["F2"]));
+
+    let sent = sent(dir.path());
     assert_eq!(sent["event"], "REQUEST_CHANGES");
     assert_eq!(sent["comments"].as_array().unwrap().len(), 1);
     assert_eq!(sent["comments"][0]["path"], "src/a.rs");
-    assert!(sent["body"].as_str().unwrap().contains("`src/b.rs:9`"));
-    assert_eq!(fs::read_to_string(dir.path().join("token")).unwrap(), "");
+    assert!(!sent["body"].as_str().unwrap().contains("misleading name"));
 }
 
 #[test]
@@ -134,8 +167,9 @@ fn skips_findings_an_earlier_run_posted() {
     let out = post(dir.path(), &["--dry-run"]);
     assert_eq!(out["posted"], false);
     assert_eq!(out["inline"], json!([]));
-    assert_eq!(out["inBody"], json!(["F2"]));
+    assert_eq!(out["inBody"], json!([]));
     assert_eq!(out["skipped"][0]["id"], "F1");
+    assert_eq!(out["leftOut"], json!(["F2"]));
     assert!(!dir.path().join("posted.json").exists());
     assert!(out["payload"]["body"]
         .as_str()
@@ -203,10 +237,10 @@ fn on_the_posters_own_pr_findings_post_as_a_plain_review() {
     let out = post(dir.path(), &[]);
     assert_eq!(out["posted"], true);
     assert_eq!(out["event"], "REQUEST_CHANGES");
-    let sent: Value =
-        serde_json::from_str(&fs::read_to_string(dir.path().join("posted.json")).unwrap()).unwrap();
+    let sent = sent(dir.path());
     assert_eq!(sent["event"], "COMMENT");
-    assert_eq!(sent["comments"].as_array().unwrap().len(), 1);
+    let key = lens::pr::key("src/a.rs", "new() panics");
+    assert!(sent["body"].as_str().unwrap().contains(&key));
 }
 
 #[test]

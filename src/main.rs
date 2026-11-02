@@ -245,7 +245,12 @@ fn run_pr(command: PrCommand) -> Result<()> {
                 .with_context(|| format!("parsing {}", report.display()))?;
             let patch = std::fs::read_to_string(&diff)
                 .with_context(|| format!("reading {}", diff.display()))?;
-            let plan = pr::plan(&report, &gh.earlier(number)?, &pr::commentable(&patch));
+            let plan = pr::plan(
+                &report,
+                &gh.earlier(number)?,
+                &pr::commentable(&patch),
+                cfg.comments,
+            );
             let url = match (&plan.review, dry_run) {
                 (Some(review), false) => gh.post(number, review)?,
                 _ => None,
@@ -253,6 +258,7 @@ fn run_pr(command: PrCommand) -> Result<()> {
             let out = serde_json::json!({
                 "pr": number,
                 "postAs": cfg.post_as,
+                "comments": cfg.comments,
                 "dryRun": dry_run,
                 "posted": url.is_some(),
                 "event": plan.event,
@@ -260,6 +266,7 @@ fn run_pr(command: PrCommand) -> Result<()> {
                 "inline": plan.inline,
                 "inBody": plan.in_body,
                 "skipped": plan.skipped,
+                "leftOut": plan.left_out,
                 "payload": if dry_run { plan.review } else { None },
             });
             println!("{}", serde_json::to_string_pretty(&out)?);

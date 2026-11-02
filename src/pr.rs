@@ -1,10 +1,12 @@
 //! The PR pass's GitHub side: reading the comments earlier lens runs left on a PR, and posting a
-//! review's verified findings as one review with inline comments.
+//! review's verified blocker and major findings as one review. `[pr] comments` picks where they
+//! go: all in the review's post (`single`, the default) or inline on the lines the diff shows.
+//! Minor and nit findings are never posted; the review says how many it left out.
 //!
 //! A review is never just comments: it requests changes while a blocker or major is unfixed and
-//! approves otherwise, nits and minors included.
+//! approves otherwise.
 //!
-//! Every comment lens posts ends in a marker, `<!-- lens:finding key=<key> -->`, and the review
+//! Every finding lens posts ends in a marker, `<!-- lens:finding key=<key> -->`, and the review
 //! body in `<!-- lens:review head=<sha> verdict=<event> -->`. The key is a hash of the file and the normalized
 //! title, so a later run can tell which findings it already posted.
 
@@ -17,7 +19,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::config::{PostAs, PrConfig};
+use sha2::{Digest, Sha256};
+
+use crate::config::{Comments, PostAs, PrConfig};
 
 /// A finding within this many lines of an earlier lens comment on the same file counts as the
 /// same finding.
@@ -30,6 +34,8 @@ const REVIEW_MARK: &str = "<!-- lens:review";
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Report {
+    #[serde(default)]
+    pub pr: Option<PrRef>,
     pub head: String,
     #[serde(default)]
     pub base: String,
@@ -43,6 +49,12 @@ pub struct Report {
     pub findings: Vec<Finding>,
     #[serde(default)]
     pub dropped: Vec<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PrRef {
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,13 +89,14 @@ impl Finding {
         key(&self.file, &self.title)
     }
 
-    fn collapsed(&self) -> bool {
+    /// A minor or nit: never posted, and never blocks.
+    fn left_out(&self) -> bool {
         matches!(self.severity.as_str(), "minor" | "nit")
     }
 
     /// A blocker or major the fix loop hasn't fixed: the PR can't merge with it.
     fn blocking(&self) -> bool {
-        !self.collapsed() && self.fix.as_ref().is_none_or(|f| f["status"] != "resolved")
+        !self.left_out() && self.fix.as_ref().is_none_or(|f| f["status"] != "resolved")
     }
 }
 
@@ -234,6 +247,7 @@ impl Gh {
             Err(e) if format!("{e:#}").contains("your own pull request") => {
                 if review["event"] == "APPROVE"
                     && review["comments"].as_array().is_none_or(Vec::is_empty)
+                    && !review["body"].as_str().unwrap_or("").contains(FINDING_MARK)
                 {
                     return Ok(None);
                 }
@@ -376,11 +390,14 @@ pub struct Skipped {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Plan {
-    /// Findings commented inline, by id.
+    /// Findings commented inline, by id; always empty with `[pr] comments = "single"`.
     pub inline: Vec<String>,
-    /// Findings on lines outside the diff, listed in the review body instead.
+    /// Findings listed in the review body: every new one in single mode, those on lines outside
+    /// the diff in inline mode.
     pub in_body: Vec<String>,
     pub skipped: Vec<Skipped>,
+    /// Minor and nit findings, by id: counted in the review, never posted.
+    pub left_out: Vec<String>,
     /// `REQUEST_CHANGES` while a blocker or major is unfixed, else `APPROVE`.
     pub event: &'static str,
     /// The review to post; `None` when there's nothing new to raise and an earlier lens review
@@ -400,14 +417,31 @@ fn already_posted(f: &Finding, key: &str, earlier: &[Posted]) -> Option<String> 
     })
 }
 
-pub fn plan(report: &Report, earlier: &Earlier, lines: &BTreeMap<String, BTreeSet<u32>>) -> Plan {
+/// A finding the review body lists, with whether the diff shows its line.
+pub struct InBody<'a> {
+    pub finding: &'a Finding,
+    pub key: String,
+    pub on_diff: bool,
+}
+
+pub fn plan(
+    report: &Report,
+    earlier: &Earlier,
+    lines: &BTreeMap<String, BTreeSet<u32>>,
+    mode: Comments,
+) -> Plan {
     let mut inline = Vec::new();
     let mut in_body = Vec::new();
     let mut skipped = Vec::new();
+    let mut left_out = Vec::new();
     let mut comments = Vec::new();
     let mut body_findings = Vec::new();
     let mut seen = Vec::new();
     for f in &report.findings {
+        if f.left_out() {
+            left_out.push(f.id.clone());
+            continue;
+        }
         let key = f.key();
         if let Some(reason) = already_posted(f, &key, &earlier.findings) {
             skipped.push(Skipped {
@@ -424,7 +458,8 @@ pub fn plan(report: &Report, earlier: &Earlier, lines: &BTreeMap<String, BTreeSe
             continue;
         }
         seen.push(key.clone());
-        if lines.get(&f.file).is_some_and(|ls| ls.contains(&f.line)) {
+        let on_diff = lines.get(&f.file).is_some_and(|ls| ls.contains(&f.line));
+        if on_diff && mode == Comments::Inline {
             comments.push(json!({
                 "path": f.file,
                 "line": f.line,
@@ -433,7 +468,11 @@ pub fn plan(report: &Report, earlier: &Earlier, lines: &BTreeMap<String, BTreeSe
             }));
             inline.push(f.id.clone());
         } else {
-            body_findings.push((f, key));
+            body_findings.push(InBody {
+                finding: f,
+                key,
+                on_diff,
+            });
             in_body.push(f.id.clone());
         }
     }
@@ -446,8 +485,17 @@ pub fn plan(report: &Report, earlier: &Earlier, lines: &BTreeMap<String, BTreeSe
     let changed = earlier.verdict.as_deref() != Some(event);
     let review = (new || changed).then(|| {
         // An approval with nothing new to raise says nothing: the marker alone renders empty.
-        let body = if new || event == "REQUEST_CHANGES" {
-            review_body(report, &body_findings, skipped.len(), event)
+        let body = if new || event == "REQUEST_CHANGES" || !left_out.is_empty() {
+            review_body(
+                report,
+                &BodyParts {
+                    findings: &body_findings,
+                    skipped: skipped.len(),
+                    left_out: left_out.len(),
+                    mode,
+                },
+                event,
+            )
         } else {
             review_mark(report, event)
         };
@@ -462,6 +510,7 @@ pub fn plan(report: &Report, earlier: &Earlier, lines: &BTreeMap<String, BTreeSe
         inline,
         in_body,
         skipped,
+        left_out,
         event,
         review,
     }
@@ -476,38 +525,57 @@ fn by(f: &Finding) -> String {
 }
 
 pub fn comment_body(f: &Finding, key: &str) -> String {
-    let mut details = String::new();
+    finding_text(f, key, None)
+}
+
+/// A finding as lens posts it: severity and title, where it is when that isn't the comment's own
+/// line, the failure scenario, how it fails folded away, and its marker.
+fn finding_text(f: &Finding, key: &str, location: Option<&str>) -> String {
+    let mut s = format!("**{}** · {}{}\n\n", f.severity, f.title, by(f));
+    if let Some(at) = location {
+        s.push_str(&format!("{at}\n\n"));
+    }
     if !f.failure_scenario.is_empty() {
-        details.push_str(&f.failure_scenario);
-        details.push_str("\n\n");
+        s.push_str(&f.failure_scenario);
+        s.push_str("\n\n");
     }
     let how = f.how_it_fails.as_deref().unwrap_or("").trim();
-    let mark = format!("{FINDING_MARK}{key} -->");
-    if f.collapsed() {
-        if !how.is_empty() {
-            details.push_str(&format!("How it fails:\n\n{how}\n\n"));
-        }
-        format!(
-            "<details><summary><b>{}</b> · {}{}</summary>\n\n{}</details>\n\n{mark}",
-            f.severity,
-            f.title,
-            if f.profiles.is_empty() {
-                String::new()
-            } else {
-                format!(" · <i>{}</i>", f.profiles.join(", "))
-            },
-            details
-        )
-    } else {
-        let mut s = format!("**{}** · {}{}\n\n{details}", f.severity, f.title, by(f));
-        if !how.is_empty() {
-            s.push_str(&format!(
-                "<details><summary>How it fails</summary>\n\n{how}\n\n</details>\n\n"
-            ));
-        }
-        s.push_str(&mark);
-        s
+    if !how.is_empty() {
+        s.push_str(&format!(
+            "<details><summary>How it fails</summary>\n\n{how}\n\n</details>\n\n"
+        ));
     }
+    s.push_str(&format!("{FINDING_MARK}{key} -->"));
+    s
+}
+
+/// `file:line`, linked to the line in the PR's diff when the diff shows it, else to the file at
+/// the reviewed commit. Unlinked when the report doesn't name the PR's URL.
+fn location(report: &Report, f: &Finding, on_diff: bool) -> String {
+    let text = format!("`{}:{}`", f.file, f.line);
+    let Some(pr) = report
+        .pr
+        .as_ref()
+        .and_then(|p| p.url.as_deref())
+        .map(|u| u.trim_end_matches('/'))
+    else {
+        return text;
+    };
+    let url = if on_diff {
+        let anchor = hex(&Sha256::digest(f.file.as_bytes()));
+        Some(format!("{pr}/files#diff-{anchor}R{}", f.line))
+    } else {
+        pr.rfind("/pull/")
+            .map(|i| format!("{}/blob/{}/{}#L{}", &pr[..i], report.head, f.file, f.line))
+    };
+    match url {
+        Some(url) => format!("[{text}]({url})"),
+        None => text,
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn counts(findings: &[&Finding]) -> String {
@@ -521,13 +589,18 @@ fn counts(findings: &[&Finding]) -> String {
     parts.join(", ")
 }
 
-pub fn review_body(
-    report: &Report,
-    outside: &[(&Finding, String)],
-    skipped: usize,
-    event: &str,
-) -> String {
-    let posted: Vec<&Finding> = report.findings.iter().collect();
+/// What a review body lists besides the report's own summary.
+pub struct BodyParts<'a> {
+    pub findings: &'a [InBody<'a>],
+    /// New findings an earlier run already posted.
+    pub skipped: usize,
+    /// Minor and nit findings, counted but not posted.
+    pub left_out: usize,
+    pub mode: Comments,
+}
+
+pub fn review_body(report: &Report, parts: &BodyParts, event: &str) -> String {
+    let posted: Vec<&Finding> = report.findings.iter().filter(|f| !f.left_out()).collect();
     let n = posted.len();
     let mut s = format!(
         "### lens review · {n} finding{}",
@@ -535,6 +608,9 @@ pub fn review_body(
     );
     if n > 0 {
         s.push_str(&format!(" ({})", counts(&posted)));
+    }
+    if parts.left_out > 0 {
+        s.push_str(&format!(" · {} minor/nit left out", parts.left_out));
     }
     if let Some(risk) = &report.risk {
         s.push_str(&format!(" · risk {risk}"));
@@ -546,26 +622,23 @@ pub fn review_body(
     } else {
         s.push_str(&format!("Reviewed `{short}` against `{}`.", report.base));
     }
-    s.push_str(" Every finding was confirmed by a verifier that traced the failure; minor and nit findings are collapsed.\n\n");
-    if skipped > 0 {
+    s.push_str(" Every finding was confirmed by a verifier that traced the failure; only blockers and majors are posted.\n\n");
+    if parts.skipped > 0 {
         s.push_str(&format!(
-            "{skipped} of them already posted on an earlier run, not repeated.\n\n"
+            "{} of them already posted on an earlier run, not repeated.\n\n",
+            parts.skipped
         ));
     }
-    if !outside.is_empty() {
-        s.push_str("Findings on lines outside the diff:\n\n");
-        for (f, key) in outside {
-            s.push_str(&format!(
-                "- **{}** `{}:{}` {}{}: {} {FINDING_MARK}{key} -->\n",
-                f.severity,
-                f.file,
-                f.line,
-                f.title,
-                by(f),
-                f.failure_scenario
-            ));
+    if !parts.findings.is_empty() {
+        s.push_str(match parts.mode {
+            Comments::Single => "Findings:\n\n",
+            Comments::Inline => "Findings on lines outside the diff:\n\n",
+        });
+        for b in parts.findings {
+            let at = location(report, b.finding, b.on_diff);
+            s.push_str(&finding_text(b.finding, &b.key, Some(&at)));
+            s.push_str("\n\n");
         }
-        s.push('\n');
     }
     if let Some(a) = report
         .assessment
@@ -633,6 +706,9 @@ mod tests {
 
     fn report(findings: Vec<Finding>) -> Report {
         Report {
+            pr: Some(PrRef {
+                url: Some(PR_URL.into()),
+            }),
             head: "abcdef1234".into(),
             base: "origin/main".into(),
             risk: Some("low".into()),
@@ -642,6 +718,8 @@ mod tests {
             dropped: vec![],
         }
     }
+
+    const PR_URL: &str = "https://github.com/o/r/pull/7";
 
     const PATCH: &str = "\
 diff --git a/src/a.rs b/src/a.rs
@@ -705,33 +783,95 @@ diff --git a/gone.rs b/gone.rs
         assert_eq!(e.findings[0].line, Some(3));
     }
 
-    #[test]
-    fn plan_posts_inline_in_the_diff_and_in_the_body_outside_it() {
-        let r = report(vec![
+    fn sample() -> Report {
+        report(vec![
             finding("F1", "src/a.rs", 2, "blocker", "breaks"),
             finding("F2", "src/a.rs", 40, "major", "far away"),
             finding("F3", "src/a.rs", 22, "nit", "tiny"),
-        ]);
-        let p = plan(&r, &Earlier::default(), &commentable(PATCH));
-        assert_eq!(p.inline, vec!["F1", "F3"]);
-        assert_eq!(p.in_body, vec!["F2"]);
+            finding("F4", "src/a.rs", 3, "minor", "edge"),
+        ])
+    }
+
+    #[test]
+    fn single_puts_every_finding_in_the_one_post_linked_to_its_line() {
+        let p = plan(
+            &sample(),
+            &Earlier::default(),
+            &commentable(PATCH),
+            Comments::Single,
+        );
+        assert!(p.inline.is_empty());
+        assert_eq!(p.in_body, vec!["F1", "F2"]);
+        assert_eq!(p.left_out, vec!["F3", "F4"]);
         let review = p.review.unwrap();
         assert_eq!(review["commit_id"], "abcdef1234");
         assert_eq!(review["event"], "REQUEST_CHANGES");
-        assert_eq!(review["comments"][0]["line"], 2);
-        assert_eq!(review["comments"][0]["side"], "RIGHT");
+        assert!(review["comments"].as_array().unwrap().is_empty());
         let body = review["body"].as_str().unwrap();
         assert!(
-            body.contains("3 findings (1 blocker, 1 major, 1 nit)"),
+            body.contains("2 findings (1 blocker, 1 major) · 2 minor/nit left out · risk low"),
+            "{body}"
+        );
+        let anchor = hex(&Sha256::digest(b"src/a.rs"));
+        assert!(
+            body.contains(&format!(
+                "**blocker** · breaks · _correctness_\n\n[`src/a.rs:2`]({PR_URL}/files#diff-{anchor}R2)\n\nx happens"
+            )),
+            "{body}"
+        );
+        assert!(
+            body.contains("[`src/a.rs:40`](https://github.com/o/r/blob/abcdef1234/src/a.rs#L40)"),
+            "{body}"
+        );
+        assert!(body.contains(&format!("{FINDING_MARK}{} -->", key("src/a.rs", "breaks"))));
+        assert!(body.contains(&format!(
+            "{FINDING_MARK}{} -->",
+            key("src/a.rs", "far away")
+        )));
+        assert!(!body.contains("tiny") && !body.contains("edge"), "{body}");
+        assert!(body.contains("<!-- lens:review head=abcdef1234 verdict=REQUEST_CHANGES -->"));
+    }
+
+    #[test]
+    fn inline_comments_on_the_diff_and_lists_the_rest_in_the_body() {
+        let p = plan(
+            &sample(),
+            &Earlier::default(),
+            &commentable(PATCH),
+            Comments::Inline,
+        );
+        assert_eq!(p.inline, vec!["F1"]);
+        assert_eq!(p.in_body, vec!["F2"]);
+        assert_eq!(p.left_out, vec!["F3", "F4"]);
+        let review = p.review.unwrap();
+        assert_eq!(review["event"], "REQUEST_CHANGES");
+        let comments = review["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0]["line"], 2);
+        assert_eq!(comments[0]["side"], "RIGHT");
+        let body = review["body"].as_str().unwrap();
+        assert!(
+            body.contains("Findings on lines outside the diff:"),
             "{body}"
         );
         assert!(body.contains(&key("src/a.rs", "far away")));
-        assert!(body.contains("<!-- lens:review head=abcdef1234 verdict=REQUEST_CHANGES -->"));
-        let nit = review["comments"][1]["body"].as_str().unwrap();
-        assert!(
-            nit.starts_with("<details><summary><b>nit</b> · tiny"),
-            "{nit}"
+        assert!(!body.contains(&key("src/a.rs", "breaks")));
+        assert!(body.contains("2 minor/nit left out"), "{body}");
+    }
+
+    #[test]
+    fn a_finding_is_unlinked_when_the_report_names_no_pr_url() {
+        let mut r = sample();
+        r.pr = None;
+        let p = plan(
+            &r,
+            &Earlier::default(),
+            &commentable(PATCH),
+            Comments::Single,
         );
+        let body = p.review.unwrap()["body"].as_str().unwrap().to_string();
+        assert!(body.contains("\n\n`src/a.rs:2`\n\n"), "{body}");
+        assert!(!body.contains("]("), "{body}");
     }
 
     #[test]
@@ -759,22 +899,66 @@ diff --git a/gone.rs b/gone.rs
                 },
             ],
         };
-        let p = plan(&r, &earlier, &commentable(PATCH));
-        let skipped: Vec<&str> = p.skipped.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(skipped, vec!["F1", "F2"]);
-        assert_eq!(p.skipped[0].reason, "already posted: u");
-        assert_eq!(p.inline, vec!["F3"]);
+        for mode in [Comments::Single, Comments::Inline] {
+            let p = plan(&r, &earlier, &commentable(PATCH), mode);
+            let skipped: Vec<&str> = p.skipped.iter().map(|s| s.id.as_str()).collect();
+            assert_eq!(skipped, vec!["F1", "F2"]);
+            assert_eq!(p.skipped[0].reason, "already posted: u");
+            let posted = [p.inline, p.in_body].concat();
+            assert_eq!(posted, vec!["F3"]);
+        }
+    }
+
+    /// What GitHub hands back for a posted review: its body, and each inline comment.
+    fn as_posted(review: &Value) -> Earlier {
+        let comments: Vec<Value> = review["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| json!({"path": c["path"], "line": c["line"], "body": c["body"]}))
+            .collect();
+        earlier_from(&comments, &[json!({"body": review["body"]})])
     }
 
     #[test]
-    fn only_nits_and_minors_approve() {
+    fn a_rerun_posts_nothing_in_either_mode_or_after_a_mode_change() {
+        let modes = [Comments::Single, Comments::Inline];
+        for first in modes {
+            for second in modes {
+                let lines = commentable(PATCH);
+                let review = plan(&sample(), &Earlier::default(), &lines, first)
+                    .review
+                    .unwrap();
+                let earlier = as_posted(&review);
+                assert_eq!(earlier.verdict.as_deref(), Some("REQUEST_CHANGES"));
+                let again = plan(&sample(), &earlier, &lines, second);
+                let skipped: Vec<&str> = again.skipped.iter().map(|s| s.id.as_str()).collect();
+                assert_eq!(skipped, vec!["F1", "F2"], "{first:?} then {second:?}");
+                assert!(again.review.is_none(), "{first:?} then {second:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn minors_and_nits_are_left_out_and_approve() {
         let r = report(vec![
             finding("F1", "src/a.rs", 2, "minor", "edge"),
             finding("F2", "src/a.rs", 3, "nit", "tiny"),
         ]);
-        let p = plan(&r, &Earlier::default(), &commentable(PATCH));
-        assert_eq!(p.event, "APPROVE");
-        assert_eq!(p.review.unwrap()["comments"].as_array().unwrap().len(), 2);
+        for mode in [Comments::Single, Comments::Inline] {
+            let p = plan(&r, &Earlier::default(), &commentable(PATCH), mode);
+            assert_eq!(p.event, "APPROVE");
+            assert!(p.inline.is_empty() && p.in_body.is_empty());
+            assert_eq!(p.left_out, vec!["F1", "F2"]);
+            let review = p.review.unwrap();
+            assert!(review["comments"].as_array().unwrap().is_empty());
+            let body = review["body"].as_str().unwrap();
+            assert!(
+                body.starts_with("### lens review · 0 findings · 2 minor/nit left out"),
+                "{body}"
+            );
+            assert!(!body.contains(FINDING_MARK), "{body}");
+        }
     }
 
     #[test]
@@ -785,18 +969,29 @@ diff --git a/gone.rs b/gone.rs
             &report(vec![f.clone()]),
             &Earlier::default(),
             &BTreeMap::new(),
+            Comments::Single,
         );
         assert_eq!(p.event, "APPROVE");
         f.fix = Some(json!({"status": "escalated"}));
-        let p = plan(&report(vec![f]), &Earlier::default(), &BTreeMap::new());
+        let p = plan(
+            &report(vec![f]),
+            &Earlier::default(),
+            &BTreeMap::new(),
+            Comments::Single,
+        );
         assert_eq!(p.event, "REQUEST_CHANGES");
     }
 
     #[test]
     fn a_clean_review_approves_with_an_empty_body() {
-        let review = plan(&report(vec![]), &Earlier::default(), &BTreeMap::new())
-            .review
-            .unwrap();
+        let review = plan(
+            &report(vec![]),
+            &Earlier::default(),
+            &BTreeMap::new(),
+            Comments::Single,
+        )
+        .review
+        .unwrap();
         assert_eq!(review["event"], "APPROVE");
         assert_eq!(
             review["body"],
@@ -812,9 +1007,14 @@ diff --git a/gone.rs b/gone.rs
             verdict: Some("REQUEST_CHANGES".into()),
             findings: vec![],
         };
-        let review = plan(&report(vec![]), &earlier, &BTreeMap::new())
-            .review
-            .unwrap();
+        let review = plan(
+            &report(vec![]),
+            &earlier,
+            &BTreeMap::new(),
+            Comments::Single,
+        )
+        .review
+        .unwrap();
         assert_eq!(review["event"], "APPROVE");
     }
 
@@ -825,9 +1025,14 @@ diff --git a/gone.rs b/gone.rs
             verdict: Some("APPROVE".into()),
             findings: vec![],
         };
-        assert!(plan(&report(vec![]), &earlier, &BTreeMap::new())
-            .review
-            .is_none());
+        assert!(plan(
+            &report(vec![]),
+            &earlier,
+            &BTreeMap::new(),
+            Comments::Single
+        )
+        .review
+        .is_none());
         let r = report(vec![finding("F1", "src/a.rs", 2, "major", "breaks")]);
         let earlier = Earlier {
             reviews: 1,
@@ -839,7 +1044,11 @@ diff --git a/gone.rs b/gone.rs
                 url: None,
             }],
         };
-        assert!(plan(&r, &earlier, &commentable(PATCH)).review.is_none());
+        for mode in [Comments::Single, Comments::Inline] {
+            assert!(plan(&r, &earlier, &commentable(PATCH), mode)
+                .review
+                .is_none());
+        }
     }
 
     #[test]
