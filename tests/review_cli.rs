@@ -79,14 +79,16 @@ elif role == "reviewer":
     if 're-review of a fix' not in prompt and 'name="correctness"' in prompt:
         findings = [
             {"file": "src/a.rs", "line": 3, "severity": "blocker", "title": "empty input accepted",
-             "failureScenario": "parse(\"\") returns Ok", "confidence": 0.9},
+             "failureScenario": "parse(\"\") returns Ok", "confidence": 0.9,
+             "suggestedFix": "reject empty input"},
             {"file": "src/a.rs", "line": 9, "severity": "minor", "title": "odd name",
              "failureScenario": "confusing", "confidence": 0.5},
         ]
         # A delta review looks only at the delta, which never touches src/b.rs.
         if "(delta.patch)" not in system_text:
             findings.append({"file": "src/b.rs", "line": 1, "severity": "major", "title": "leaks a handle",
-                             "failureScenario": "b() never closes it", "confidence": 0.7})
+                             "failureScenario": "b() never closes it", "confidence": 0.7,
+                             "suggestedFix": "close it in b()"})
     reply = {"summary": "checked", "findings": findings}
     if "You are the lead reviewer" in prompt:
         reply.update({"risk": "moderate", "assessment": "**Impact**: small",
@@ -98,6 +100,9 @@ elif role == "verifier":
                  "failureScenario": "b() never closes the handle it opens"}
     else:
         reply = {"verdict": "confirmed", "severity": "blocker", "howItFails": "1. parse(\"\")\n2. Ok"}
+        if "suggestedFix: reject empty input" in prompt:
+            reply["suggestedFix"] = "\n  return Err on an empty string in parse()\nmore"
+
 else:
     reply = None
 text = "I couldn't finish." if reply is None else "Done.\n```json\n" + json.dumps(reply) + "\n```\n"
@@ -371,6 +376,13 @@ fn a_full_review_verifies_blockers_and_drops_the_rest() {
         findings[1]["failureScenario"],
         "b() never closes the handle it opens"
     );
+    // The verifier sees the reviewer's fix and its first line is the one kept; a fix the
+    // verifier doesn't give back isn't kept.
+    assert_eq!(
+        findings[0]["suggestedFix"],
+        "return Err on an empty string in parse()"
+    );
+    assert!(findings[1].get("suggestedFix").is_none(), "{}", findings[1]);
     assert_eq!(report["dropped"][0]["reason"], "below major");
     let ran: Vec<&str> = report["profiles"]
         .as_array()
@@ -383,6 +395,10 @@ fn a_full_review_verifies_blockers_and_drops_the_rest() {
     assert!(report["tree"].as_str().is_some());
     assert!(
         out.contains("F1  blocker  src/a.rs:3  empty input accepted"),
+        "{out}"
+    );
+    assert!(
+        out.contains("  fix: return Err on an empty string in parse()"),
         "{out}"
     );
 
@@ -891,7 +907,7 @@ fn the_protocol_writes_a_result_and_never_touches_the_worktree() {
     assert_eq!(findings[0]["line"], 3);
     assert_eq!(
         findings[0]["detail"],
-        "parse(\"\") returns Ok\n\n1. parse(\"\")\n2. Ok"
+        "parse(\"\") returns Ok\n\nFix: return Err on an empty string in parse()\n\n1. parse(\"\")\n2. Ok"
     );
     assert_eq!(findings[0]["url"], Value::Null);
     assert_eq!(findings[1]["id"], "F2");

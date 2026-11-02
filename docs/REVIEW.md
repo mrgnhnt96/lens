@@ -62,7 +62,8 @@ its latest report in `<state>/pr-<n>.json`.
       "title": "empty input parses as a valid token",
       "failureScenario": "parse(\"\") returns Ok(Token::empty()), so login() accepts a blank password",
       "confidence": 0.8,
-      "howItFails": "1. login() (src/auth.rs:30) passes the raw field to parse()\n2. …"
+      "howItFails": "1. login() (src/auth.rs:30) passes the raw field to parse()\n2. …",
+      "suggestedFix": "return Err from parse() on an empty string"
     }
   ],
   "dropped": [
@@ -102,7 +103,9 @@ its latest report in `<state>/pr-<n>.json`.
   `agents`. The top-level `costUsd` is the same total, kept for older readers.
 - `findings`: blocker and major only, every one confirmed by a verifier. `severity` is the
   verifier's, `line` the verifier's when it moved it, and `failureScenario` the verifier's when
-  it took out a failure it couldn't reach (otherwise the reviewer's). Ids are `F1`, `F2`, … (blockers first). A
+  it took out a failure it couldn't reach (otherwise the reviewer's). `suggestedFix` is an
+  optional one-line fix, only ever the verifier's (a reviewer's suggestion is a hint it checks).
+  Ids are `F1`, `F2`, … (blockers first). A
   finding carried over from the last report keeps its id, and a new one takes the next number
   after any id the branch's reports have used (`lastId`), so an id never changes meaning.
 - `settled`: findings the task board's triage dismissed or backlogged (see the protocol below),

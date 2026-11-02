@@ -185,7 +185,8 @@ PR, in the review's post or inline. `lens pr post --pr <n> --report <file> --dif
 Blocker, major and minor findings are posted; nits never are, and minors and nits never block. The
 review says how many nits it left out. The post is written for an agent: the findings and nothing
 else. By default every new finding goes in the review's post, each
-with its severity, title, `file:line` linked to that line in the PR's diff, and failure scenario;
+with its severity, title, `file:line` linked to that line in the PR's diff, failure scenario,
+and the verifier's one-line fix when it gave one;
 with `comments = "inline"` a finding on a line the diff shows is a comment on that line instead,
 and the rest go in the post. A review is never just comments: it requests changes while a blocker
 or major is unfixed, and approves otherwise. A clean review approves with an empty body. Findings
