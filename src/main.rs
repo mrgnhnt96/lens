@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use serde_json::Value;
 
-use lens::{config, cost, diff, forge, map, pr, profile, review, select, usage};
+use lens::{config, cost, diff, forge, map, outcome, pr, profile, review, select, usage};
 
 /// Agent code review for Claude Code.
 #[derive(Parser)]
@@ -148,6 +148,23 @@ enum PrCommand {
         /// Print the review instead of posting it.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Check what became of the findings lens posted on PRs that aren't settled yet (the check
+    /// every review starts with), then sum up the stored outcomes by reviewer profile and
+    /// severity: fixed, dismissed, ignored or still open.
+    Outcomes {
+        /// Check these PRs too, however they stand, and sum up only them. Repeatable.
+        #[arg(long)]
+        pr: Vec<u64>,
+        /// The repo the PRs belong to. Defaults to the current directory.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// The state folder holding the PRs' reports. Defaults to the repo's.
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Print every PR's outcomes as JSON instead of the summary.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -320,6 +337,33 @@ fn run_pr(command: PrCommand) -> Result<()> {
                 "payload": plan.review.as_ref().filter(|_| dry_run).map(|r| forge.payload(number, r)),
             });
             println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        PrCommand::Outcomes {
+            pr: prs,
+            repo,
+            state,
+            json,
+        } => {
+            let state = match state {
+                Some(dir) => dir,
+                None => outcome::state_of(&repo)?,
+            };
+            let forge = forge::open(&repo, &config::load(&repo)?.pr)?;
+            outcome::check(&repo, &state, &*forge, &prs)?;
+            let mut all = outcome::stored(&state)?;
+            if !prs.is_empty() {
+                all.retain(|o| prs.contains(&o.pr));
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&all)?);
+            } else {
+                let heading = match all.as_slice() {
+                    [one] => format!("PR #{}", one.pr),
+                    _ => format!("{} PRs", all.len()),
+                };
+                let summary = outcome::Summary::of(all.iter().flat_map(|o| &o.findings));
+                print!("{}", outcome::render(&heading, &summary));
+            }
         }
     }
     Ok(())

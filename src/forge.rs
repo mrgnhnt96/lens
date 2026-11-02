@@ -1,6 +1,7 @@
 //! Where a repo's PRs live. The PR pass reads a PR, fetches it and posts its review through a
 //! [`Forge`]; what to post (which findings, where, the markers) is forge-neutral, in [`crate::pr`].
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
@@ -8,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{ForgeKind, PrConfig};
+use crate::outcome::Discussion;
 use crate::pr::{Earlier, Markup, Review};
 
 mod bitbucket;
@@ -62,6 +64,13 @@ pub trait Forge {
     /// Posts `review` on PR `pr` with its verdict and returns where it landed; `None` when the
     /// forge took nothing (an approval it wouldn't accept, with no findings to fall back on).
     fn post(&self, pr: u64, review: &Review) -> Result<Option<String>>;
+
+    /// What became of lens's findings on each of `prs`, read in as few calls as the forge
+    /// allows, with each PR's head fetched to `refs/lens/pr/<n>`. A PR the forge can't tell about
+    /// is left out; by default that is every PR.
+    fn discussions(&self, _prs: &[u64]) -> Result<BTreeMap<u64, Discussion>> {
+        Ok(BTreeMap::new())
+    }
 }
 
 /// The forge `[pr] forge` names, else the one origin's URL points at.

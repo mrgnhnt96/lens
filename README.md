@@ -92,6 +92,7 @@ small_lines = 40                            # at most this many changed lines: c
 parallel = 4                                # agents running at once
 timeout_mins = 20                           # per agent
 keep_reports = true                         # keep every run's report in reports/; false: latest only
+track_outcomes = true                       # before a review, check what became of posted findings
 ```
 
 **The floor.** Deep review runs elsewhere (the board's pre-PR review), so each PR keeps only a cheap check:
@@ -251,6 +252,18 @@ nothing new and the same verdict posts nothing; a changed verdict replaces the o
 
 `LENS_BITBUCKET_API` points lens at another API base (default `https://api.bitbucket.org/2.0`),
 for tests.
+
+## `lens pr outcomes [--pr <n>]... [--json]`
+
+Each review starts by checking what became of the findings lens posted on PRs that aren't settled
+yet, and writes each PR's `pr-<n>/outcomes.json`. A finding is `fixed` when the code at its spot
+changed, `dismissed` when its thread got a reply or was resolved with no change, `ignored` when
+the PR closed with neither, and `open` until then. See
+[What became of posted findings](docs/REVIEW.md#what-became-of-posted-findings). `lens pr outcomes`
+runs that check now, plus any PR `--pr` names, and prints how the stored findings fared, by
+reviewer profile and by severity. With `--pr` it covers only those PRs. `--json` prints every
+PR's outcomes instead. `[review] track_outcomes = false` turns off the check before each review,
+but this command still runs. GitHub only for now.
 
 ## License
 

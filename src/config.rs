@@ -91,6 +91,9 @@ pub struct ReviewConfig {
     /// Keep a copy of every report under the work folder's `reports/`, so earlier runs stay
     /// readable. `false` keeps only the latest.
     pub keep_reports: bool,
+    /// Before each review, check what became of the findings lens posted on PRs that aren't
+    /// settled yet, and write each PR's `outcomes.json` beside its kept reports.
+    pub track_outcomes: bool,
 }
 
 impl Default for ReviewConfig {
@@ -100,6 +103,7 @@ impl Default for ReviewConfig {
             parallel: 4,
             timeout_mins: 20,
             keep_reports: true,
+            track_outcomes: true,
         }
     }
 }

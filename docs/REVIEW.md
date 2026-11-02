@@ -253,3 +253,49 @@ failure stops before a comment goes up), a `POST …/comments` with `inline: {pa
 inline finding, and last the summary `POST …/comments`, the review body, whose marker records the
 review. `file:line` links go to the file at `head` (`<repo>/src/<head>/<file>#lines-<n>`),
 on the diff or not.
+
+## What became of posted findings
+
+Before every review (`lens review` in any pass), lens checks the PRs it has reviewed whose
+outcomes aren't settled: those with a `<state>/pr-<n>.json` and no `pr-<n>/outcomes.json`, an
+`outcomes.json` older than that report, or one with `"settled": false`. Nothing runs on a
+schedule. On GitHub it reads every such PR's state, head and review threads with one GraphQL
+query per 20 PRs, fetches their heads to `refs/lens/pr/<n>` in one `git fetch`, and writes each
+PR's `pr-<n>/outcomes.json`. Each finding lens posted gets one of these fates:
+
+- `fixed`: the code within 3 lines of its spot changed between the commit it was posted for and
+  the PR's head.
+- `dismissed`: no such change, but someone replied in its thread, or the thread was resolved.
+- `ignored`: no change and no answer, and the PR is merged or closed.
+- `open`: none of these yet.
+
+A PR is `settled` once it is merged or closed. A settled PR isn't checked again until a new report
+for it is written. A failed check prints a warning and the review goes on. `[review]
+track_outcomes = false` in `.lens.toml` turns the check off. `lens pr outcomes` runs the same check
+whenever you ask. Bitbucket PRs aren't checked yet.
+
+```json
+{
+  "pr": 12,
+  "head": "9f1c2ab…",
+  "state": "MERGED",
+  "settled": true,
+  "checkedAt": "2026-11-02T20:41:05Z",
+  "findings": [
+    {
+      "key": "3be1…", "id": "F2", "profiles": ["correctness"], "severity": "major",
+      "title": "…", "file": "src/a.rs", "line": 40, "postedAt": "72557a01ef…",
+      "url": "https://github.com/o/r/pull/12#discussion_r1", "fate": "fixed",
+      "why": "the code at its spot changed since"
+    }
+  ],
+  "summary": {
+    "total": { "posted": 1, "fixed": 1, "dismissed": 0, "ignored": 0, "open": 0 },
+    "byProfile": { "correctness": { "posted": 1, "fixed": 1, "dismissed": 0, "ignored": 0, "open": 0 } },
+    "bySeverity": { "major": { "posted": 1, "fixed": 1, "dismissed": 0, "ignored": 0, "open": 0 } }
+  }
+}
+```
+
+A finding's `profiles`, `severity` and `postedAt` come from the first kept report (in `reports/`)
+that has it. A finding that no kept report holds is counted under the `unknown` profile.

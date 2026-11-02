@@ -11,6 +11,7 @@ pub mod diff;
 pub mod forge;
 pub mod lang;
 pub mod map;
+pub mod outcome;
 pub mod pr;
 pub mod profile;
 pub mod reply;
