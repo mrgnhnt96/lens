@@ -236,7 +236,8 @@ Each posted finding, inline or in the body, ends with `<!-- lens:finding key=<ha
 title> -->` and the review body with `<!-- lens:review head=<sha>
 verdict=<APPROVE|REQUEST_CHANGES> -->`, which is how later runs find what's already there and the
 verdict they last gave. A finding is already there when an earlier one has its key (in a body or
-inline) or was commented inline in the same file within 3 lines, so a rerun skips it whichever
+inline) or sits in the same file within 3 lines: commented inline there, or listed in a review
+body with that `file:line`, so a rerun skips it whichever
 mode either run used. The pre-PR protocol review is unaffected: it keeps every severity.
 
 On Bitbucket, which shows HTML comments, the markers are link-reference lines on their own:

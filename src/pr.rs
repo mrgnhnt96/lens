@@ -206,11 +206,12 @@ pub fn earlier_from(comments: &[Value], reviews: &[Value]) -> Earlier {
         out.reviews += 1;
         out.verdict = verdict_in(body);
         out.head = head_in(body);
-        for key in keys_in(body) {
+        for (key, at) in body_findings(body) {
+            let (path, line) = at.map_or((None, None), |(p, l)| (Some(p), Some(l)));
             out.findings.push(Posted {
                 key,
-                path: None,
-                line: None,
+                path,
+                line,
                 url: r["html_url"].as_str().map(str::to_string),
             });
         }
@@ -235,6 +236,42 @@ fn head_in(body: &str) -> Option<String> {
     let rest = &mark[mark.find(" head=")? + " head=".len()..];
     let h: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
     (!h.is_empty()).then_some(h)
+}
+
+/// Each finding a review body lists: its key, and the `file:line` it names before its marker
+/// (the first `` `path:line` `` in its block), so a reworded finding at the same spot reads as
+/// already posted.
+fn body_findings(body: &str) -> Vec<(String, Option<(String, u32)>)> {
+    let mut marks: Vec<(usize, usize)> = FINDING_MARKS
+        .iter()
+        .flat_map(|m| body.match_indices(m).map(|(i, _)| (i, i + m.len())))
+        .collect();
+    marks.sort();
+    let mut from = 0;
+    let mut out = Vec::new();
+    for (start, end) in marks {
+        let key: String = body[end..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        let block = &body[from..start];
+        from = end;
+        if key.is_empty() {
+            continue;
+        }
+        out.push((key, location_in(block)));
+    }
+    out
+}
+
+/// The first `` `path:line` `` in `text`.
+fn location_in(text: &str) -> Option<(String, u32)> {
+    text.split('`').skip(1).step_by(2).find_map(|code| {
+        let (path, line) = code.rsplit_once(':')?;
+        let ok = !path.is_empty() && !path.contains(char::is_whitespace);
+        ok.then_some(())?;
+        Some((path.to_string(), line.parse().ok()?))
+    })
 }
 
 fn keys_in(body: &str) -> Vec<String> {
@@ -686,6 +723,50 @@ diff --git a/gone.rs b/gone.rs
         let keys: Vec<&str> = e.findings.iter().map(|p| p.key.as_str()).collect();
         assert_eq!(keys, vec![k.as_str(), "ffff"]);
         assert_eq!(e.findings[0].line, Some(3));
+    }
+
+    #[test]
+    fn a_reworded_finding_at_a_spot_the_body_already_lists_is_skipped() {
+        let mut r = report(vec![finding(
+            "F1",
+            "src/a.rs",
+            40,
+            "minor",
+            "first wording",
+        )]);
+        let review = plan(
+            &r,
+            &Earlier::default(),
+            &commentable(PATCH),
+            Comments::Single,
+        )
+        .review
+        .map(github)
+        .unwrap();
+        let earlier = as_posted(&review);
+        assert_eq!(earlier.findings[0].path.as_deref(), Some("src/a.rs"));
+        assert_eq!(earlier.findings[0].line, Some(40));
+
+        r.findings = vec![
+            finding("F2", "src/a.rs", 42, "minor", "same gap, said another way"),
+            finding("F3", "src/a.rs", 90, "minor", "somewhere else"),
+            finding("F4", "src/b.rs", 40, "minor", "another file"),
+        ];
+        let again = plan(&r, &earlier, &commentable(PATCH), Comments::Single);
+        let skipped: Vec<&str> = again.skipped.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(skipped, vec!["F2"]);
+        assert_eq!(again.in_body, vec!["F3", "F4"]);
+    }
+
+    #[test]
+    fn a_body_finding_without_a_location_still_has_its_key() {
+        let body = "**minor** · x\n\nno place given\n\n<!-- lens:finding key=abcd -->\n\n**minor** · y · `src/c.rs:7`\n\nsee `not a place`\n\n<!-- lens:finding key=ef01 -->";
+        let f = body_findings(body);
+        assert_eq!(f[0], ("abcd".to_string(), None));
+        assert_eq!(
+            f[1],
+            ("ef01".to_string(), Some(("src/c.rs".to_string(), 7)))
+        );
     }
 
     #[test]
