@@ -80,27 +80,6 @@ impl GitHub {
         String::from_utf8(out.stdout).context("gh printed non-UTF-8")
     }
 
-    /// Opens a PR from `head` into `base` and returns its URL.
-    pub fn create_pr(&self, base: &str, head: &str, title: &str, body: &Path) -> Result<String> {
-        let body = body.display().to_string();
-        let out = self.run(
-            &[
-                "pr",
-                "create",
-                "--base",
-                base,
-                "--head",
-                head,
-                "--title",
-                title,
-                "--body-file",
-                &body,
-            ],
-            None,
-        )?;
-        Ok(out.trim().lines().last().unwrap_or("").to_string())
-    }
-
     /// Every page of a list endpoint.
     fn list(&self, endpoint: &str) -> Result<Vec<Value>> {
         let text = self.api(&["--paginate", endpoint], None)?;
