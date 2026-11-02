@@ -232,17 +232,30 @@ fn bot_identity_uses_the_configured_token() {
 }
 
 #[test]
-fn on_the_posters_own_pr_findings_post_as_a_plain_review() {
+fn on_the_posters_own_pr_findings_post_nothing_and_say_to_post_as_a_bot() {
     let dir = tempfile::tempdir().unwrap();
     setup(dir.path(), json!([]));
     fs::write(dir.path().join("own"), "").unwrap();
-    let out = post(dir.path(), &[]);
-    assert_eq!(out["posted"], true);
-    assert_eq!(out["event"], "REQUEST_CHANGES");
-    let sent = sent(dir.path());
-    assert_eq!(sent["event"], "COMMENT");
-    let key = lens::pr::key("src/a.rs", "new() panics");
-    assert!(sent["body"].as_str().unwrap().contains(&key));
+    let report = dir.path().join("pr-7.json");
+    let diff = dir.path().join("diff.patch");
+    let out = lens(
+        dir.path(),
+        &[
+            "pr",
+            "post",
+            "--pr",
+            "7",
+            "--report",
+            report.to_str().unwrap(),
+            "--diff",
+            diff.to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("nothing was posted"), "{err}");
+    assert!(err.contains("post_as = \"bot\""), "{err}");
+    assert!(!dir.path().join("posted.json").exists());
 }
 
 #[test]
