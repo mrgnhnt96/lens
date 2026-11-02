@@ -3,13 +3,15 @@
 //! tools its role needs, and the 5-minute prompt cache. Every agent of a pass shares one system
 //! prompt that holds the change itself; its role's instructions come in its first message. Agents
 //! with the same model and tools then send the same cached prefix, so the first one's request
-//! caches it and the rest read it at a tenth of the price: a batch starts one agent per (model,
-//! tools) group and holds the rest of that group until its first response.
+//! caches it and the rest read it at a tenth of the price: every batch starts one agent per (model,
+//! tools) group and holds the rest of that group until its first response. It does so even when
+//! the group ran a moment ago: the API's cache is best-effort, and a miss then costs one cache
+//! write instead of one per agent that started at once.
 //!
 //! When the plan turns an agent away (a `rate_limit_event` whose status is `rejected`), no agent
 //! starts again until that window resets, in this lens or any other: see [`Gate`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -98,15 +100,10 @@ pub struct Runner {
     pub timeout: Duration,
     /// Where each agent's reply is saved, as `<label>.md`.
     pub log_dir: PathBuf,
-    /// When each cache group last sent a request, so a later batch knows its prefix is cached.
-    pub cached: Arc<Mutex<HashMap<String, Instant>>>,
     /// Where each agent's tokens and the plan's window readings are recorded, if anywhere.
     pub usage: Option<usage::Log>,
     pub gate: Gate,
 }
-
-/// How long after a group's last request its prefix counts as cached: under the 5-minute TTL.
-const CACHED_FOR: Duration = Duration::from_secs(4 * 60);
 
 /// How long to hold agents when a rejected reading gives no reset time still ahead.
 const HOLD_WITHOUT_RESET: u64 = 5 * 60;
@@ -292,16 +289,18 @@ impl Runner {
         }
     }
 
-    /// Runs every agent, at most `parallel` at once, and returns their outcomes in order. In a
-    /// group whose prefix isn't cached yet, the first agent runs alone until its first response,
-    /// so the rest of the group finds it cached.
+    /// Runs every agent, at most `parallel` at once, and returns their outcomes in order. In each
+    /// group the first agent runs alone until its first response, so the rest of the group finds
+    /// the prefix cached.
     pub fn run_all(&self, specs: Vec<Spec>) -> Vec<Outcome> {
         let n = specs.len();
         let mut out: Vec<Option<Outcome>> = vec![None; n];
         let groups: Vec<String> = specs.iter().map(group).collect();
         let mut queue: Vec<Option<Spec>> = specs.into_iter().map(Some).collect();
-        // Groups whose first agent is running and hasn't had a response yet.
+        // Groups whose first agent is running and hasn't had a response yet, and groups that have
+        // started one.
         let mut warming: HashSet<String> = HashSet::new();
+        let mut started: HashSet<String> = HashSet::new();
         let (tx, rx) = mpsc::channel();
         let mut running = 0;
         loop {
@@ -320,7 +319,7 @@ impl Runner {
                 if queue[i].is_none() || warming.contains(&groups[i]) {
                     continue;
                 }
-                if !self.is_cached(&groups[i]) {
+                if started.insert(groups[i].clone()) {
                     warming.insert(groups[i].clone());
                 }
                 self.spawn(i, queue[i].take().unwrap(), tx.clone());
@@ -345,14 +344,6 @@ impl Runner {
         out.into_iter().map(Option::unwrap_or_default).collect()
     }
 
-    fn is_cached(&self, group: &str) -> bool {
-        self.cached
-            .lock()
-            .unwrap()
-            .get(group)
-            .is_some_and(|t| t.elapsed() < CACHED_FOR)
-    }
-
     fn spawn(&self, i: usize, spec: Spec, tx: mpsc::Sender<Event>) {
         let runner = self.clone();
         thread::spawn(move || {
@@ -374,7 +365,6 @@ impl Runner {
         if let Some(full) = self.gate.full(now_secs()) {
             return Ok(refused(spec, full));
         }
-        let group = group(spec);
         let started_at = iso_now();
         let mut child = Command::new(&self.claude)
             .args(self.args(spec))
@@ -419,11 +409,6 @@ impl Runner {
                     };
                     match event["type"].as_str() {
                         Some("assistant") => {
-                            // Every request reads the prefix again, which keeps it cached.
-                            self.cached
-                                .lock()
-                                .unwrap()
-                                .insert(group.clone(), Instant::now());
                             if first_usage.is_none() {
                                 let usage = &event["message"]["usage"];
                                 first_usage = Some((
@@ -636,7 +621,6 @@ mod tests {
             parallel: 4,
             timeout: Duration::from_secs(60),
             log_dir: "/tmp".into(),
-            cached: Default::default(),
             usage: None,
             gate: Gate::default(),
         }
@@ -691,7 +675,7 @@ mod tests {
 
     /// Runs `specs` (labelled by their prompt) through a fake claude that logs when each agent
     /// starts and when it answers, and returns that log.
-    fn batch(cached: &[(&Spec, Instant)], specs: Vec<Spec>) -> Vec<String> {
+    fn batch(specs: Vec<Spec>) -> Vec<String> {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
@@ -718,9 +702,6 @@ echo '{{"type":"result","result":"ok"}}'
             log_dir: dir.path().into(),
             ..runner()
         };
-        for (spec, at) in cached {
-            runner.cached.lock().unwrap().insert(group(spec), *at);
-        }
         let specs = specs
             .into_iter()
             .map(|s| Spec {
@@ -752,15 +733,12 @@ echo '{{"type":"result","result":"ok"}}'
     }
 
     #[test]
-    fn a_cold_group_starts_one_agent_and_holds_the_rest_until_it_answers() {
-        let log = batch(
-            &[],
-            vec![
-                labelled("a1", "opus"),
-                labelled("a2", "opus"),
-                labelled("b", "sonnet"),
-            ],
-        );
+    fn a_group_starts_one_agent_and_holds_the_rest_until_it_answers() {
+        let log = batch(vec![
+            labelled("a1", "opus"),
+            labelled("a2", "opus"),
+            labelled("b", "sonnet"),
+        ]);
         assert!(at(&log, "start a2") > at(&log, "first a1"), "{log:?}");
         // Another group doesn't wait for it.
         assert!(at(&log, "start b") < at(&log, "first a1"), "{log:?}");
@@ -1072,18 +1050,5 @@ echo '{{"type":"result","result":"ok","total_cost_usd":0.01}}'
         for o in outcomes {
             assert_eq!((o.error, o.full), (None, None));
         }
-    }
-
-    #[test]
-    fn a_cached_group_starts_together_and_an_expired_one_is_held_again() {
-        let (a1, a2) = (labelled("a1", "opus"), labelled("a2", "opus"));
-        let log = batch(&[(&a1, Instant::now())], vec![a1.clone(), a2.clone()]);
-        assert!(at(&log, "start a2") < at(&log, "first a1"), "{log:?}");
-
-        let Some(expired) = Instant::now().checked_sub(CACHED_FOR + Duration::from_secs(1)) else {
-            return;
-        };
-        let log = batch(&[(&a1, expired)], vec![a1.clone(), a2]);
-        assert!(at(&log, "start a2") > at(&log, "first a1"), "{log:?}");
     }
 }

@@ -88,11 +88,13 @@ one replaced.
   and `cacheReadInputTokens` are the usage of its first request, which is where the change gets
   cached: every agent of a pass shares one system prompt (a short preamble plus the diff, change
   map, task and guideline files) and gets its role's instructions as its first message, so agents
-  with the same model and tools share one cached prefix. A pass starts one agent per (model,
-  tools) group first and holds the rest of the group until it answers; after that, the group's
+  with the same model and tools share one cached prefix. Every batch starts one agent per (model,
+  tools) group first and holds the rest of the group until it answers, even when the group ran a
+  moment ago, so a cache miss costs one write rather than one per agent; after that, the group's
   first agent shows the change under creation and every other one under read, with only its role
   prompt (a few hundred tokens) as creation. A large creation on a later agent means the cache
-  missed: the prompt changed between them, or more than 5 minutes passed.
+  missed: the prompt changed between them, more than 5 minutes passed, or the API didn't have it
+  (its cache is best-effort).
 - `totals`: `agents` (how many sessions ran), `costUsd`, and the two cache fields summed over
   `agents`. The top-level `costUsd` is the same total, kept for older readers.
 - `findings`: blocker and major only, every one confirmed by a verifier. `severity` is the
