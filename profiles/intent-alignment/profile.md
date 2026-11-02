@@ -24,9 +24,8 @@ Evaluate:
   cite the criterion text and what's missing.
 - **Design conformance**: where a design doc specifies a mechanism (data flow, naming,
   protocol, storage shape), does the implementation follow it? Deviations are findings —
-  note whether the deviation looks deliberate (suggest saying so in the PR description) or accidental.
-- **Scope creep**: substantial changes in the diff that the ticket doesn't ask for and the PR
-  description doesn't explain. Don't flag mechanical drive-bys (formatting, small renames); flag
+  note whether the deviation looks deliberate or accidental.
+- **Scope creep**: substantial changes in the diff that the ticket doesn't ask for. Don't flag mechanical drive-bys (formatting, small renames); flag
   behavior changes hitchhiking on an unrelated ticket.
 - **Ticket-says-X-code-does-Y**: contradictions between the described approach and the
   implementation — these often reveal an outdated ticket OR a misread requirement; raise

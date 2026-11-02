@@ -198,14 +198,14 @@ The format is the same, except:
 - `findings` holds every confirmed finding, `minor` and `nit` included; `dropped` only the
   unverified ones. Every profile lens picked is listed in `profiles`.
 
-`lens pr post` reads the report and posts it; it uses `pr.url`, `head`, `base`, `risk`,
-`assessment`, `profiles`, `findings` and the length of `dropped`, and ignores the rest. It posts
-only `blocker` and `major` findings; `minor` and `nit` are counted in the review's first line
-(`· 2 minor/nit left out`) and not shown. `[pr] comments` in `.lens.toml` picks where the posted
+`lens pr post` reads the report and posts it; it uses `pr.url`, `head` and `findings`, and
+ignores the rest. It posts `blocker`, `major` and `minor` findings; `nit`s are counted in the
+review's first line (`· 2 nit left out`) and not shown. An agent reads the post, so it holds
+nothing but the findings: no impact assessment, no list of reviewers, no verifier trace. `[pr] comments` in `.lens.toml` picks where the posted
 ones go:
 
 - `single` (the default): the review has no inline comments. Each new finding is listed in its
-  body with its severity, title, `file:line` and failure scenario, and how it fails folded away.
+  body as `**<severity>** · <title> · <file:line>`, then its failure scenario.
   The `file:line` links to the line in the PR's diff (`<pr.url>/files#diff-<sha256 of the
   path>R<line>`) when the diff shows it, else to the file at `head`; without `pr.url` it's plain
   text.
@@ -226,6 +226,5 @@ order: `DELETE …/pullrequests/<n>/approve` or `…/request-changes` (the oppos
 404 or 409 means there was none), `POST` the verdict (a 409 means it's already given; any other
 failure stops before a comment goes up), a `POST …/comments` with `inline: {path, to}` for each
 inline finding, and last the summary `POST …/comments`, the review body, whose marker records the
-review. How it fails isn't folded away there (Bitbucket has no `<details>`): it follows under a
-bold heading. `file:line` links go to the file at `head` (`<repo>/src/<head>/<file>#lines-<n>`),
+review. `file:line` links go to the file at `head` (`<repo>/src/<head>/<file>#lines-<n>`),
 on the diff or not.

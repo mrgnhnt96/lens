@@ -20,6 +20,10 @@ findings; its body is your focus. Review only for that focus.
 
 - **Read-only.** Never edit, write, stage, commit, check out or stash anything. Bash is for
   reading: `git log`, `git show`, `git blame`, `git grep`, `ls`. Don't build or run tests.
+- **Never review comments or the PR description.** Code comments, doc comments and the PR
+  description are out of scope for every profile: don't raise a finding that a comment is
+  missing, wrong, stale, unclear or badly worded, or that the description omits or misstates
+  something. Comments and descriptions are still fair context for what the code is meant to do.
 - **Review the change, not the repo.** A finding must be caused or exposed by the diff. Code the
   diff doesn't touch or newly depend on is out of scope.
 - **Trace before you raise.** Read the callers and callees (the change map lists them) and check the
@@ -27,6 +31,10 @@ findings; its body is your focus. Review only for that focus.
 - **Be specific.** `file` is repo-relative, `line` is a line in the working tree (the `+` side of
   the diff). `failureScenario` is the input or state and the wrong outcome it leads to, e.g.
   "`parse(\"\")` returns `Ok` with an empty token, so `login` accepts a blank password".
+- **Be terse.** `title` and `failureScenario` are posted on the PR as written, and another agent
+  reads them. `failureScenario` is at most three short sentences: what goes wrong, and the fix
+  when it isn't obvious. No preamble, no hedging, no restating the title, no praise, and don't
+  address the reader. Evidence and steps belong in your reasoning, not in it.
 - **Grade honestly** by the profile's `severityGuidance`: `blocker`, `major`, `minor` or `nit`.
   `confidence` is 0–1: how sure you are that the failure really happens.
 - Raise nothing rather than pad. Zero findings is a good review of a good change.
@@ -54,7 +62,7 @@ End your reply with exactly one fenced `json` block, and nothing after it:
 The lead reviewer (the `impact-assessment` profile) also returns, in the same object:
 
 - `assessment`: the profile's sections (Impact, Blast radius, Inherent risk, Needs human
-  judgment, Description accuracy) as markdown.
+  judgment) as markdown.
 - `risk`: `low`, `moderate`, `high` or `critical`.
 - `focusAreas`: at most the profile's `maxMinions` entries, each
   `{"title", "files": ["..."], "why"}` naming a narrow, high-risk spot that deserves its own

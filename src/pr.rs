@@ -1,8 +1,9 @@
 //! What the PR pass posts, whatever the forge: reading the markers earlier lens runs left on a
-//! PR, and planning one review of the verified blocker and major findings. Reading and posting
+//! PR, and planning one review of the verified blocker, major and minor findings. Reading and posting
 //! go through [`crate::forge`]. `[pr] comments` picks where they
 //! go: all in the review's post (`single`, the default) or inline on the lines the diff shows.
-//! Minor and nit findings are never posted; the review says how many it left out.
+//! Nits are never posted; the review says how many it left out. The post is terse: an agent
+//! reads it, so it holds the findings and nothing else.
 //!
 //! A review is never just comments: it requests changes while a blocker or major is unfixed and
 //! approves otherwise.
@@ -37,13 +38,12 @@ fn has_mark(body: &str, marks: &[&str]) -> bool {
     marks.iter().any(|m| body.contains(m))
 }
 
-/// How a forge renders what lens posts: its hidden markers, folded sections and file links.
+/// How a forge renders what lens posts: its hidden markers and file links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Markup {
-    /// HTML-comment markers, `<details>` folds, links into the PR's diff.
+    /// HTML-comment markers, links into the PR's diff.
     GitHub,
-    /// `[//]: # (lens:…)` markers on their own line, bold headings for folds (Bitbucket renders
-    /// no `<details>`), links to the file at the reviewed commit.
+    /// `[//]: # (lens:…)` markers on their own line, links to the file at the reviewed commit.
     Bitbucket,
 }
 
@@ -59,15 +59,6 @@ impl Markup {
         match self {
             Markup::GitHub => format!("{REVIEW_MARK} head={head} verdict={event} -->"),
             Markup::Bitbucket => format!("{} head={head} verdict={event})", REVIEW_MARKS[1]),
-        }
-    }
-
-    fn fold(self, title: &str, text: &str) -> String {
-        match self {
-            Markup::GitHub => {
-                format!("<details><summary>{title}</summary>\n\n{text}\n\n</details>\n\n")
-            }
-            Markup::Bitbucket => format!("**{title}**\n\n{text}\n\n"),
         }
     }
 }
@@ -131,14 +122,15 @@ impl Finding {
         key(&self.file, &self.title)
     }
 
-    /// A minor or nit: never posted, and never blocks.
+    /// A nit: never posted, and never blocks.
     fn left_out(&self) -> bool {
-        matches!(self.severity.as_str(), "minor" | "nit")
+        self.severity == "nit"
     }
 
     /// A blocker or major the fix loop hasn't fixed: the PR can't merge with it.
     fn blocking(&self) -> bool {
-        !self.left_out() && self.fix.as_ref().is_none_or(|f| f["status"] != "resolved")
+        matches!(self.severity.as_str(), "blocker" | "major")
+            && self.fix.as_ref().is_none_or(|f| f["status"] != "resolved")
     }
 }
 
@@ -457,32 +449,22 @@ pub fn plan(
     }
 }
 
-fn by(f: &Finding) -> String {
-    if f.profiles.is_empty() {
-        String::new()
-    } else {
-        format!(" · _{}_", f.profiles.join(", "))
-    }
-}
-
 pub fn comment_body(f: &Finding, key: &str, markup: Markup) -> String {
     finding_text(f, key, None, markup)
 }
 
 /// A finding as lens posts it: severity and title, where it is when that isn't the comment's own
-/// line, the failure scenario, how it fails folded away, and its marker.
+/// line, the failure scenario and its marker. Nothing else: the verifier's trace stays in the
+/// report.
 fn finding_text(f: &Finding, key: &str, location: Option<&str>, markup: Markup) -> String {
-    let mut s = format!("**{}** · {}{}\n\n", f.severity, f.title, by(f));
+    let mut s = format!("**{}** · {}", f.severity, f.title);
     if let Some(at) = location {
-        s.push_str(&format!("{at}\n\n"));
+        s.push_str(&format!(" · {at}"));
     }
+    s.push_str("\n\n");
     if !f.failure_scenario.is_empty() {
-        s.push_str(&f.failure_scenario);
+        s.push_str(f.failure_scenario.trim());
         s.push_str("\n\n");
-    }
-    let how = f.how_it_fails.as_deref().unwrap_or("").trim();
-    if !how.is_empty() {
-        s.push_str(&markup.fold("How it fails", how));
     }
     s.push_str(&markup.finding_mark(key));
     s
@@ -554,83 +536,31 @@ pub struct BodyParts<'a> {
 pub fn review_body(report: &Report, parts: &BodyParts, event: &str) -> String {
     let posted: Vec<&Finding> = report.findings.iter().filter(|f| !f.left_out()).collect();
     let n = posted.len();
-    let mut s = format!(
-        "### lens review · {n} finding{}",
-        if n == 1 { "" } else { "s" }
-    );
+    let mut s = format!("### lens · {n} finding{}", if n == 1 { "" } else { "s" });
     if n > 0 {
         s.push_str(&format!(" ({})", counts(&posted)));
     }
     if parts.left_out > 0 {
-        s.push_str(&format!(" · {} minor/nit left out", parts.left_out));
-    }
-    if let Some(risk) = &report.risk {
-        s.push_str(&format!(" · risk {risk}"));
+        s.push_str(&format!(" · {} nit left out", parts.left_out));
     }
     s.push_str("\n\n");
-    let short = &report.head[..report.head.len().min(7)];
-    if report.base.is_empty() {
-        s.push_str(&format!("Reviewed `{short}`."));
-    } else {
-        s.push_str(&format!("Reviewed `{short}` against `{}`.", report.base));
-    }
-    s.push_str(" Every finding was confirmed by a verifier that traced the failure; only blockers and majors are posted.\n\n");
     if parts.skipped > 0 {
         s.push_str(&format!(
-            "{} of them already posted on an earlier run, not repeated.\n\n",
+            "{} already posted on an earlier run.\n\n",
             parts.skipped
         ));
     }
     if !parts.findings.is_empty() {
-        s.push_str(match parts.mode {
-            Comments::Single => "Findings:\n\n",
-            Comments::Inline => "Findings on lines outside the diff:\n\n",
-        });
+        if parts.mode == Comments::Inline {
+            s.push_str("Outside the diff:\n\n");
+        }
         for b in parts.findings {
             let at = location(report, b.finding, b.on_diff, parts.markup);
             s.push_str(&finding_text(b.finding, &b.key, Some(&at), parts.markup));
             s.push_str("\n\n");
         }
     }
-    if let Some(a) = report
-        .assessment
-        .as_deref()
-        .filter(|a| !a.trim().is_empty())
-    {
-        s.push_str(&parts.markup.fold("Impact assessment", a.trim()));
-    }
-    let ran: Vec<&str> = report
-        .profiles
-        .iter()
-        .filter(|p| p.ran)
-        .map(|p| p.name.as_str())
-        .collect();
-    let skipped_profiles: Vec<String> = report
-        .profiles
-        .iter()
-        .filter(|p| !p.ran)
-        .map(|p| match &p.reason {
-            Some(r) => format!("{} ({r})", p.name),
-            None => p.name.clone(),
-        })
-        .collect();
-    if !ran.is_empty() {
-        s.push_str(&format!("Ran: {}.", ran.join(", ")));
-        if !skipped_profiles.is_empty() {
-            s.push_str(&format!(" Skipped: {}.", skipped_profiles.join(", ")));
-        }
-        s.push(' ');
-    }
-    if !report.dropped.is_empty() {
-        s.push_str(&format!(
-            "Dropped {} the verifier couldn't show failing.",
-            report.dropped.len()
-        ));
-    }
-    s.push_str(&format!(
-        "\n\n{}",
-        parts.markup.review_mark(&report.head, event)
-    ));
+    s.push_str(&parts.markup.review_mark(&report.head, event));
     s
 }
 
@@ -781,21 +711,23 @@ diff --git a/gone.rs b/gone.rs
             Comments::Single,
         );
         assert!(p.inline.is_empty());
-        assert_eq!(p.in_body, vec!["F1", "F2"]);
-        assert_eq!(p.left_out, vec!["F3", "F4"]);
+        assert_eq!(p.in_body, vec!["F1", "F2", "F4"]);
+        assert_eq!(p.left_out, vec!["F3"]);
         let review = p.review.map(github).unwrap();
         assert_eq!(review["commit_id"], "abcdef1234");
         assert_eq!(review["event"], "REQUEST_CHANGES");
         assert!(review["comments"].as_array().unwrap().is_empty());
         let body = review["body"].as_str().unwrap();
         assert!(
-            body.contains("2 findings (1 blocker, 1 major) · 2 minor/nit left out · risk low"),
+            body.starts_with(
+                "### lens · 3 findings (1 blocker, 1 major, 1 minor) · 1 nit left out\n\n"
+            ),
             "{body}"
         );
         let anchor = hex(&Sha256::digest(b"src/a.rs"));
         assert!(
             body.contains(&format!(
-                "**blocker** · breaks · _correctness_\n\n[`src/a.rs:2`]({PR_URL}/files#diff-{anchor}R2)\n\nx happens"
+                "**blocker** · breaks · [`src/a.rs:2`]({PR_URL}/files#diff-{anchor}R2)\n\nx happens\n\n<!--"
             )),
             "{body}"
         );
@@ -808,8 +740,19 @@ diff --git a/gone.rs b/gone.rs
             "{FINDING_MARK}{} -->",
             key("src/a.rs", "far away")
         )));
-        assert!(!body.contains("tiny") && !body.contains("edge"), "{body}");
-        assert!(body.contains("<!-- lens:review head=abcdef1234 verdict=REQUEST_CHANGES -->"));
+        assert!(body.contains("**minor** · edge"), "{body}");
+        assert!(!body.contains("tiny"), "{body}");
+        for fluff in [
+            "Impact assessment",
+            "Ran:",
+            "Dropped",
+            "Reviewed",
+            "How it fails",
+            "risk",
+        ] {
+            assert!(!body.contains(fluff), "{fluff} in {body}");
+        }
+        assert!(body.ends_with("<!-- lens:review head=abcdef1234 verdict=REQUEST_CHANGES -->"));
     }
 
     #[test]
@@ -820,23 +763,20 @@ diff --git a/gone.rs b/gone.rs
             &commentable(PATCH),
             Comments::Inline,
         );
-        assert_eq!(p.inline, vec!["F1"]);
+        assert_eq!(p.inline, vec!["F1", "F4"]);
         assert_eq!(p.in_body, vec!["F2"]);
-        assert_eq!(p.left_out, vec!["F3", "F4"]);
+        assert_eq!(p.left_out, vec!["F3"]);
         let review = p.review.map(github).unwrap();
         assert_eq!(review["event"], "REQUEST_CHANGES");
         let comments = review["comments"].as_array().unwrap();
-        assert_eq!(comments.len(), 1);
+        assert_eq!(comments.len(), 2);
         assert_eq!(comments[0]["line"], 2);
         assert_eq!(comments[0]["side"], "RIGHT");
         let body = review["body"].as_str().unwrap();
-        assert!(
-            body.contains("Findings on lines outside the diff:"),
-            "{body}"
-        );
+        assert!(body.contains("Outside the diff:"), "{body}");
         assert!(body.contains(&key("src/a.rs", "far away")));
         assert!(!body.contains(&key("src/a.rs", "breaks")));
-        assert!(body.contains("2 minor/nit left out"), "{body}");
+        assert!(body.contains("1 nit left out"), "{body}");
     }
 
     #[test]
@@ -853,7 +793,10 @@ diff --git a/gone.rs b/gone.rs
             .as_str()
             .unwrap()
             .to_string();
-        assert!(body.contains("\n\n`src/a.rs:2`\n\n"), "{body}");
+        assert!(
+            body.contains("**blocker** · breaks · `src/a.rs:2`\n\n"),
+            "{body}"
+        );
         assert!(!body.contains("]("), "{body}");
     }
 
@@ -917,14 +860,14 @@ diff --git a/gone.rs b/gone.rs
                 assert_eq!(earlier.verdict.as_deref(), Some("REQUEST_CHANGES"));
                 let again = plan(&sample(), &earlier, &lines, second);
                 let skipped: Vec<&str> = again.skipped.iter().map(|s| s.id.as_str()).collect();
-                assert_eq!(skipped, vec!["F1", "F2"], "{first:?} then {second:?}");
+                assert_eq!(skipped, vec!["F1", "F2", "F4"], "{first:?} then {second:?}");
                 assert!(again.review.is_none(), "{first:?} then {second:?}");
             }
         }
     }
 
     #[test]
-    fn minors_and_nits_are_left_out_and_approve() {
+    fn minors_are_posted_but_approve_and_nits_are_left_out() {
         let r = report(vec![
             finding("F1", "src/a.rs", 2, "minor", "edge"),
             finding("F2", "src/a.rs", 3, "nit", "tiny"),
@@ -932,16 +875,15 @@ diff --git a/gone.rs b/gone.rs
         for mode in [Comments::Single, Comments::Inline] {
             let p = plan(&r, &Earlier::default(), &commentable(PATCH), mode);
             assert_eq!(p.event, "APPROVE");
-            assert!(p.inline.is_empty() && p.in_body.is_empty());
-            assert_eq!(p.left_out, vec!["F1", "F2"]);
+            assert_eq!([p.inline.clone(), p.in_body.clone()].concat(), vec!["F1"]);
+            assert_eq!(p.left_out, vec!["F2"]);
             let review = p.review.map(github).unwrap();
-            assert!(review["comments"].as_array().unwrap().is_empty());
             let body = review["body"].as_str().unwrap();
             assert!(
-                body.starts_with("### lens review · 0 findings · 2 minor/nit left out"),
+                body.starts_with("### lens · 1 finding (1 minor) · 1 nit left out"),
                 "{body}"
             );
-            assert!(!body.contains(FINDING_MARK), "{body}");
+            assert!(!body.contains("tiny"), "{body}");
         }
     }
 
@@ -1038,14 +980,12 @@ diff --git a/gone.rs b/gone.rs
     }
 
     #[test]
-    fn blocker_comments_lead_with_severity_and_hide_the_trace() {
+    fn a_comment_is_severity_title_and_scenario_without_the_trace() {
         let f = finding("F1", "a.rs", 1, "blocker", "breaks");
         let b = comment_body(&f, "k", Markup::GitHub);
-        assert!(
-            b.starts_with("**blocker** · breaks · _correctness_\n\nx happens"),
-            "{b}"
+        assert_eq!(
+            b,
+            "**blocker** · breaks\n\nx happens\n\n<!-- lens:finding key=k -->"
         );
-        assert!(b.contains("<details><summary>How it fails</summary>\n\n1. step"));
-        assert!(b.ends_with("<!-- lens:finding key=k -->"));
     }
 }

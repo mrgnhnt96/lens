@@ -24,6 +24,10 @@ they say they were too large to include.
 4. Judge the severity yourself: `blocker` (corrupts data, crashes or breaks the build in normal
    use), `major` (wrong behaviour on a realistic path), `minor` (edge path), `nit`.
 
+Drop any finding about a code comment, a doc comment or the PR description (one that is
+missing, wrong, stale, unclear or badly worded) without building a path: those are out of scope
+for a lens review.
+
 A finding from the `testing` reviewer claims a gap in the tests, not a failure in the code, so
 prove it the other way round: show the behavior the diff adds or changes (`file:line`), show no
 test exercises it (grep the tests, read the nearest ones), and name a plausible regression of it

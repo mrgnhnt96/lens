@@ -1737,7 +1737,7 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         );
         let left_out = match plan.left_out.len() {
             0 => String::new(),
-            n => format!("; {n} minor/nit left out"),
+            n => format!("; {n} nit left out"),
         };
         let url = match (&plan.review, pass.opts.dry_run) {
             (Some(review), false) => forge.post(number, review)?,

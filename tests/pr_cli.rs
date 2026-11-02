@@ -60,7 +60,7 @@ fn setup(dir: &Path, comments: Value) {
              "severity": "major", "title": "new() panics", "failureScenario": "a() panics",
              "howItFails": "1. a() calls new()"},
             {"id": "F2", "profiles": ["naming-intuitivity"], "file": "src/b.rs", "line": 9,
-             "severity": "minor", "title": "misleading name", "failureScenario": "reader thinks x"}
+             "severity": "nit", "title": "misleading name", "failureScenario": "reader thinks x"}
         ],
         "dropped": []
     });
@@ -130,7 +130,7 @@ fn posts_one_review_with_every_finding_in_its_body_by_default() {
         body.contains("[`src/a.rs:2`](https://github.test/o/r/pull/7/files#diff-"),
         "{body}"
     );
-    assert!(body.contains("1 minor/nit left out"), "{body}");
+    assert!(body.contains("1 nit left out"), "{body}");
     assert!(!body.contains("misleading name"), "{body}");
     assert_eq!(fs::read_to_string(dir.path().join("token")).unwrap(), "");
 }
@@ -176,7 +176,7 @@ fn skips_findings_an_earlier_run_posted() {
     assert!(out["payload"]["body"]
         .as_str()
         .unwrap()
-        .contains("1 of them already posted"));
+        .contains("1 already posted on an earlier run"));
 
     let out = lens(dir.path(), &["pr", "earlier", "--pr", "7"]);
     assert!(out.status.success());

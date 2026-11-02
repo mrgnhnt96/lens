@@ -4,8 +4,8 @@ Agent code review in one binary. Fresh-context reviewers look at a change in par
 verifier drops anything it can't show failing, and only real problems reach you.
 
 - **Local pass** (`lens review`): a few minutes, before you open a PR.
-- **PR pass** (`lens review --pr <n>`): posts its verified blockers and majors on the PR as one
-  review that approves or requests changes.
+- **PR pass** (`lens review --pr <n>`): posts its verified blockers, majors and minors on the PR
+  as one terse review that approves or requests changes.
 
 `lens review` runs the whole pass itself; no model orchestrates it. Each reviewer and
 verifier is its own headless `claude -p`, started as lean as a review allows (see below), so a
@@ -179,8 +179,9 @@ The PR pass's forge side: GitHub through `gh`, or Bitbucket Cloud through its AP
 title, body, base and head branch, head commit) and fetches its head to `refs/lens/pr/<n>`; `--out <dir>` also writes `pr.json` and `intent.md` there, and each
 `--field <name>` prints just that value on its own line. `lens pr earlier --pr <n>` lists the lens findings already posted on the
 PR, in the review's post or inline. `lens pr post --pr <n> --report <file> --diff <patch>` posts a report as one review at the reviewed commit.
-Only blocker and major findings are posted: minor and nit findings never are, and never block; the
-review says how many it left out. By default every new finding goes in the review's post, each
+Blocker, major and minor findings are posted; nits never are, and minors and nits never block. The
+review says how many nits it left out. The post is written for an agent: the findings and nothing
+else. By default every new finding goes in the review's post, each
 with its severity, title, `file:line` linked to that line in the PR's diff, and failure scenario;
 with `comments = "inline"` a finding on a line the diff shows is a comment on that line instead,
 and the rest go in the post. A review is never just comments: it requests changes while a blocker

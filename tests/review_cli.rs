@@ -690,7 +690,7 @@ fn the_pr_pass_runs_the_lead_and_its_focus_areas_and_posts() {
     );
     let posted: Value =
         serde_json::from_str(&fs::read_to_string(fake.join("posted.json")).unwrap()).unwrap();
-    // One post by default: every blocker and major in the body, no inline comments.
+    // One post by default: every blocker, major and minor in the body, no inline comments.
     assert!(posted["comments"].as_array().unwrap().is_empty());
     assert!(posted["body"]
         .as_str()
