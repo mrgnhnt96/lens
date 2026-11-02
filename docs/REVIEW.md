@@ -198,8 +198,23 @@ The format is the same, except:
 - `findings` holds every confirmed finding, `minor` and `nit` included; `dropped` only the
   unverified ones. Every profile lens picked is listed in `profiles`.
 
-`lens pr post` reads the report and posts it; it uses `head`, `base`, `risk`, `assessment`,
-`profiles`, `findings` and the length of `dropped`, and ignores the rest. Each posted comment
-ends with `<!-- lens:finding key=<hash of file and title> -->` and the review body with
-`<!-- lens:review head=<sha> verdict=<APPROVE|REQUEST_CHANGES> -->`, which is how later runs find
-what's already there and the verdict they last gave.
+`lens pr post` reads the report and posts it; it uses `pr.url`, `head`, `base`, `risk`,
+`assessment`, `profiles`, `findings` and the length of `dropped`, and ignores the rest. It posts
+only `blocker` and `major` findings; `minor` and `nit` are counted in the review's first line
+(`· 2 minor/nit left out`) and not shown. `[pr] comments` in `.lens.toml` picks where the posted
+ones go:
+
+- `single` (the default): the review has no inline comments. Each new finding is listed in its
+  body with its severity, title, `file:line` and failure scenario, and how it fails folded away.
+  The `file:line` links to the line in the PR's diff (`<pr.url>/files#diff-<sha256 of the
+  path>R<line>`) when the diff shows it, else to the file at `head`; without `pr.url` it's plain
+  text.
+- `inline`: a finding on a line the diff shows is an inline comment on that line; the rest are
+  listed in the body as in `single`.
+
+Each posted finding, inline or in the body, ends with `<!-- lens:finding key=<hash of file and
+title> -->` and the review body with `<!-- lens:review head=<sha>
+verdict=<APPROVE|REQUEST_CHANGES> -->`, which is how later runs find what's already there and the
+verdict they last gave. A finding is already there when an earlier one has its key (in a body or
+inline) or was commented inline in the same file within 3 lines, so a rerun skips it whichever
+mode either run used. The pre-PR protocol review is unaffected: it keeps every severity.

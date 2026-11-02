@@ -142,6 +142,19 @@ pub struct PrConfig {
     /// The environment variable holding the bot's token, for `post_as = "bot"`.
     /// Defaults to `LENS_BOT_TOKEN`.
     pub bot_token_env: Option<String>,
+    /// Where a review's findings go: all in its one post, or inline on the diff.
+    #[serde(default)]
+    pub comments: Comments,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Comments {
+    /// Every finding in the review's own post, each linked to its line in the PR's diff.
+    #[default]
+    Single,
+    /// A comment on each finding's line where the diff shows it; the rest in the review's post.
+    Inline,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -160,6 +173,7 @@ impl Default for PrConfig {
             sample: Self::default_sample(),
             post_as: PostAs::default(),
             bot_token_env: None,
+            comments: Comments::default(),
         }
     }
 }
@@ -259,6 +273,17 @@ mod tests {
         assert_eq!(c.pr.post_as, PostAs::Bot);
         assert_eq!(c.pr.bot_token_env(), "REVIEW_BOT");
         assert!(toml::from_str::<Config>("[pr]\npost_as = \"me\"\n").is_err());
+    }
+
+    #[test]
+    fn pr_comments_are_one_post_unless_set_to_inline() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.pr.comments, Comments::Single);
+        let c: Config = toml::from_str("[pr]\ncomments = \"inline\"\n").unwrap();
+        assert_eq!(c.pr.comments, Comments::Inline);
+        let c: Config = toml::from_str("[pr]\ncomments = \"single\"\n").unwrap();
+        assert_eq!(c.pr.comments, Comments::Single);
+        assert!(toml::from_str::<Config>("[pr]\ncomments = \"threads\"\n").is_err());
     }
 
     #[test]
