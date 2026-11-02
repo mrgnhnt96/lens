@@ -901,7 +901,7 @@ diff --git a/src/a.rs b/src/a.rs
             .as_str()
             .unwrap()
             .to_string();
-        assert!(raw.starts_with("### lens review"), "{raw}");
+        assert!(raw.starts_with("### lens · 0 findings"), "{raw}");
         assert!(
             raw.ends_with("[//]: # (lens:review head=abcdef1234 verdict=APPROVE)"),
             "{raw}"

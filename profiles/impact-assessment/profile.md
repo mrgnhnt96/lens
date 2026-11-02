@@ -2,12 +2,11 @@
 name: impact-assessment
 model: sonnet
 effort: high
-description: Lead assessment — impact, blast radius, inherent risk, areas needing human judgment, and whether the PR description conveys them. Runs first; its output guides the other reviewers and dispatches targeted minion reviews for the riskiest areas.
+description: Lead assessment — impact, blast radius, inherent risk, and areas needing human judgment. Runs first; its output guides the other reviewers and dispatches targeted minion reviews for the riskiest areas.
 dispatch: true
 maxMinions: 1
 severityGuidance: >
-  This profile mainly produces the assessment summary. Raise findings ONLY for: a PR
-  description that materially misrepresents or omits the change's risk/impact (major), or a
+  This profile mainly produces the assessment summary. Raise findings ONLY for a
   high-risk area that no test or reviewer attention covers (major/minor). Don't restate the
   assessment as findings.
 enabled: true
@@ -37,10 +36,6 @@ auth, or user data. Rate overall risk (low / moderate / high / critical) and say
 is most valuable: subtle trade-offs, product/UX decisions, ambiguous requirements,
 irreversible choices, places where "correct" depends on intent the code can't reveal.
 Be specific (file:area), not generic.
-
-**Description accuracy** — Does the PR description (and linked ticket) accurately convey
-the impact, blast radius, and risk above? Note anything the description omits, understates,
-or misstates — reviewers and the author both rely on it being honest.
 
 Keep it tight and scannable — this is the map the other reviewers and the human will read
 first, not an essay. Then, only if warranted per the severity guidance, add findings.
