@@ -458,7 +458,6 @@ impl Pass {
             parallel: cfg.review.parallel,
             timeout: Duration::from_secs(cfg.review.timeout_mins.max(1) * 60),
             log_dir: work.join("agents"),
-            cached: Default::default(),
             usage: usage_log(&root),
             gate: Gate::shared(),
         };
