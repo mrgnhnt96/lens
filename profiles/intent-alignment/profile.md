@@ -8,8 +8,9 @@ inferenceRules:
   - The PR's context includes a linked design document
 severityGuidance: >
   major = an acceptance criterion or documented requirement is unmet or contradicted;
-  minor = undocumented scope creep or partial coverage. If no ticket/design context
-  exists, return zero findings.
+  minor = the text and the code disagree on a detail and either could be the one to change,
+  undocumented scope creep, or partial coverage. Quote the line you check against. If no
+  ticket/design context exists, return zero findings.
 enabled: true
 ---
 
