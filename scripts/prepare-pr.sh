@@ -4,10 +4,10 @@
 #
 #   LENS_STATE=<dir> prepare-pr.sh <n>
 #
-# Fetches the PR's head and base from origin. When the checkout is already at the PR's head with
+# Fetches the PR's head and base from origin through `lens pr view`, which talks to the forge. When the checkout is already at the PR's head with
 # a clean tree it reviews in place; otherwise it checks the head out detached in
 # $LENS_STATE/pr-<n>/tree, so the user's checkout is never touched. Writes:
-#   pr.json        `gh pr view` (number, url, title, body, baseRefName, headRefName, headRefOid)
+#   pr.json        `lens pr view` (number, url, title, body, baseRefName, headRefName, headRefOid)
 #   intent.md      the PR's title and description, for intent-alignment
 #   profiles.json  `lens profiles --base origin/<base>`
 #   map.json       `lens map --base origin/<base>` (map.err instead when the provider fails)
@@ -18,7 +18,6 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd -P)
 lens=${LENS:-lens}
-gh=${LENS_GH:-gh}
 state=${LENS_STATE:?prepare-pr: set LENS_STATE to the state folder of the review}
 
 pr=${1:-}
@@ -34,20 +33,11 @@ mkdir -p "$work"
 rm -f "$work/map.err"
 date +%s > "$work/started"
 
-fields=number,url,title,body,baseRefName,headRefName,headRefOid
-"$gh" pr view "$pr" --json "$fields" > "$work/pr.json"
-field() { "$gh" pr view "$pr" --json "$fields" --jq ".$1"; }
-base_ref=$(field baseRefName)
-head_ref=$(field headRefName)
-head=$(field headRefOid)
-url=$(field url)
-{
-  printf '# %s\n\n' "$(field title)"
-  field body
-} > "$work/intent.md"
-
-git fetch --quiet origin "+refs/heads/$base_ref:refs/remotes/origin/$base_ref" \
-  "+refs/pull/$pr/head:refs/lens/pr/$pr"
+# Writes pr.json and intent.md, and fetches the base to origin/<base> and the head to
+# refs/lens/pr/<n>.
+view=$("$lens" pr view --repo "$root" --pr "$pr" --out "$work" \
+  --field baseRefName --field headRefName --field headRefOid --field url)
+{ read -r base_ref; read -r head_ref; read -r head; read -r url; } <<< "$view"
 base=origin/$base_ref
 merge_base=$(git merge-base "$base" "$head")
 

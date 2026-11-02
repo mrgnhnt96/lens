@@ -145,6 +145,35 @@ pub struct PrConfig {
     /// Where a review's findings go: all in its one post, or inline on the diff.
     #[serde(default)]
     pub comments: Comments,
+    /// Where the repo's PRs live. Unset, lens tells from origin's URL.
+    pub forge: Option<ForgeKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForgeKind {
+    Github,
+    Bitbucket,
+}
+
+impl ForgeKind {
+    /// The forge an origin URL points at: Bitbucket Cloud for bitbucket.org, GitHub otherwise.
+    pub fn of_url(url: &str) -> ForgeKind {
+        let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+        let host = rest
+            .split(['/', ':'])
+            .next()
+            .unwrap_or("")
+            .rsplit('@')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if host == "bitbucket.org" || host.ends_with(".bitbucket.org") {
+            ForgeKind::Bitbucket
+        } else {
+            ForgeKind::Github
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -174,6 +203,7 @@ impl Default for PrConfig {
             post_as: PostAs::default(),
             bot_token_env: None,
             comments: Comments::default(),
+            forge: None,
         }
     }
 }
@@ -194,6 +224,23 @@ impl PrConfig {
         self.bot_token_env
             .as_deref()
             .unwrap_or(Self::DEFAULT_BOT_TOKEN_ENV)
+    }
+
+    /// `forge` when set, else the forge origin's URL points at; GitHub when there's no origin.
+    pub fn forge(&self, repo: &Path) -> ForgeKind {
+        if let Some(kind) = self.forge {
+            return kind;
+        }
+        std::process::Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(repo)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map_or(ForgeKind::Github, |out| {
+                ForgeKind::of_url(String::from_utf8_lossy(&out.stdout).trim())
+            })
     }
 }
 
@@ -284,6 +331,35 @@ mod tests {
         let c: Config = toml::from_str("[pr]\ncomments = \"single\"\n").unwrap();
         assert_eq!(c.pr.comments, Comments::Single);
         assert!(toml::from_str::<Config>("[pr]\ncomments = \"threads\"\n").is_err());
+    }
+
+    #[test]
+    fn pr_forge_is_set_or_told_from_the_origin_url() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.pr.forge, None);
+        let c: Config = toml::from_str("[pr]\nforge = \"bitbucket\"\n").unwrap();
+        assert_eq!(c.pr.forge, Some(ForgeKind::Bitbucket));
+        assert_eq!(c.pr.forge(Path::new("/nonexistent")), ForgeKind::Bitbucket);
+        assert!(toml::from_str::<Config>("[pr]\nforge = \"gitlab\"\n").is_err());
+
+        for (url, kind) in [
+            ("https://github.com/o/r.git", ForgeKind::Github),
+            ("git@github.com:o/r.git", ForgeKind::Github),
+            ("https://bitbucket.org/team/repo.git", ForgeKind::Bitbucket),
+            (
+                "https://me@bitbucket.org/team/repo.git",
+                ForgeKind::Bitbucket,
+            ),
+            ("git@bitbucket.org:team/repo.git", ForgeKind::Bitbucket),
+            (
+                "ssh://git@bitbucket.org/team/repo.git",
+                ForgeKind::Bitbucket,
+            ),
+            ("https://github.com/bitbucket.org/r", ForgeKind::Github),
+            ("/srv/git/origin.git", ForgeKind::Github),
+        ] {
+            assert_eq!(ForgeKind::of_url(url), kind, "{url}");
+        }
     }
 
     #[test]

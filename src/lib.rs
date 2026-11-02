@@ -8,6 +8,7 @@ pub mod backoff;
 pub mod config;
 pub mod cost;
 pub mod diff;
+pub mod forge;
 pub mod lang;
 pub mod map;
 pub mod pr;
