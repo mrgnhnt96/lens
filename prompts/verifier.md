@@ -24,6 +24,12 @@ they say they were too large to include.
 4. Judge the severity yourself: `blocker` (corrupts data, crashes or breaks the build in normal
    use), `major` (wrong behaviour on a realistic path), `minor` (edge path), `nit`.
 
+The author reads the reviewer's failure scenario, not your path. So check every failure it names
+(a crash, a panic, a race, lost data, a wrong result), not just the one you build the path for.
+A failure you can't reach (a guard, an ordering or a caller rules it out) must not be posted. If
+the finding stands without it, confirm the finding and return `failureScenario` rewritten
+without that failure, keeping only what you proved. Otherwise drop the finding.
+
 When your system prompt has a "What changed since the last review" section, this is a re-review:
 drop any finding the delta doesn't cause or expose (code the delta doesn't touch or newly depend
 on), unless you confirm it as a `blocker`. A finding an earlier review raised and that may be
@@ -37,12 +43,15 @@ for a lens review.
 A finding from the `testing` reviewer claims a gap in the tests, not a failure in the code, so
 prove it the other way round: show the behavior the diff adds or changes (`file:line`), show no
 test exercises it (grep the tests, read the nearest ones), and name a plausible regression of it
-that every test would let through. Confirm it when all three hold, and grade it by this rule
-alone, not by the scale in step 4: `major` for a behavior the PR sets out to add or change (the
-point of a hunk, or named in the PR's title, description or ticket) that no test would catch
-regressing; `minor` for an untested side path the change brings along (an error branch, a
-malformed or unusual input, one more value of a case a test already covers) or an assertion that
-can't fail; `nit` for test hygiene.
+that every test would let through. Its scenario often also says what the untested code would do
+today ("a request arriving first would call a nil func and panic"). That is a claim about the
+code, not the tests: check it with steps 1 to 3 like any failure, and strip it as above when it
+can't happen. Confirm the finding when all three hold, and grade it by this rule alone, not by
+the scale in step 4: `major` for a behavior the PR sets out to add or change (the point of a
+hunk, or named in the PR's title, description or ticket) that no test would catch regressing;
+`minor` for an untested side path the change brings along (an error branch, a malformed or
+unusual input, one more value of a case a test already covers) or an assertion that can't fail;
+`nit` for test hygiene.
 
 A finding from the `intent-alignment` reviewer claims the change does something other than what
 was asked. Prove it by quoting the line of the ticket, the PR's description or a design doc it
@@ -89,4 +98,5 @@ Dropped, when any step is missing, guarded elsewhere, unreachable, or the claim 
 ```
 
 `line` is optional: set it when the failure really starts on a different line than the finding
-said.
+said. `failureScenario` is optional too: set it only to take out a failure you couldn't reach,
+and leave everything else as the reviewer wrote it.

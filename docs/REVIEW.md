@@ -101,7 +101,8 @@ its latest report in `<state>/pr-<n>.json`.
 - `totals`: `agents` (how many sessions ran), `costUsd`, and the two cache fields summed over
   `agents`. The top-level `costUsd` is the same total, kept for older readers.
 - `findings`: blocker and major only, every one confirmed by a verifier. `severity` is the
-  verifier's, `line` the verifier's when it moved it. Ids are `F1`, `F2`, … (blockers first). A
+  verifier's, `line` the verifier's when it moved it, and `failureScenario` the verifier's when
+  it took out a failure it couldn't reach (otherwise the reviewer's). Ids are `F1`, `F2`, … (blockers first). A
   finding carried over from the last report keeps its id, and a new one takes the next number
   after any id the branch's reports have used (`lastId`), so an id never changes meaning.
 - `settled`: findings the task board's triage dismissed or backlogged (see the protocol below),

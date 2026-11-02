@@ -756,6 +756,13 @@ impl Pass {
                         entry["line"] = json!(line);
                     }
                     entry["howItFails"] = r["howItFails"].clone();
+                    // The scenario with any failure the verifier couldn't reach taken out.
+                    if let Some(s) = r["failureScenario"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        entry["failureScenario"] = json!(s);
+                    }
                     confirmed.push((f.clone(), entry));
                 }
                 (Some(_), Some(r)) => {
