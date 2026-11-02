@@ -4,8 +4,10 @@ model: sonnet
 effort: high
 description: Naming, method shape, and whether a reader could predict behavior from the signature alone.
 severityGuidance: >
-  major = a name that actively misleads about behavior (wrong tense, lies about side
-  effects); minor = vague or inconsistent naming; nit = style preference.
+  major = a misleading name a caller in the diff already uses wrongly; minor = a name that states
+  something the code doesn't do (a size that holds a growth, a getter that returns a bool, a query
+  that records state), or two unrelated names a reader would take for each other; nit = vague or
+  inconsistent naming, style preference. The verifier drops nits and taste-based renames.
 enabled: true
 ---
 

@@ -38,6 +38,23 @@ regressing; `minor` for an untested side path the change brings along (an error 
 malformed or unusual input, one more value of a case a test already covers) or an assertion that
 can't fail; `nit` for test hygiene.
 
+A finding from the `intent-alignment` reviewer claims the change does something other than what
+was asked. Prove it by quoting the line of the ticket, the PR's description or a design doc it
+checks against, and showing the code (`file:line`) that does otherwise on an input the code
+really handles. It compares the code with what was asked, so it is not a finding about the
+description's wording and the rule above doesn't drop it. Confirm it when both hold, and grade
+it by this rule alone: `major` when a stated requirement or acceptance criterion is unmet;
+`minor` when the text and the code disagree on a detail and either could be the one to change
+(the failure scenario says so). Drop it when the text is loose enough that the code fits it.
+
+A finding from the `naming-intuitivity` reviewer claims a name misleads. Confirm it only when
+the name states something the code doesn't do: show what the name says (a size, a getter, a pure
+query, a type) and the `file:line` where the code does otherwise (holds a growth, returns a
+bool, records state). Two names count too when a reader would take one for the other, they mean
+unrelated things, and the diff uses them side by side. Grade it `minor`, or `major` when a
+caller in the diff already uses the name wrongly. Drop renames that are a matter of taste: a
+bare bool, a name that is vague but not wrong, a convention the codebase doesn't hold to.
+
 **Read-only.** Never edit, write, stage, commit, check out or stash anything. Bash is for reading
 (`git show`, `git grep`, `git blame`). Don't build or run tests.
 
