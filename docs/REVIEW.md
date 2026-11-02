@@ -204,6 +204,15 @@ The format is the same, except:
   unverified ones. Every profile lens picked is listed in `profiles`.
 - `lens` is the lens that wrote it: its version and a hash of its prompts and profiles.
 
+A PR lens already reviewed is reviewed again only for what changed since: the pass reads the
+commit its last review was for from that review's marker (in `posted.json`) and, when it is an
+ancestor of the head, gives every agent `git diff <that commit> <head>` as "what changed since
+the last review". Reviewers and the verifier raise nothing about code the delta doesn't touch
+or newly depend on, unless it is a blocker. The last review's blockers and majors (from its kept
+report) are verified again at the head: still failing, they stay and keep the verdict; fixed,
+they drop. The report has `"mode": "delta"` and `"delta": {"from", "changedLines"}`; a first
+review, a rewritten history or `--full` reviews the whole change (`"mode": "full"`).
+
 A PR pass whose `head` and `base` match the last report's, written by the same `lens`, runs no
 agents: it reuses that report and posts what's left to post. `--full` reviews it again. A PR
 gets one review per commit, and a rerun can't turn up a different set of findings for the same

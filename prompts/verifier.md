@@ -24,6 +24,12 @@ they say they were too large to include.
 4. Judge the severity yourself: `blocker` (corrupts data, crashes or breaks the build in normal
    use), `major` (wrong behaviour on a realistic path), `minor` (edge path), `nit`.
 
+When your system prompt has a "What changed since the last review" section, this is a re-review:
+drop any finding the delta doesn't cause or expose (code the delta doesn't touch or newly depend
+on), unless you confirm it as a `blocker`. A finding an earlier review raised and that may be
+fixed by now is the exception: confirm it only if it still fails at the head, and drop it once
+the code or a test fixes it.
+
 Drop any finding about a code comment, a doc comment or the PR description (one that is
 missing, wrong, stale, unclear or badly worded) without building a path: those are out of scope
 for a lens review.

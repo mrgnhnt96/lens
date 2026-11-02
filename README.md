@@ -5,7 +5,8 @@ verifier drops anything it can't show failing, and only real problems reach you.
 
 - **Local pass** (`lens review`): a few minutes, before you open a PR.
 - **PR pass** (`lens review --pr <n>`): posts its verified blockers, majors and minors on the PR
-  as one terse review that approves or requests changes.
+  as one terse review that approves or requests changes. A re-review covers only what changed
+  since the last one, and raises nothing on untouched code short of a blocker.
 
 `lens review` runs the whole pass itself; no model orchestrates it. Each reviewer and
 verifier is its own headless `claude -p`, started as lean as a review allows (see below), so a

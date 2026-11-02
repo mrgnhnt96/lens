@@ -582,7 +582,7 @@ impl Pass {
         }
         if let Some(delta) = delta {
             s.push_str(&format!(
-                "\n## What changed since the last review (delta.patch)\n\nThe change was reviewed before. Review only what this delta causes or exposes; the rest was already reviewed.\n\n```diff\n{delta}```\n"
+                "\n## What changed since the last review (delta.patch)\n\nThe change was reviewed before. Review only what this delta causes or exposes; the rest was already reviewed. Raise nothing about code the delta doesn't touch or newly depend on, unless it is a blocker: it crashes, corrupts data or breaks the build in normal use.\n\n```diff\n{delta}```\n"
             ));
         }
         match fs::read_to_string(self.work.join("map.json")) {
@@ -595,8 +595,10 @@ impl Pass {
             )),
             Err(_) => s.push_str("\n## The change map\n\nNone: the map provider failed. Grep for callers and tests yourself.\n"),
         }
+        // A re-review looks only at the delta, and the list covers the whole change.
         if let Some(list) = fs::read_to_string(self.work.join("map.json"))
             .ok()
+            .filter(|_| delta.is_none())
             .and_then(|m| untested(&m))
         {
             s.push_str(&format!("\n## Changed code no test names\n\nChanged symbols outside test files that no test file mentions. Each is a likely coverage gap; a symbol missing here may still be untested, since a mention isn't an assertion.\n\n{list}"));
@@ -1572,6 +1574,25 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         }
     }
     let _ = fs::remove_dir_all(pass.work.join("agents"));
+    // A PR lens reviewed before is reviewed again only for what changed since: the findings it
+    // already raised were raised, and the code it already read was read.
+    let delta = if pass.opts.full { None } else { pr_delta(pass) };
+    if let Some(d) = &delta {
+        pass.log(&format!(
+            "reviewing the {} changed lines since the last review of {}",
+            changed_lines(&d.patch),
+            &d.from[..d.from.len().min(7)]
+        ));
+    }
+    let carried: Vec<Finding> = delta
+        .as_ref()
+        .and_then(|d| d.previous.as_ref())
+        .and_then(|p| p["findings"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter(|f| matches!(f["severity"].as_str(), Some("blocker" | "major")))
+        .filter_map(carry)
+        .collect();
     let profiles: Value =
         serde_json::from_str(&fs::read_to_string(pass.work.join("profiles.json"))?)?;
     let files: Vec<String> = profiles["changedFiles"]
@@ -1583,12 +1604,18 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         .collect();
     let mut plans = plan_pr(&profiles, &files);
     pass.lighten(&mut plans);
+    if delta.as_ref().is_some_and(|d| d.patch.trim().is_empty()) {
+        for p in &mut plans {
+            p.run = false;
+            p.reason = "nothing changed since the last review".into();
+        }
+    }
     let extra = format!(
         "\nRepo: {}  (the PR's head; read files there, not in the current directory)\nAlready posted on this PR (don't raise these again): {}\n",
         pass.tree_dir.display(),
         pass.work.join("posted.json").display()
     );
-    let system = pass.system_prompt(&pass.context(None)?)?;
+    let system = pass.system_prompt(&pass.context(delta.as_ref().map(|d| d.patch.as_str()))?)?;
 
     // The lead first: its assessment goes in the review body and its focus areas get reviewers.
     let mut raised = Vec::new();
@@ -1727,7 +1754,11 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         rows.push(row);
     }
 
-    let (confirmed, dropped) = pass.verify(&system, &merge(raised), |_| true);
+    let (confirmed, dropped) = pass.verify(
+        &system,
+        &merge(raised.into_iter().chain(carried).collect()),
+        |_| true,
+    );
     if let Some(why) = pass.parked() {
         return Ok(parked(&why));
     }
@@ -1751,11 +1782,67 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         "findings": number_all(confirmed),
         "dropped": dropped,
         "lens": crate::assets::fingerprint(),
+        "mode": if delta.is_some() { "delta" } else { "full" },
     });
+    if let Some(d) = &delta {
+        report["delta"] = json!({ "from": d.from, "changedLines": changed_lines(&d.patch) });
+    }
     finish(pass, &mut report)?;
 
     let summary = summarize(&report, &pass.report_path, false);
     Ok(post_pr(pass, number, &report, summary, &failed))
+}
+
+/// What a PR changed since lens last reviewed it.
+struct PrDelta {
+    /// The commit the last lens review on the PR was for.
+    from: String,
+    /// `git diff <from> <head>`.
+    patch: String,
+    /// That review's report, when lens kept it: its blockers and majors are verified again.
+    previous: Option<Value>,
+}
+
+/// The PR's change since the commit its last lens review was for (read from that review's
+/// marker in `posted.json`), when that commit is an ancestor of the head. `None` means a full
+/// review: a first review, the same head, or history rewritten since.
+fn pr_delta(pass: &Pass) -> Option<PrDelta> {
+    let posted: Value =
+        serde_json::from_str(&fs::read_to_string(pass.work.join("posted.json")).ok()?).ok()?;
+    let from = posted["head"].as_str()?.to_string();
+    let head = pass.prepared["head"].as_str()?;
+    if from == head {
+        return None;
+    }
+    let tree = &pass.tree_dir;
+    if crate::diff::git(tree, &["cat-file", "-e", &format!("{from}^{{commit}}")]).is_err() {
+        let _ = crate::diff::git(tree, &["fetch", "--quiet", "origin", &from]);
+    }
+    crate::diff::git(tree, &["merge-base", "--is-ancestor", &from, head]).ok()?;
+    let patch = crate::diff::git(tree, &["diff", "--full-index", &from, head]).ok()?;
+    Some(PrDelta {
+        previous: report_for(pass, &from),
+        from,
+        patch,
+    })
+}
+
+/// The kept report (or the latest one) that reviewed `head`.
+fn report_for(pass: &Pass, head: &str) -> Option<Value> {
+    let read = |p: &Path| -> Option<Value> {
+        let r: Value = serde_json::from_str(&fs::read_to_string(p).ok()?).ok()?;
+        (r["head"] == head).then_some(r)
+    };
+    if let Some(r) = read(&pass.report_path) {
+        return Some(r);
+    }
+    let mut kept: Vec<PathBuf> = fs::read_dir(pass.work.join("reports"))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    kept.sort();
+    kept.iter().rev().find_map(|p| read(p))
 }
 
 /// The last PR pass's report, when it reviewed the same head against the same base with the same

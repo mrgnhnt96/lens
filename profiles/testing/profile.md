@@ -24,7 +24,8 @@ Work through the whole list, so every run of this review finds the same gaps:
 1. **List the behaviors the diff changes** in non-test code. A behavior is anything a caller
    could observe: a new function, a changed branch, and also a changed value at a call site (an
    argument, a constant, a flag). Start from the change map's symbols and its "changed code no
-   test names" list, then read every hunk: one symbol can carry several behaviors.
+   test names" list, then read every hunk: one symbol can carry several behaviors. In a
+   re-review (a "What changed since the last review" section), list only what the delta changes.
 2. **For each one, find the test that would fail if it regressed.** A test that only names the
    symbol doesn't count: it has to assert the changed outcome. A grep hit in the change map isn't
    coverage either.
