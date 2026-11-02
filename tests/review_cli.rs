@@ -94,7 +94,8 @@ elif role == "reviewer":
                                      {"title": "beyond the cap", "files": ["src/b.rs"], "why": "x"}]})
 elif role == "verifier":
     if "src/b.rs" in prompt:
-        reply = {"verdict": "confirmed", "severity": "major", "howItFails": "1. b() opens it"}
+        reply = {"verdict": "confirmed", "severity": "major", "howItFails": "1. b() opens it",
+                 "failureScenario": "b() never closes the handle it opens"}
     else:
         reply = {"verdict": "confirmed", "severity": "blocker", "howItFails": "1. parse(\"\")\n2. Ok"}
 else:
@@ -364,6 +365,12 @@ fn a_full_review_verifies_blockers_and_drops_the_rest() {
     assert_eq!(findings[0]["id"], "F1");
     assert_eq!(findings[0]["severity"], "blocker");
     assert_eq!(findings[0]["howItFails"], "1. parse(\"\")\n2. Ok");
+    // The verifier's rewrite of a scenario replaces the reviewer's; without one it stays.
+    assert_eq!(findings[0]["failureScenario"], "parse(\"\") returns Ok");
+    assert_eq!(
+        findings[1]["failureScenario"],
+        "b() never closes the handle it opens"
+    );
     assert_eq!(report["dropped"][0]["reason"], "below major");
     let ran: Vec<&str> = report["profiles"]
         .as_array()
