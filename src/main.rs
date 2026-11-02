@@ -29,7 +29,8 @@ enum Command {
         /// A ticket or spec the change implements, for intent-alignment.
         #[arg(long)]
         intent: Option<PathBuf>,
-        /// Review the whole change, even when only part of it changed since the last review.
+        /// Review the whole change, even when only part of it changed since the last review. With
+        /// --pr: review again even when the PR's head hasn't changed since the last review.
         #[arg(long)]
         full: bool,
         /// The per-PR floor: one Sonnet correctness reviewer, only when the change touches a
@@ -37,7 +38,7 @@ enum Command {
         #[arg(long, conflicts_with_all = ["pr", "full"])]
         floor: bool,
         /// Run the PR pass on this PR: every profile, all severities, posted on the PR.
-        #[arg(long, conflicts_with_all = ["base", "full"])]
+        #[arg(long, conflicts_with_all = ["base"])]
         pr: Option<u64>,
         /// With --pr: build the review but don't post it.
         #[arg(long, requires = "pr")]

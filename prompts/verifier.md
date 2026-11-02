@@ -31,8 +31,12 @@ for a lens review.
 A finding from the `testing` reviewer claims a gap in the tests, not a failure in the code, so
 prove it the other way round: show the behavior the diff adds or changes (`file:line`), show no
 test exercises it (grep the tests, read the nearest ones), and name a plausible regression of it
-that every test would let through. Confirm it when all three hold: `major` for a changed
-behavior no test would catch regressing, `minor` for a weak or tautological assertion.
+that every test would let through. Confirm it when all three hold, and grade it by this rule
+alone, not by the scale in step 4: `major` for a behavior the PR sets out to add or change (the
+point of a hunk, or named in the PR's title, description or ticket) that no test would catch
+regressing; `minor` for an untested side path the change brings along (an error branch, a
+malformed or unusual input, one more value of a case a test already covers) or an assertion that
+can't fail; `nit` for test hygiene.
 
 **Read-only.** Never edit, write, stage, commit, check out or stash anything. Bash is for reading
 (`git show`, `git grep`, `git blame`). Don't build or run tests.
