@@ -88,6 +88,9 @@ pub struct ReviewConfig {
     pub parallel: usize,
     /// Minutes before an agent is stopped.
     pub timeout_mins: u64,
+    /// Keep a copy of every report under the work folder's `reports/`, so earlier runs stay
+    /// readable. `false` keeps only the latest.
+    pub keep_reports: bool,
 }
 
 impl Default for ReviewConfig {
@@ -96,6 +99,7 @@ impl Default for ReviewConfig {
             small_lines: 40,
             parallel: 4,
             timeout_mins: 20,
+            keep_reports: true,
         }
     }
 }

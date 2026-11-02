@@ -1529,11 +1529,28 @@ pub(crate) fn finish(pass: &mut Pass, report: &mut Value) -> Result<()> {
     });
     report["agents"] = json!(pass.agents);
     report["costUsd"] = json!(cost);
-    fs::write(
-        &pass.report_path,
-        serde_json::to_string_pretty(report)? + "\n",
-    )
-    .with_context(|| format!("writing {}", pass.report_path.display()))
+    let text = serde_json::to_string_pretty(report)? + "\n";
+    fs::write(&pass.report_path, &text)
+        .with_context(|| format!("writing {}", pass.report_path.display()))?;
+    if pass.cfg.review.keep_reports {
+        let kept = pass.work.join("reports").join(kept_name(report));
+        fs::create_dir_all(kept.parent().unwrap())?;
+        fs::write(&kept, &text).with_context(|| format!("writing {}", kept.display()))?;
+    }
+    Ok(())
+}
+
+/// The file name a kept report gets: its start time and the commit it reviewed, so the
+/// `reports/` folder lists runs in order, e.g. `20261102T204105Z-3cd14fc.json`.
+fn kept_name(report: &Value) -> String {
+    let started: String = report["startedAt"]
+        .as_str()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !matches!(c, '-' | ':'))
+        .collect();
+    let head = report["head"].as_str().unwrap_or("");
+    format!("{started}-{}.json", &head[..head.len().min(7)])
 }
 
 fn pr_pass(pass: &mut Pass) -> Result<Done> {

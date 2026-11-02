@@ -727,6 +727,28 @@ fn a_pr_whose_head_is_unchanged_reuses_its_last_review() {
     // --full reviews it again.
     fx.review_with(&[], &["--pr", "7", "--dry-run", "--full"], &env);
     assert!(!fx.calls().is_empty());
+
+    // Every run that reviewed is kept; the reuse wrote nothing new.
+    let kept = fs::read_dir(fx.state().join("pr-7/reports"))
+        .unwrap()
+        .count();
+    assert_eq!(kept, 2);
+}
+
+#[test]
+fn keep_reports_off_keeps_only_the_latest() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(
+        &d,
+        ".lens.toml",
+        "[pr]\nsample = 1\n[review]\nkeep_reports = false\n",
+    );
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    assert!(fx.state().join("pr-7.json").is_file());
+    assert!(!fx.state().join("pr-7/reports").exists());
 }
 
 #[test]
