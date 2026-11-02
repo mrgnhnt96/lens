@@ -4,6 +4,10 @@
 //! `post_as = "owner"` signs in with an Atlassian API token (`$LENS_BITBUCKET_EMAIL` and
 //! `$LENS_BITBUCKET_TOKEN`, Basic auth); `post_as = "bot"` with a repository access token from
 //! `bot_token_env` (Bearer auth). Git fetches use git's own credentials for origin.
+//!
+//! A review is a verdict (approve or request changes) and comments: the verdict first, so lens
+//! never leaves comments without one, then a comment on each inline finding's line, then the
+//! summary comment, whose marker records the review for later runs.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,7 +19,7 @@ use serde_json::{json, Value};
 
 use super::{Forge, PrView};
 use crate::config::{PostAs, PrConfig};
-use crate::pr::{earlier_from, Earlier, Review};
+use crate::pr::{earlier_from, Earlier, Markup, Review};
 
 pub const DEFAULT_API: &str = "https://api.bitbucket.org/2.0";
 pub const EMAIL_ENV: &str = "LENS_BITBUCKET_EMAIL";
@@ -28,9 +32,74 @@ const PR_FIELDS: &str = "id,title,description,links.html.href,source.branch.name
 const COMMENT_FIELDS: &str =
     "next,values.id,values.deleted,values.inline,values.content.raw,values.links.html.href";
 
-/// A GET against the API, answering its JSON.
+/// One API request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Request {
+    pub method: &'static str,
+    pub url: String,
+    pub body: Option<Value>,
+}
+
+impl Request {
+    fn get(url: String) -> Request {
+        Request {
+            method: "GET",
+            url,
+            body: None,
+        }
+    }
+
+    fn post(url: String, body: Option<Value>) -> Request {
+        Request {
+            method: "POST",
+            url,
+            body,
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!("{} {}", self.method, self.url)
+    }
+}
+
+/// What the API answered, whatever its status.
+pub struct Reply {
+    pub status: u16,
+    pub text: String,
+}
+
+impl Reply {
+    fn ok(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    /// The body as JSON when the status is a success; `Null` when there is none.
+    fn json(self, req: &Request) -> Result<Value> {
+        if !self.ok() {
+            let why = serde_json::from_str::<Value>(&self.text)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                .unwrap_or_else(|| self.text.trim().chars().take(300).collect());
+            let hint = match self.status {
+                401 | 403 => "; check the token and its scopes (README: Bitbucket)",
+                _ => "",
+            };
+            bail!(
+                "Bitbucket answered {} to {}: {why}{hint}",
+                self.status,
+                req.describe()
+            );
+        }
+        if self.text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&self.text).with_context(|| format!("parsing {}", req.describe()))
+    }
+}
+
+/// Sends a request to the API; only a failure to reach it is an error.
 pub trait Http {
-    fn get(&self, url: &str) -> Result<Value>;
+    fn send(&self, req: &Request) -> Result<Reply>;
 }
 
 struct Ureq {
@@ -39,31 +108,25 @@ struct Ureq {
 }
 
 impl Http for Ureq {
-    fn get(&self, url: &str) -> Result<Value> {
-        let resp = self
+    fn send(&self, req: &Request) -> Result<Reply> {
+        let call = self
             .agent
-            .get(url)
+            .request(req.method, &req.url)
             .set("Authorization", &self.auth)
-            .set("Accept", "application/json")
-            .call();
+            .set("Accept", "application/json");
+        let resp = match &req.body {
+            Some(body) => call
+                .set("Content-Type", "application/json")
+                .send_string(&body.to_string()),
+            None => call.call(),
+        };
         let (status, text) = match resp {
             Ok(r) => (r.status(), r.into_string()),
             Err(ureq::Error::Status(code, r)) => (code, r.into_string()),
-            Err(e) => return Err(e).with_context(|| format!("GET {url}")),
+            Err(e) => return Err(e).with_context(|| req.describe()),
         };
-        let text = text.with_context(|| format!("reading GET {url}"))?;
-        if !(200..300).contains(&status) {
-            let why = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
-                .unwrap_or_else(|| text.trim().chars().take(300).collect());
-            let hint = match status {
-                401 | 403 => "; check the token and its scopes (README: Bitbucket)",
-                _ => "",
-            };
-            bail!("Bitbucket answered {status} to GET {url}: {why}{hint}");
-        }
-        serde_json::from_str(&text).with_context(|| format!("parsing GET {url}"))
+        let text = text.with_context(|| format!("reading {}", req.describe()))?;
+        Ok(Reply { status, text })
     }
 }
 
@@ -106,6 +169,43 @@ impl Bitbucket {
         format!("{}/repositories/{}/pullrequests/{pr}", self.api, self.slug)
     }
 
+    fn get(&self, url: String) -> Result<Value> {
+        let req = Request::get(url);
+        self.http.send(&req)?.json(&req)
+    }
+
+    /// What posting `review` on PR `pr` sends, in order: clearing the opposite verdict, giving
+    /// this one, a comment on each inline finding's line, then the summary.
+    pub fn requests(&self, pr: u64, review: &Review) -> Vec<Request> {
+        let at = self.pr_url(pr);
+        let (verdict, opposite) = match review.event {
+            "APPROVE" => ("approve", "request-changes"),
+            _ => ("request-changes", "approve"),
+        };
+        let mut out = vec![
+            Request {
+                method: "DELETE",
+                url: format!("{at}/{opposite}"),
+                body: None,
+            },
+            Request::post(format!("{at}/{verdict}"), None),
+        ];
+        for c in &review.comments {
+            out.push(Request::post(
+                format!("{at}/comments"),
+                Some(json!({
+                    "content": {"raw": c.body},
+                    "inline": {"path": c.path, "to": c.line},
+                })),
+            ));
+        }
+        out.push(Request::post(
+            format!("{at}/comments"),
+            Some(json!({"content": {"raw": review.body}})),
+        ));
+        out
+    }
+
     fn git(&self, args: &[&str]) -> Result<String> {
         let out = Command::new("git")
             .args(args)
@@ -128,7 +228,7 @@ impl Bitbucket {
         if rev.len() == 40 {
             return Ok(rev.to_string());
         }
-        let v = self.http.get(&format!(
+        let v = self.get(format!(
             "{}/repositories/{repo}/commit/{rev}?fields=hash",
             self.api
         ))?;
@@ -251,9 +351,7 @@ pub fn earlier_from_comments(mut values: Vec<Value>) -> Earlier {
 
 impl Forge for Bitbucket {
     fn view(&self, pr: u64) -> Result<PrView> {
-        let v = self
-            .http
-            .get(&format!("{}?fields={PR_FIELDS}", self.pr_url(pr)))?;
+        let v = self.get(format!("{}?fields={PR_FIELDS}", self.pr_url(pr)))?;
         let short = v
             .pointer("/source/commit/hash")
             .and_then(Value::as_str)
@@ -304,7 +402,7 @@ impl Forge for Bitbucket {
         ));
         for _ in 0..MAX_PAGES {
             let Some(url) = next.take() else { break };
-            let page = self.http.get(&url)?;
+            let page = self.get(url)?;
             if let Some(vs) = page["values"].as_array() {
                 values.extend(vs.iter().cloned());
             }
@@ -316,42 +414,101 @@ impl Forge for Bitbucket {
         Ok(earlier_from_comments(values))
     }
 
-    fn payload(&self, review: &Review) -> Value {
-        json!({
-            "summary": review.body,
-            "inline": review.comments.iter().map(|c| json!({
-                "path": c.path,
-                "to": c.line,
-                "body": c.body,
-            })).collect::<Vec<_>>(),
-            "verdict": review.event,
-        })
+    fn markup(&self) -> Markup {
+        Markup::Bitbucket
     }
 
-    fn post(&self, _pr: u64, _review: &Review) -> Result<Option<String>> {
-        bail!("lens can't post on Bitbucket pull requests yet; --dry-run shows what it would post")
+    fn payload(&self, pr: u64, review: &Review) -> Value {
+        let requests: Vec<Value> = self
+            .requests(pr, review)
+            .into_iter()
+            .map(|r| match r.body {
+                Some(body) => json!({"method": r.method, "url": r.url, "body": body}),
+                None => json!({"method": r.method, "url": r.url}),
+            })
+            .collect();
+        json!({"requests": requests})
+    }
+
+    /// Clearing a verdict lens never gave is no error; giving one it already gave (409) isn't
+    /// either. A verdict Bitbucket refuses stops the post before any comment goes up.
+    fn post(&self, pr: u64, review: &Review) -> Result<Option<String>> {
+        let mut summary = None;
+        for req in self.requests(pr, review) {
+            let reply = self.http.send(&req)?;
+            match req.method {
+                "DELETE" if reply.ok() || matches!(reply.status, 400 | 404 | 409) => {}
+                "POST" if req.body.is_none() && reply.status == 409 => {}
+                "POST" if req.body.is_none() => {
+                    reply.json(&req).with_context(|| {
+                        format!(
+                            "Bitbucket wouldn't take lens's verdict on PR {pr}, so nothing was posted (lens never leaves comments without one). On your own PR, post as a bot (post_as = \"bot\") to give it one"
+                        )
+                    })?;
+                }
+                _ => {
+                    let v = reply.json(&req)?;
+                    summary = v
+                        .pointer("/links/html/href")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+            }
+        }
+        Ok(Some(summary.unwrap_or_else(|| self.pr_url(pr))))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Comments;
+    use crate::pr::{commentable, plan, Finding, PrRef, Report};
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::rc::Rc;
 
+    type Sent = Rc<RefCell<Vec<Request>>>;
+
+    /// The API: GETs answered from `pages`, anything else from the first of `replies` whose
+    /// method and URL prefix match, else 200 with a link to what was posted. Keeps each request.
     struct Fake {
         pages: BTreeMap<String, Value>,
-        asked: RefCell<Vec<String>>,
+        replies: Vec<(&'static str, String, u16)>,
+        sent: Sent,
     }
 
     impl Http for Fake {
-        fn get(&self, url: &str) -> Result<Value> {
-            self.asked.borrow_mut().push(url.to_string());
-            self.pages
+        fn send(&self, req: &Request) -> Result<Reply> {
+            self.sent.borrow_mut().push(req.clone());
+            if req.method == "GET" {
+                return Ok(
+                    match self
+                        .pages
+                        .iter()
+                        .find(|(prefix, _)| req.url.starts_with(prefix.as_str()))
+                    {
+                        Some((_, v)) => Reply {
+                            status: 200,
+                            text: v.to_string(),
+                        },
+                        None => Reply {
+                            status: 404,
+                            text: json!({"error": {"message": "no page"}}).to_string(),
+                        },
+                    },
+                );
+            }
+            let status = self
+                .replies
                 .iter()
-                .find(|(prefix, _)| url.starts_with(prefix.as_str()))
-                .map(|(_, v)| v.clone())
-                .with_context(|| format!("no page for {url}"))
+                .find(|(m, prefix, _)| *m == req.method && req.url.starts_with(prefix.as_str()))
+                .map_or(200, |(_, _, s)| *s);
+            let n = self.sent.borrow().len();
+            Ok(Reply {
+                status,
+                text: json!({"links": {"html": {"href": format!("posted-{n}")}}}).to_string(),
+            })
         }
     }
 
@@ -372,14 +529,105 @@ mod tests {
     }
 
     fn bitbucket(dir: &Path, pages: &[(&str, Value)]) -> Bitbucket {
+        bitbucket_with(dir, pages, &[]).0
+    }
+
+    fn bitbucket_with(
+        dir: &Path,
+        pages: &[(&str, Value)],
+        replies: &[(&'static str, &str, u16)],
+    ) -> (Bitbucket, Sent) {
+        let sent = Sent::default();
         let fake = Fake {
             pages: pages
                 .iter()
                 .map(|(k, v)| (format!("http://bb{k}"), v.clone()))
                 .collect(),
-            asked: RefCell::new(Vec::new()),
+            replies: replies
+                .iter()
+                .map(|(m, k, s)| (*m, format!("http://bb{k}"), *s))
+                .collect(),
+            sent: sent.clone(),
         };
-        Bitbucket::with_http(dir, Box::new(fake), "http://bb/").unwrap()
+        let bb = Bitbucket::with_http(dir, Box::new(fake), "http://bb/").unwrap();
+        (bb, sent)
+    }
+
+    const AT: &str = "http://bb/repositories/team/repo/pullrequests/7";
+    const PR_PATH: &str = "/repositories/team/repo/pullrequests/7";
+    const PATCH: &str = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,2 +1,3 @@
+ fn a() {
++    new();
+ }
+";
+
+    fn finding(id: &str, file: &str, line: u32, severity: &str, title: &str) -> Finding {
+        Finding {
+            id: id.into(),
+            profiles: vec!["correctness".into()],
+            file: file.into(),
+            line,
+            severity: severity.into(),
+            title: title.into(),
+            failure_scenario: "x happens".into(),
+            how_it_fails: None,
+            fix: None,
+        }
+    }
+
+    fn report(findings: Vec<Finding>) -> Report {
+        Report {
+            pr: Some(PrRef {
+                url: Some("https://bitbucket.org/team/repo/pull-requests/7".into()),
+            }),
+            head: "abcdef1234".into(),
+            base: "origin/main".into(),
+            risk: None,
+            assessment: None,
+            profiles: vec![],
+            findings,
+            dropped: vec![],
+        }
+    }
+
+    /// A blocker on a line the diff shows and a major on one it doesn't.
+    fn sample() -> Report {
+        report(vec![
+            finding("F1", "src/a.rs", 2, "blocker", "breaks"),
+            finding("F2", "src/a.rs", 40, "major", "far away"),
+            finding("F3", "src/a.rs", 3, "nit", "tiny"),
+        ])
+    }
+
+    fn review_of(r: &Report, earlier: &Earlier, mode: Comments) -> Option<Review> {
+        plan(r, earlier, &commentable(PATCH), mode, Markup::Bitbucket).review
+    }
+
+    fn methods(sent: &Sent) -> Vec<String> {
+        sent.borrow()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.trim_start_matches(AT)))
+            .collect()
+    }
+
+    /// The comments as Bitbucket lists them back, numbered in the order they went up.
+    fn as_listed(sent: &Sent) -> Vec<Value> {
+        sent.borrow()
+            .iter()
+            .filter_map(|r| r.body.as_ref())
+            .enumerate()
+            .map(|(i, b)| {
+                let mut c = json!({"id": i + 1, "content": b["content"]});
+                if b["inline"].is_object() {
+                    c["inline"] = b["inline"].clone();
+                }
+                c
+            })
+            .collect()
     }
 
     fn pr_json(source_repo: &str) -> Value {
@@ -563,5 +811,194 @@ mod tests {
                 ("cccc", None, None),
             ]
         );
+    }
+
+    #[test]
+    fn single_gives_the_verdict_then_one_comment_with_every_finding() {
+        let dir = repo_with_origin("git@bitbucket.org:team/repo.git");
+        let (bb, sent) = bitbucket_with(dir.path(), &[], &[]);
+        let review = review_of(&sample(), &Earlier::default(), Comments::Single).unwrap();
+        assert_eq!(bb.post(7, &review).unwrap().as_deref(), Some("posted-3"));
+        assert_eq!(
+            methods(&sent),
+            ["DELETE /approve", "POST /request-changes", "POST /comments"]
+        );
+        let sent = sent.borrow();
+        assert!(sent[1].body.is_none());
+        let raw = sent[2].body.as_ref().unwrap()["content"]["raw"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(sent[2].body.as_ref().unwrap().get("inline").is_none());
+        assert!(
+            raw.contains(
+                "[`src/a.rs:2`](https://bitbucket.org/team/repo/src/abcdef1234/src/a.rs#lines-2)"
+            ),
+            "{raw}"
+        );
+        assert!(raw.contains("#lines-40)"), "{raw}");
+        assert!(
+            raw.contains(&format!(
+                "\n\n[//]: # (lens:finding key={})",
+                crate::pr::key("src/a.rs", "breaks")
+            )),
+            "{raw}"
+        );
+        assert!(
+            raw.ends_with("[//]: # (lens:review head=abcdef1234 verdict=REQUEST_CHANGES)"),
+            "{raw}"
+        );
+        assert!(!raw.contains("<!--") && !raw.contains("<details>"), "{raw}");
+        assert!(!raw.contains("tiny"), "{raw}");
+    }
+
+    #[test]
+    fn inline_comments_on_the_diffs_lines_and_sums_up_last() {
+        let dir = repo_with_origin("git@bitbucket.org:team/repo.git");
+        let (bb, sent) = bitbucket_with(dir.path(), &[], &[]);
+        let review = review_of(&sample(), &Earlier::default(), Comments::Inline).unwrap();
+        bb.post(7, &review).unwrap();
+        assert_eq!(
+            methods(&sent),
+            [
+                "DELETE /approve",
+                "POST /request-changes",
+                "POST /comments",
+                "POST /comments"
+            ]
+        );
+        let sent = sent.borrow();
+        let inline = sent[2].body.as_ref().unwrap();
+        assert_eq!(inline["inline"], json!({"path": "src/a.rs", "to": 2}));
+        let raw = inline["content"]["raw"].as_str().unwrap();
+        assert!(raw.contains("[//]: # (lens:finding key="), "{raw}");
+        let summary = sent[3].body.as_ref().unwrap()["content"]["raw"]
+            .as_str()
+            .unwrap();
+        assert!(
+            summary.contains("#lines-40)") && !summary.contains("#lines-2)"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn an_approval_clears_a_request_for_changes_and_still_says_why() {
+        let dir = repo_with_origin("git@bitbucket.org:team/repo.git");
+        let (bb, sent) = bitbucket_with(dir.path(), &[], &[]);
+        let earlier = Earlier {
+            reviews: 1,
+            verdict: Some("REQUEST_CHANGES".into()),
+            findings: vec![],
+        };
+        let review = review_of(&report(vec![]), &earlier, Comments::Single).unwrap();
+        assert_eq!(review.event, "APPROVE");
+        bb.post(7, &review).unwrap();
+        assert_eq!(
+            methods(&sent),
+            ["DELETE /request-changes", "POST /approve", "POST /comments"]
+        );
+        let raw = sent.borrow()[2].body.as_ref().unwrap()["content"]["raw"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(raw.starts_with("### lens review"), "{raw}");
+        assert!(
+            raw.ends_with("[//]: # (lens:review head=abcdef1234 verdict=APPROVE)"),
+            "{raw}"
+        );
+    }
+
+    #[test]
+    fn a_verdict_it_never_gave_or_already_gave_is_no_error() {
+        let dir = repo_with_origin("git@bitbucket.org:team/repo.git");
+        for (clear, give) in [(404, 409), (400, 200), (409, 409)] {
+            let (bb, sent) = bitbucket_with(
+                dir.path(),
+                &[],
+                &[
+                    ("DELETE", &format!("{PR_PATH}/approve"), clear),
+                    ("POST", &format!("{PR_PATH}/request-changes"), give),
+                ],
+            );
+            let review = review_of(&sample(), &Earlier::default(), Comments::Single).unwrap();
+            bb.post(7, &review).unwrap();
+            assert_eq!(sent.borrow().len(), 3, "{clear} {give}");
+        }
+    }
+
+    #[test]
+    fn a_refused_verdict_posts_no_comments() {
+        let dir = repo_with_origin("git@bitbucket.org:team/repo.git");
+        let (bb, sent) = bitbucket_with(
+            dir.path(),
+            &[],
+            &[("POST", &format!("{PR_PATH}/request-changes"), 400)],
+        );
+        let review = review_of(&sample(), &Earlier::default(), Comments::Inline).unwrap();
+        let err = format!("{:#}", bb.post(7, &review).unwrap_err());
+        assert!(err.contains("nothing was posted"), "{err}");
+        assert!(err.contains("post_as = \"bot\""), "{err}");
+        assert_eq!(methods(&sent), ["DELETE /approve", "POST /request-changes"]);
+    }
+
+    #[test]
+    fn a_failed_comment_says_what_bitbucket_answered() {
+        let dir = repo_with_origin("git@bitbucket.org:team/repo.git");
+        let (bb, _) = bitbucket_with(
+            dir.path(),
+            &[],
+            &[("POST", &format!("{PR_PATH}/comments"), 403)],
+        );
+        let review = review_of(&sample(), &Earlier::default(), Comments::Single).unwrap();
+        let err = format!("{:#}", bb.post(7, &review).unwrap_err());
+        assert!(err.contains("403 to POST http://bb/"), "{err}");
+        assert!(err.contains("check the token and its scopes"), "{err}");
+    }
+
+    #[test]
+    fn the_dry_run_payload_is_the_requests_in_order() {
+        let dir = repo_with_origin("git@bitbucket.org:team/repo.git");
+        let bb = bitbucket(dir.path(), &[]);
+        let review = review_of(&sample(), &Earlier::default(), Comments::Inline).unwrap();
+        let payload = bb.payload(7, &review);
+        let requests = payload["requests"].as_array().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[0],
+            json!({"method": "DELETE", "url": format!("{AT}/approve")})
+        );
+        assert_eq!(
+            requests[1],
+            json!({"method": "POST", "url": format!("{AT}/request-changes")})
+        );
+        assert_eq!(requests[2]["body"]["inline"]["to"], 2);
+        assert_eq!(requests[3]["body"]["content"]["raw"], review.body);
+    }
+
+    #[test]
+    fn a_rerun_posts_nothing_in_either_mode() {
+        let dir = repo_with_origin("git@bitbucket.org:team/repo.git");
+        let modes = [Comments::Single, Comments::Inline];
+        for first in modes {
+            for second in modes {
+                let (bb, sent) = bitbucket_with(dir.path(), &[], &[]);
+                let review = review_of(&sample(), &Earlier::default(), first).unwrap();
+                bb.post(7, &review).unwrap();
+                let earlier = earlier_from_comments(as_listed(&sent));
+                assert_eq!(earlier.verdict.as_deref(), Some("REQUEST_CHANGES"));
+                let mut moved = sample();
+                moved.findings[0].line = 4;
+                let again = plan(
+                    &moved,
+                    &earlier,
+                    &commentable(PATCH),
+                    second,
+                    Markup::Bitbucket,
+                );
+                let skipped: Vec<&str> = again.skipped.iter().map(|s| s.id.as_str()).collect();
+                assert_eq!(skipped, ["F1", "F2"], "{first:?} then {second:?}");
+                assert!(again.review.is_none(), "{first:?} then {second:?}");
+            }
+        }
     }
 }

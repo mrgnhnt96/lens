@@ -2,7 +2,7 @@
 //! (`$LENS_BITBUCKET_API`) on localhost and a local origin standing in for bitbucket.org.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
@@ -22,10 +22,13 @@ fn basic_credential(header: &str) -> Option<String> {
 }
 
 /// A Bitbucket API stand-in: answers a GET with the first route whose prefix its path starts
-/// with, and keeps each request's path and `Authorization` header.
+/// with, and keeps each request's path and `Authorization` header. Anything else is kept in
+/// `sent` with its method and body: a DELETE answers 404 (no verdict to clear), a POST 200 with
+/// a link to what it made.
 struct Api {
     base: String,
     seen: Arc<Mutex<Vec<(String, String)>>>,
+    sent: Arc<Mutex<Vec<(String, String, Value)>>>,
 }
 
 fn serve(routes: Vec<(String, Value)>) -> Api {
@@ -38,15 +41,19 @@ fn serve_at(routes: impl FnOnce(&str) -> Vec<(String, Value)>) -> Api {
     let base = format!("http://{}", listener.local_addr().unwrap());
     let routes = routes(&base);
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let log = seen.clone();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (log, sent_log, here) = (seen.clone(), sent.clone(), base.clone());
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
-            let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+            let mut words = line.split_whitespace();
+            let method = words.next().unwrap_or("").to_string();
+            let path = words.next().unwrap_or("").to_string();
             let mut auth = String::new();
+            let mut length = 0;
             loop {
                 let mut h = String::new();
                 if reader.read_line(&mut h).unwrap() == 0 || h.trim().is_empty() {
@@ -56,11 +63,34 @@ fn serve_at(routes: impl FnOnce(&str) -> Vec<(String, Value)>) -> Api {
                     if k.eq_ignore_ascii_case("authorization") {
                         auth = v.trim().to_string();
                     }
+                    if k.eq_ignore_ascii_case("content-length") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
                 }
             }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
             log.lock().unwrap().push((path.clone(), auth));
-            let (status, body) = match routes.iter().find(|(p, _)| path.starts_with(p.as_str())) {
-                Some((_, v)) => ("200 OK", v.to_string()),
+            let answer = if method == "GET" {
+                routes
+                    .iter()
+                    .find(|(p, _)| path.starts_with(p.as_str()))
+                    .map(|(_, v)| ("200 OK", v.to_string()))
+            } else {
+                let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let mut sent = sent_log.lock().unwrap();
+                sent.push((method.clone(), path.clone(), body));
+                Some(match method.as_str() {
+                    "DELETE" => ("404 Not Found", String::new()),
+                    _ => (
+                        "200 OK",
+                        json!({"links": {"html": {"href": format!("{here}/c/{}", sent.len())}}})
+                            .to_string(),
+                    ),
+                })
+            };
+            let (status, body) = match answer {
+                Some(a) => a,
                 None => (
                     "404 Not Found",
                     json!({"error": {"message": format!("no route for {path}")}}).to_string(),
@@ -73,7 +103,7 @@ fn serve_at(routes: impl FnOnce(&str) -> Vec<(String, Value)>) -> Api {
             );
         }
     });
-    Api { base, seen }
+    Api { base, seen, sent }
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -397,7 +427,7 @@ diff --git a/src/a.rs b/src/a.rs
 ";
 
 #[test]
-fn post_shows_the_review_on_a_dry_run_and_says_it_cannot_post_yet() {
+fn post_gives_the_verdict_then_the_comment_and_dry_run_shows_the_requests() {
     let root = tempfile::tempdir().unwrap();
     repos(root.path());
     let work = root.path().join("work");
@@ -437,6 +467,7 @@ fn post_shows_the_review_on_a_dry_run_and_says_it_cannot_post_yet() {
         "--diff",
         diff.to_str().unwrap(),
     ];
+    let at = format!("{}/repositories/team/repo/pullrequests/7", api.base);
     let dry: Value = serde_json::from_str(&ok(&lens(
         &work,
         &api,
@@ -445,17 +476,57 @@ fn post_shows_the_review_on_a_dry_run_and_says_it_cannot_post_yet() {
     )))
     .unwrap();
     assert_eq!(dry["event"], "REQUEST_CHANGES");
-    assert_eq!(dry["payload"]["verdict"], "REQUEST_CHANGES");
-    assert!(
-        dry["payload"]["summary"]
-            .as_str()
-            .unwrap()
-            .contains("new() panics"),
-        "{dry}"
+    assert_eq!(dry["posted"], false);
+    let requests = dry["payload"]["requests"].as_array().unwrap();
+    let urls: Vec<_> = requests
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {}",
+                r["method"].as_str().unwrap(),
+                r["url"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(
+        urls,
+        [
+            format!("DELETE {at}/approve"),
+            format!("POST {at}/request-changes"),
+            format!("POST {at}/comments"),
+        ]
     );
+    assert!(api.sent.lock().unwrap().is_empty());
 
-    let out = lens(&work, &api, OWNER, &args);
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("can't post on Bitbucket"), "{err}");
+    let posted: Value = serde_json::from_str(&ok(&lens(&work, &api, OWNER, &args))).unwrap();
+    assert_eq!(posted["posted"], true);
+    assert_eq!(posted["review"], format!("{}/c/3", api.base));
+    let sent = api.sent.lock().unwrap();
+    let calls: Vec<_> = sent.iter().map(|(m, p, _)| format!("{m} {p}")).collect();
+    let pr_path = "/repositories/team/repo/pullrequests/7";
+    assert_eq!(
+        calls,
+        [
+            format!("DELETE {pr_path}/approve"),
+            format!("POST {pr_path}/request-changes"),
+            format!("POST {pr_path}/comments"),
+        ]
+    );
+    let raw = sent[2].2["content"]["raw"].as_str().unwrap();
+    assert!(raw.contains("new() panics"), "{raw}");
+    assert!(
+        raw.contains("https://bitbucket.org/team/repo/src/0123456789abcdef/src/a.rs#lines-2"),
+        "{raw}"
+    );
+    assert!(raw.contains("[//]: # (lens:finding key="), "{raw}");
+    assert!(
+        raw.contains("[//]: # (lens:review head=0123456789abcdef verdict=REQUEST_CHANGES)"),
+        "{raw}"
+    );
+    let seen = api.seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .all(|(_, a)| basic_credential(a).as_deref() == Some("me@x.io:tok")),
+        "{seen:?}"
+    );
 }

@@ -1733,6 +1733,7 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
             &forge.earlier(number)?,
             &pr::commentable(&patch),
             cfg.comments,
+            forge.markup(),
         );
         let left_out = match plan.left_out.len() {
             0 => String::new(),

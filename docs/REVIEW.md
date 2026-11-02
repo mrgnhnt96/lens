@@ -218,3 +218,14 @@ verdict=<APPROVE|REQUEST_CHANGES> -->`, which is how later runs find what's alre
 verdict they last gave. A finding is already there when an earlier one has its key (in a body or
 inline) or was commented inline in the same file within 3 lines, so a rerun skips it whichever
 mode either run used. The pre-PR protocol review is unaffected: it keeps every severity.
+
+On Bitbucket, which shows HTML comments, the markers are link-reference lines on their own:
+`[//]: # (lens:finding key=<hash>)` and `[//]: # (lens:review head=<sha> verdict=<APPROVE|REQUEST_CHANGES>)`;
+lens reads both forms on either forge. The review there is a verdict and comments, sent in this
+order: `DELETE …/pullrequests/<n>/approve` or `…/request-changes` (the opposite verdict; a 400,
+404 or 409 means there was none), `POST` the verdict (a 409 means it's already given; any other
+failure stops before a comment goes up), a `POST …/comments` with `inline: {path, to}` for each
+inline finding, and last the summary `POST …/comments`, the review body, whose marker records the
+review. How it fails isn't folded away there (Bitbucket has no `<details>`): it follows under a
+bold heading. `file:line` links go to the file at `head` (`<repo>/src/<head>/<file>#lines-<n>`),
+on the diff or not.

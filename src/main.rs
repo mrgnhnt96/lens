@@ -298,6 +298,7 @@ fn run_pr(command: PrCommand) -> Result<()> {
                 &forge.earlier(number)?,
                 &pr::commentable(&patch),
                 cfg.comments,
+                forge.markup(),
             );
             let url = match (&plan.review, dry_run) {
                 (Some(review), false) => forge.post(number, review)?,
@@ -315,7 +316,7 @@ fn run_pr(command: PrCommand) -> Result<()> {
                 "inBody": plan.in_body,
                 "skipped": plan.skipped,
                 "leftOut": plan.left_out,
-                "payload": plan.review.as_ref().filter(|_| dry_run).map(|r| forge.payload(r)),
+                "payload": plan.review.as_ref().filter(|_| dry_run).map(|r| forge.payload(number, r)),
             });
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
