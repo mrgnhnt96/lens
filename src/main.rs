@@ -92,8 +92,8 @@ enum Command {
         #[arg(long)]
         since: Option<String>,
     },
-    /// The PR pass's forge side: GitHub through `gh`, picked by `[pr] forge` or origin's URL
-    /// (posting as .lens.toml's `[pr] post_as`).
+    /// The PR pass's forge side: GitHub through `gh` or Bitbucket Cloud through its API, picked by
+    /// `[pr] forge` or origin's URL (posting as .lens.toml's `[pr] post_as`).
     Pr {
         #[command(subcommand)]
         command: PrCommand,
@@ -103,7 +103,8 @@ enum Command {
 #[derive(Subcommand)]
 enum PrCommand {
     /// Fetch a PR's base branch to origin/<base> and its head to refs/lens/pr/<n>, and print its
-    /// metadata as JSON (number, url, title, body, baseRefName, headRefName, headRefOid).
+    /// metadata as JSON (number, url, title, body, baseRefName, headRefName, headRefOid, and
+    /// headRepo for a Bitbucket fork's PR).
     View {
         /// The PR number.
         #[arg(long)]

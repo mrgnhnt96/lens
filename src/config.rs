@@ -189,10 +189,12 @@ pub enum Comments {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PostAs {
-    /// The account `gh` is logged in as.
+    /// You: the account `gh` is logged in as on GitHub; on Bitbucket, the Atlassian API token in
+    /// `$LENS_BITBUCKET_EMAIL` and `$LENS_BITBUCKET_TOKEN`.
     #[default]
     Owner,
-    /// A bot account, through the token in `bot_token_env`.
+    /// A bot account, through the token in `bot_token_env` (on Bitbucket, a repository access
+    /// token).
     Bot,
 }
 

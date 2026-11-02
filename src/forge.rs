@@ -3,15 +3,17 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{ForgeKind, PrConfig};
 use crate::pr::{Earlier, Review};
 
+mod bitbucket;
 mod github;
 
+pub use bitbucket::Bitbucket;
 #[cfg(test)]
 pub(crate) use github::payload as github_payload;
 pub use github::GitHub;
@@ -28,6 +30,9 @@ pub struct PrView {
     pub base_ref_name: String,
     pub head_ref_name: String,
     pub head_ref_oid: String,
+    /// The `workspace/repo` the head branch lives in, when it isn't origin's (a fork's PR).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_repo: Option<String>,
 }
 
 impl PrView {
@@ -60,8 +65,6 @@ pub trait Forge {
 pub fn open(repo: &Path, config: &PrConfig) -> Result<Box<dyn Forge>> {
     match config.forge(repo) {
         ForgeKind::Github => Ok(Box::new(GitHub::new(repo, config)?)),
-        ForgeKind::Bitbucket => {
-            bail!("lens can't review Bitbucket pull requests yet; set [pr] forge = \"github\" in .lens.toml if this repo's PRs are on GitHub")
-        }
+        ForgeKind::Bitbucket => Ok(Box::new(Bitbucket::new(repo, config)?)),
     }
 }

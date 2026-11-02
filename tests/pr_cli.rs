@@ -75,6 +75,8 @@ fn lens(dir: &Path, args: &[&str]) -> std::process::Output {
         .env("FAKE", dir)
         .env_remove("LENS_BOT_TOKEN")
         .env_remove("GH_TOKEN")
+        .env_remove("LENS_BITBUCKET_EMAIL")
+        .env_remove("LENS_BITBUCKET_TOKEN")
         .output()
         .unwrap()
 }
@@ -259,7 +261,7 @@ fn a_clean_review_of_the_posters_own_pr_posts_nothing() {
 }
 
 #[test]
-fn a_bitbucket_origin_is_refused_until_lens_supports_it() {
+fn a_bitbucket_origin_goes_to_bitbucket_unless_the_config_says_github() {
     let dir = tempfile::tempdir().unwrap();
     setup(dir.path(), json!([]));
     let git = |args: &[&str]| {
@@ -277,7 +279,11 @@ fn a_bitbucket_origin_is_refused_until_lens_supports_it() {
 
     let out = lens(dir.path(), &["pr", "earlier", "--pr", "7"]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("Bitbucket"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LENS_BITBUCKET_TOKEN"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     fs::write(dir.path().join(".lens.toml"), "[pr]\nforge = \"github\"\n").unwrap();
     let out = lens(dir.path(), &["pr", "earlier", "--pr", "7"]);
