@@ -575,6 +575,7 @@ diff --git a/src/a.rs b/src/a.rs
             title: title.into(),
             failure_scenario: "x happens".into(),
             how_it_fails: None,
+            suggested_fix: None,
             fix: None,
         }
     }

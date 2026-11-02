@@ -113,6 +113,9 @@ pub struct Finding {
     pub failure_scenario: String,
     #[serde(default)]
     pub how_it_fails: Option<String>,
+    /// The verifier's one-line fix, when it had one.
+    #[serde(default)]
+    pub suggested_fix: Option<String>,
     #[serde(default)]
     pub fix: Option<Value>,
 }
@@ -502,8 +505,8 @@ pub fn comment_body(f: &Finding, key: &str, markup: Markup) -> String {
 }
 
 /// A finding as lens posts it: severity and title, where it is when that isn't the comment's own
-/// line, the failure scenario and its marker. Nothing else: the verifier's trace stays in the
-/// report.
+/// line, the failure scenario, the suggested fix when there is one, and its marker. Nothing else:
+/// the verifier's trace stays in the report.
 fn finding_text(f: &Finding, key: &str, location: Option<&str>, markup: Markup) -> String {
     let mut s = format!("**{}** · {}", f.severity, f.title);
     if let Some(at) = location {
@@ -513,6 +516,14 @@ fn finding_text(f: &Finding, key: &str, location: Option<&str>, markup: Markup) 
     if !f.failure_scenario.is_empty() {
         s.push_str(f.failure_scenario.trim());
         s.push_str("\n\n");
+    }
+    if let Some(fix) = f
+        .suggested_fix
+        .as_deref()
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+    {
+        s.push_str(&format!("**Fix:** {fix}\n\n"));
     }
     s.push_str(&markup.finding_mark(key));
     s
@@ -642,6 +653,7 @@ mod tests {
             title: title.into(),
             failure_scenario: "x happens".into(),
             how_it_fails: Some("1. step".into()),
+            suggested_fix: None,
             fix: None,
         }
     }
@@ -1083,6 +1095,17 @@ diff --git a/gone.rs b/gone.rs
         assert_eq!(
             b,
             "**blocker** · breaks\n\nx happens\n\n<!-- lens:finding key=k -->"
+        );
+    }
+
+    #[test]
+    fn a_comment_shows_the_suggested_fix_after_the_scenario() {
+        let mut f = finding("F1", "a.rs", 1, "blocker", "breaks");
+        f.suggested_fix = Some("check the length before parsing".into());
+        let b = comment_body(&f, "k", Markup::GitHub);
+        assert_eq!(
+            b,
+            "**blocker** · breaks\n\nx happens\n\n**Fix:** check the length before parsing\n\n<!-- lens:finding key=k -->"
         );
     }
 }

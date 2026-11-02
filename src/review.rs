@@ -138,6 +138,8 @@ pub(crate) struct Finding {
     pub(crate) severity: String,
     pub(crate) title: String,
     pub(crate) failure_scenario: String,
+    /// The reviewer's one-line fix, a hint for the verifier: only the verifier's reaches a post.
+    pub(crate) suggested_fix: Option<String>,
     pub(crate) confidence: f64,
     /// A blocker the last report left unfixed, verified again in a delta review.
     pub(crate) carried: bool,
@@ -154,6 +156,7 @@ impl Finding {
             severity: v["severity"].as_str().unwrap_or("minor").to_string(),
             title: v["title"].as_str().unwrap_or("").to_string(),
             failure_scenario: v["failureScenario"].as_str().unwrap_or("").to_string(),
+            suggested_fix: one_line(&v["suggestedFix"]),
             confidence: v["confidence"].as_f64().unwrap_or(0.5),
             carried: false,
             id: None,
@@ -161,7 +164,7 @@ impl Finding {
     }
 
     pub(crate) fn json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "profiles": self.profiles,
             "file": self.file,
             "line": self.line,
@@ -169,12 +172,16 @@ impl Finding {
             "title": self.title,
             "failureScenario": self.failure_scenario,
             "confidence": self.confidence,
-        })
+        });
+        if let Some(fix) = &self.suggested_fix {
+            v["suggestedFix"] = json!(fix);
+        }
+        v
     }
 
     fn for_verifier(&self) -> String {
         format!(
-            "Finding (from the {} reviewer{}):\n  file: {}\n  line: {}\n  severity: {}\n  title: {}\n  failureScenario: {}\n",
+            "Finding (from the {} reviewer{}):\n  file: {}\n  line: {}\n  severity: {}\n  title: {}\n  failureScenario: {}\n{}",
             self.profiles.join(", "),
             if self.carried {
                 "; an earlier review raised it and it may be fixed by now"
@@ -185,9 +192,19 @@ impl Finding {
             self.line,
             self.severity,
             self.title,
-            self.failure_scenario
+            self.failure_scenario,
+            self.suggested_fix
+                .as_ref()
+                .map(|fix| format!("  suggestedFix: {fix}\n"))
+                .unwrap_or_default()
         )
     }
+}
+
+/// A suggested fix as one trimmed line, or `None` when it's missing or blank.
+fn one_line(v: &Value) -> Option<String> {
+    let line = v.as_str()?.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(line.to_string())
 }
 
 pub fn rank(severity: &str) -> u8 {
@@ -211,6 +228,7 @@ pub(crate) fn merge(findings: Vec<Finding>) -> Vec<Finding> {
                     o.severity = f.severity.clone();
                     o.title = f.title.clone();
                     o.failure_scenario = f.failure_scenario.clone();
+                    o.suggested_fix = f.suggested_fix.clone();
                 }
                 o.confidence = o.confidence.max(f.confidence);
                 o.carried &= f.carried;
@@ -762,6 +780,15 @@ impl Pass {
                         .filter(|s| !s.trim().is_empty())
                     {
                         entry["failureScenario"] = json!(s);
+                    }
+                    // Only a fix the verifier stands behind is posted; the reviewer's was a hint.
+                    match one_line(&r["suggestedFix"]) {
+                        Some(fix) => entry["suggestedFix"] = json!(fix),
+                        None => {
+                            if let Some(o) = entry.as_object_mut() {
+                                o.remove("suggestedFix");
+                            }
+                        }
                     }
                     confirmed.push((f.clone(), entry));
                 }
@@ -1478,6 +1505,9 @@ fn protocol_result(report: Option<&Value>, summary: &str, cost: f64) -> Value {
         .iter()
         .map(|f| {
             let mut detail = f["failureScenario"].as_str().unwrap_or("").to_string();
+            if let Some(fix) = f["suggestedFix"].as_str() {
+                detail = format!("{detail}\n\nFix: {fix}");
+            }
             if let Some(how) = f["howItFails"].as_str().filter(|h| !h.is_empty()) {
                 detail = format!("{detail}\n\n{how}");
             }
@@ -2063,6 +2093,9 @@ pub fn summarize(report: &Value, path: &Path, fresh: bool) -> String {
             f["title"].as_str().unwrap_or("")
         ));
         out.push(format!("  {}", f["failureScenario"].as_str().unwrap_or("")));
+        if let Some(fix) = f["suggestedFix"].as_str() {
+            out.push(format!("  fix: {fix}"));
+        }
         if let Some(how) = f["howItFails"].as_str() {
             for line in how.lines() {
                 out.push(format!("  {line}"));
@@ -2262,6 +2295,7 @@ mod tests {
             severity: sev.into(),
             title: title.into(),
             failure_scenario: String::new(),
+            suggested_fix: None,
             confidence: 0.5,
             carried: false,
             id: None,
@@ -2408,6 +2442,7 @@ mod tests {
             "findings": [{
                 "id": "F1", "title": "t", "severity": "major", "file": "a.rs", "line": 3,
                 "failureScenario": "boom", "howItFails": "because",
+                "suggestedFix": "guard it",
             }],
         });
         let r = protocol_result(Some(&findings), "lens: 1 finding (1 major)\nmore", 0.123456);
@@ -2415,7 +2450,10 @@ mod tests {
         assert_eq!(r["reviewer"], "lens");
         assert_eq!(r["verdict"], "fail");
         assert_eq!(r["headline"], "1 finding (1 major)");
-        assert_eq!(r["findings"][0]["detail"], "boom\n\nbecause");
+        assert_eq!(
+            r["findings"][0]["detail"],
+            "boom\n\nFix: guard it\n\nbecause"
+        );
         assert_eq!(r["findings"][0]["url"], Value::Null);
         assert_eq!(r["cost"]["usd"], 0.1235);
         let clean = json!({ "totals": { "agents": 2 }, "findings": [] });

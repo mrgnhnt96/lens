@@ -32,9 +32,13 @@ findings; its body is your focus. Review only for that focus.
   the diff). `failureScenario` is the input or state and the wrong outcome it leads to, e.g.
   "`parse(\"\")` returns `Ok` with an empty token, so `login` accepts a blank password".
 - **Be terse.** `title` and `failureScenario` are posted on the PR as written, and another agent
-  reads them. `failureScenario` is at most three short sentences: what goes wrong, and the fix
-  when it isn't obvious. No preamble, no hedging, no restating the title, no praise, and don't
-  address the reader. Evidence and steps belong in your reasoning, not in it.
+  reads them. `failureScenario` is at most three short sentences: what goes wrong. No preamble,
+  no hedging, no restating the title, no praise, and don't address the reader. Evidence and
+  steps belong in your reasoning, not in it.
+- **Suggest a fix when there's a clear one.** `suggestedFix` is optional: one line naming the
+  change that fixes it, e.g. "return `Err` from `parse` on an empty string". Leave it out when
+  the fix is a design choice or needs more than a line to say. The verifier checks it before it
+  is posted.
 - **Grade honestly** by the profile's `severityGuidance`: `blocker`, `major`, `minor` or `nit`.
   `confidence` is 0–1: how sure you are that the failure really happens.
 - Raise nothing rather than pad. Zero findings is a good review of a good change.
@@ -53,6 +57,7 @@ End your reply with exactly one fenced `json` block, and nothing after it:
       "severity": "major",
       "title": "empty input parses as a valid token",
       "failureScenario": "parse(\"\") returns Ok(Token::empty()), so login() accepts a blank password",
+      "suggestedFix": "return Err from parse() on an empty string",
       "confidence": 0.8
     }
   ]
