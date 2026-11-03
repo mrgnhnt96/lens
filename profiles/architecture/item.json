@@ -1,5 +1,5 @@
 {
   "name": "architecture",
   "conformsTo": "reviewer@1",
-  "description": "Layering, coupling, separation of concerns, consistency with the codebase's established patterns."
+  "description": "Structural changes that cost something now — broken boundaries, a second way to do a job the repo already does, new APIs that trap their callers."
 }
