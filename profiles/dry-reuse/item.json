@@ -1,5 +1,5 @@
 {
   "name": "dry-reuse",
   "conformsTo": "reviewer@1",
-  "description": "Duplicated logic, reinvented helpers, missed reuse of utilities that already exist in the repo."
+  "description": "Duplicated logic that already differs or must stay in step, and helpers the diff rewrites instead of calling."
 }

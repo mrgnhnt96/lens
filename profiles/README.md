@@ -38,12 +38,12 @@ General:
 
 - `impact-assessment` — lead assessment (impact, blast radius, risk, needs human judgment); runs first and may dispatch minions.
 - `correctness` — logic errors, races, leaks, null handling, async mistakes.
-- `architecture` — layering, coupling, separation of concerns, pattern consistency.
+- `architecture` — structural changes that cost something now: broken boundaries, a second path for an existing job, APIs that trap callers. Returns nothing for diffs that touch no structure.
 - `intent-alignment` — does the change satisfy the linked ticket / design, without scope creep.
 - `testing` — coverage of the change, brittle tests, mock-vs-reality mismatches.
 - `security` — injection, validation, authn/authz, secrets, unsafe deserialization.
 - `performance` — N+1, hot-path allocation, blocking I/O, complexity regressions.
-- `dry-reuse` — duplicated logic and missed reuse of existing helpers.
+- `dry-reuse` — duplicated logic that already differs or must stay in step, and repo helpers the diff rewrites instead of calling.
 - `coding-guidelines` — the repo's own written conventions.
 
 Dart / Flutter:
