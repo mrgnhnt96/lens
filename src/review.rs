@@ -1794,14 +1794,12 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         rows.push(row);
     }
 
-    let (confirmed, dropped) = pass.verify(
-        &system,
-        &merge(raised.into_iter().chain(carried).collect()),
-        |_| true,
-    );
+    let (to_verify, nits) = skip_nits(merge(raised.into_iter().chain(carried).collect()));
+    let (confirmed, mut dropped) = pass.verify(&system, &to_verify, |_| true);
     if let Some(why) = pass.parked() {
         return Ok(parked(&why));
     }
+    dropped.extend(nits);
     let pr_info: Value = serde_json::from_str(&fs::read_to_string(pass.work.join("pr.json"))?)
         .unwrap_or(Value::Null);
     let mut report = json!({
@@ -1831,6 +1829,26 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
 
     let summary = summarize(&report, &pass.report_path, false);
     Ok(post_pr(pass, number, &report, summary, &failed))
+}
+
+/// Why a nit the PR pass never verified is in the report's `dropped`.
+const NIT_UNVERIFIED: &str = "nit: never posted, so not verified";
+
+/// Splits off the nits: a PR never gets one (`pr::Finding::left_out`), so a verifier on one is
+/// spent for nothing. They go to `dropped`, not `findings`, so the report counts only what a
+/// verifier checked.
+fn skip_nits(findings: Vec<Finding>) -> (Vec<Finding>, Vec<Value>) {
+    let (nits, rest): (Vec<Finding>, Vec<Finding>) =
+        findings.into_iter().partition(|f| f.severity == "nit");
+    let dropped = nits
+        .iter()
+        .map(|f| {
+            let mut e = f.json();
+            e["reason"] = json!(NIT_UNVERIFIED);
+            e
+        })
+        .collect();
+    (rest, dropped)
 }
 
 /// What a PR changed since lens last reviewed it.
@@ -2140,10 +2158,19 @@ pub fn summarize(report: &Value, path: &Path, fresh: bool) -> String {
         .iter()
         .filter(|d| d["reason"] == "below major")
         .count();
-    out.push(format!(
-        "Dropped {} finding(s) the verifier couldn't show failing; {below} below major.",
-        dropped.len() - below
-    ));
+    let nits = dropped
+        .iter()
+        .filter(|d| d["reason"] == NIT_UNVERIFIED)
+        .count();
+    let mut line = format!(
+        "Dropped {} finding(s) the verifier couldn't show failing; {below} below major",
+        dropped.len() - below - nits
+    );
+    if nits > 0 {
+        line.push_str(&format!("; {nits} nit(s) left out unverified"));
+    }
+    line.push('.');
+    out.push(line);
     if let Some(err) = report["map"]["error"].as_str() {
         out.push(format!(
             "The change map failed, so reviewers ran without it: {err}"

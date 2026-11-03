@@ -39,7 +39,7 @@ fn write(dir: &Path, path: &str, text: &str) {
 /// and prompt. It plays the prompt cache too: the first request with a given model, tools and
 /// system prompt reports the system prompt's length as cache creation, later ones as cache read. The correctness reviewer raises a blocker and a minor in src/a.rs and a
 /// major in src/b.rs; the verifier confirms both. The reviewer whose profile `$FAKE_FAIL` names replies with no JSON. The PR
-/// pass's lead names one focus area. The plan turns away every agent of the role `$FAKE_REJECT`
+/// pass's lead names one focus area. With `$FAKE_NIT` set it raises a nit in src/a.rs too. The plan turns away every agent of the role `$FAKE_REJECT`
 /// names.
 const FAKE: &str = r#"#!/usr/bin/env python3
 import hashlib, json, os, re, sys, time
@@ -85,6 +85,9 @@ elif role == "reviewer":
              "failureScenario": "confusing", "confidence": 0.5},
         ]
         # A delta review looks only at the delta, which never touches src/b.rs.
+        if os.environ.get("FAKE_NIT"):
+            findings.append({"file": "src/a.rs", "line": 30, "severity": "nit", "title": "stray blank line",
+                             "failureScenario": "none, it reads oddly", "confidence": 0.9})
         if "(delta.patch)" not in system_text:
             findings.append({"file": "src/b.rs", "line": 1, "severity": "major", "title": "leaks a handle",
                              "failureScenario": "b() never closes it", "confidence": 0.7,
@@ -727,6 +730,54 @@ fn the_pr_pass_runs_the_lead_and_its_focus_areas_and_posts() {
         out.contains("Posted (request changes): https://github.test/pr/7#review-1"),
         "{out}"
     );
+}
+
+#[test]
+fn the_pr_pass_never_verifies_a_nit() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let out = fx.review_with(
+        &[],
+        &["--pr", "7"],
+        &[
+            ("LENS_GH", &gh),
+            ("FAKE", &fake),
+            ("FAKE_NIT", Path::new("1")),
+        ],
+    );
+
+    // The nit is never posted, so no verifier is spent on it; the others are still verified.
+    let calls = fx.calls();
+    let verifiers: Vec<&Value> = calls.iter().filter(|c| c["role"] == "verifier").collect();
+    assert!(!verifiers.is_empty());
+    assert!(verifiers
+        .iter()
+        .all(|v| !v["prompt"].as_str().unwrap().contains("stray blank line")));
+
+    // It's listed as dropped, not as a finding, so the counts hold only what was verified.
+    let report = read_json(&fx.state().join("pr-7.json"));
+    let findings = report["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().all(|f| f["severity"] != "nit"),
+        "{findings:?}"
+    );
+    let nit = report["dropped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["title"] == "stray blank line")
+        .expect("the nit is in dropped");
+    assert_eq!(nit["reason"], "nit: never posted, so not verified");
+    assert!(out.contains("1 nit(s) left out unverified"), "{out}");
+
+    let posted: Value =
+        serde_json::from_str(&fs::read_to_string(fake.join("posted.json")).unwrap()).unwrap();
+    assert!(!posted["body"]
+        .as_str()
+        .unwrap()
+        .contains("stray blank line"));
 }
 
 #[test]
