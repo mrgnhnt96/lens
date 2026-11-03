@@ -323,6 +323,34 @@ impl Fixture {
         (gh, fake)
     }
 
+    /// Commits a fix to src/a.rs (with anything already staged) and pushes it as PR 7's new head.
+    fn push_fix(&self, fake: &Path) {
+        let d = self.repo();
+        write(
+            &d,
+            "src/a.rs",
+            &(fs::read_to_string(d.join("src/a.rs")).unwrap() + "// a fix\n"),
+        );
+        git(&d, &["commit", "-qam", "fix"]);
+        git(
+            &d,
+            &["push", "-q", "-f", "origin", "feature:refs/pull/7/head"],
+        );
+        let head = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&d)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let mut pr: Value = read_json(&fake.join("pr.json"));
+        pr["headRefOid"] = json!(head.trim());
+        fs::write(fake.join("pr.json"), pr.to_string()).unwrap();
+    }
+
     /// Every agent started so far, and clears the log.
     fn calls(&self) -> Vec<Value> {
         let calls = fs::read_to_string(&self.log)
@@ -870,30 +898,7 @@ fn a_rereview_reviews_only_what_changed_since_the_last_posted_review() {
     assert_eq!(first["mode"], "full");
     fx.calls();
 
-    // A new commit on the PR.
-    write(
-        &d,
-        "src/a.rs",
-        &(fs::read_to_string(d.join("src/a.rs")).unwrap() + "// a fix\n"),
-    );
-    git(&d, &["commit", "-qam", "fix"]);
-    git(
-        &d,
-        &["push", "-q", "-f", "origin", "feature:refs/pull/7/head"],
-    );
-    let head = String::from_utf8(
-        Command::new("git")
-            .arg("-C")
-            .arg(&d)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
-    let mut pr: Value = read_json(&fake.join("pr.json"));
-    pr["headRefOid"] = json!(head.trim());
-    fs::write(fake.join("pr.json"), pr.to_string()).unwrap();
+    fx.push_fix(&fake);
 
     fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
     let report = read_json(&fx.state().join("pr-7.json"));
@@ -925,10 +930,78 @@ fn a_rereview_reviews_only_what_changed_since_the_last_posted_review() {
         .filter(|f| f["severity"] == "blocker" || f["severity"] == "major")
         .count();
     assert!(serious > 0 && carried >= 1, "{carried} of {serious}");
+    // The base and the PR's files are the same, so the lead's assessment is reused; its focus
+    // area on src/a.rs, which the delta touches, is reviewed again.
+    assert_lead_reused(&report, &first, &calls);
+    assert!(ran(&report).contains(&"focus: parsing".to_string()));
 
     // --full reviews the whole change again.
     fx.review_with(&[], &["--pr", "7", "--dry-run", "--full"], &env);
     assert_eq!(read_json(&fx.state().join("pr-7.json"))["mode"], "full");
+    assert!(fx.calls().iter().any(is_lead));
+}
+
+#[test]
+fn a_rereview_with_nothing_posted_reuses_the_lead_until_the_files_change() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let first = read_json(&fx.state().join("pr-7.json"));
+    assert!(fx.calls().iter().any(is_lead));
+
+    // No review was posted, so this is a full review, but the lead's assessment still holds.
+    fx.push_fix(&fake);
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "full");
+    assert_lead_reused(&report, &first, &fx.calls());
+    assert_eq!(report["risk"], first["risk"]);
+    assert_eq!(
+        fs::read_to_string(fx.state().join("pr-7/impact.md")).unwrap(),
+        "**Impact**: small"
+    );
+    assert!(ran(&report).contains(&"focus: parsing".to_string()));
+
+    // A commit that adds a file changes what the PR touches: the lead runs again.
+    write(&d, "src/c.rs", "pub fn c() {}\n");
+    git(&d, &["add", "src/c.rs"]);
+    fx.push_fix(&fake);
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    assert!(fx.calls().iter().any(is_lead));
+    assert!(read_json(&fx.state().join("pr-7.json"))["lead"]["reusedFrom"].is_null());
+}
+
+fn is_lead(call: &Value) -> bool {
+    call["prompt"]
+        .as_str()
+        .unwrap_or("")
+        .contains("You are the lead reviewer")
+}
+
+fn ran(report: &Value) -> Vec<String> {
+    report["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["ran"] == true)
+        .map(|p| p["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn assert_lead_reused(report: &Value, earlier: &Value, calls: &[Value]) {
+    assert!(!calls.iter().any(is_lead), "the lead ran again");
+    assert_eq!(report["assessment"], earlier["assessment"]);
+    assert_eq!(report["lead"]["reusedFrom"], earlier["head"]);
+    let lead = report["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "impact-assessment")
+        .unwrap();
+    assert_eq!(lead["ran"], false, "{lead}");
 }
 
 #[test]
