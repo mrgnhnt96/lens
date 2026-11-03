@@ -781,6 +781,52 @@ fn the_pr_pass_never_verifies_a_nit() {
 }
 
 #[test]
+fn only_runs_the_named_profiles_and_leaves_the_prs_own_report_alone() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(
+        &[],
+        &["--pr", "7", "--dry-run", "--only", "correctness"],
+        &env,
+    );
+
+    // One reviewer, no lead and so no focus areas; its findings are still verified.
+    let calls = fx.calls();
+    let reviewers: Vec<&Value> = calls.iter().filter(|c| c["role"] == "reviewer").collect();
+    assert_eq!(reviewers.len(), 1, "{reviewers:?}");
+    assert!(!reviewers[0]["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("You are the lead reviewer"));
+    assert!(calls.iter().any(|c| c["role"] == "verifier"));
+
+    let report = read_json(&fx.state().join(".only/pr-7.json"));
+    assert_eq!(report["mode"], "full");
+    let ran: Vec<&str> = report["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["ran"] == true)
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(ran, ["correctness"]);
+    assert!(!fx.state().join("pr-7.json").exists());
+    assert!(!fake.join("posted.json").exists());
+
+    // A real review afterwards neither reuses nor builds on the partial run.
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let full = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(full["mode"], "full");
+    assert!(fx.calls().iter().any(|c| c["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("You are the lead reviewer")));
+}
+
+#[test]
 fn a_pr_whose_head_is_unchanged_reuses_its_last_review() {
     let fx = Fixture::new(60);
     let d = fx.repo();
