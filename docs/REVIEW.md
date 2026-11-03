@@ -222,6 +222,13 @@ agents: it reuses that report and posts what's left to post. `--full` reviews it
 gets one review per commit, and a rerun can't turn up a different set of findings for the same
 code.
 
+`lens review --pr <n> --dry-run --only <profile>,...` is for tuning reviewers: `profiles.json`
+picks only the named profiles (the rest are `skipped` with `"not named in --only"`), so the
+report's `profiles` lists just those, and their findings are verified as usual. The lead runs
+only when `impact-assessment` is named. The run is always `"mode": "full"`, posts nothing, and
+keeps its state in `<state>/.only/` instead of `<state>/`, so the PR's own report, its reuse and
+its deltas never see a partial run.
+
 `lens pr post` reads the report and posts it; it uses `pr.url`, `head` and `findings`, and
 ignores the rest. It posts `blocker`, `major` and `minor` findings; `nit`s are counted in the
 review's first line (`· 2 nit left out`) and not shown. An agent reads the post, so it holds

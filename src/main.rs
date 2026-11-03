@@ -43,6 +43,11 @@ enum Command {
         /// With --pr: build the review but don't post it.
         #[arg(long, requires = "pr")]
         dry_run: bool,
+        /// With --pr --dry-run: run only these reviewer profiles (comma-separated or repeated)
+        /// and the verifiers of their findings, to tune one reviewer for a fraction of a full
+        /// run. Implies --full, and keeps its report apart from the PR's own.
+        #[arg(long, requires = "dry_run", value_delimiter = ',')]
+        only: Vec<String>,
         /// The repo to review. Defaults to the current directory.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -58,6 +63,10 @@ enum Command {
         /// The default profiles. Defaults to $LENS_PROFILES_DIR, then the ones built into lens.
         #[arg(long)]
         defaults: Option<PathBuf>,
+        /// Keep only these picks (comma-separated or repeated) and list the rest as skipped.
+        /// Defaults to $LENS_ONLY_PROFILES, which `lens review --only` sets.
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
     },
     /// Map the change since <base>: changed files and symbols, their callers and covering tests.
     Map {
@@ -186,20 +195,27 @@ fn main() -> Result<()> {
             base,
             repo,
             defaults,
+            only,
         } => {
             let defaults = match defaults {
                 Some(dir) => dir,
                 None => default_profiles_dir()?,
             };
+            let only = match only.is_empty() {
+                true => only_from_env(env::var(ONLY_VAR).ok().as_deref()),
+                false => only,
+            };
             let change = diff::changed_files(&repo, &base)?;
             let profiles = profile::load_all(&defaults, &change.root)?;
+            let mut selection = select::select(&profiles, &change.files)?;
+            keep_only(&mut selection, &only, &profiles)?;
             let out = ProfilesOut {
                 base: &base,
                 merge_base: &change.merge_base,
                 root: &change.root,
                 changed_files: &change.files,
                 languages: select::languages(&change.files).into_iter().collect(),
-                selection: select::select(&profiles, &change.files)?,
+                selection,
             };
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
@@ -218,17 +234,28 @@ fn main() -> Result<()> {
             floor,
             pr,
             dry_run,
+            only,
             repo,
         } => {
+            let state = match only.is_empty() {
+                true => {
+                    env::remove_var(ONLY_VAR);
+                    None
+                }
+                false => {
+                    env::set_var(ONLY_VAR, only.join(","));
+                    Some(outcome::state_of(&repo)?.join(ONLY_STATE))
+                }
+            };
             let mut opts = review::Options {
+                full: full || state.is_some(),
                 repo,
                 base,
                 intent,
-                full,
                 floor,
                 pr,
                 dry_run,
-                state: None,
+                state,
                 protocol: None,
             }
             .with_protocol(|k| std::env::var(k).ok());
@@ -369,10 +396,150 @@ fn run_pr(command: PrCommand) -> Result<()> {
     Ok(())
 }
 
+/// Carries `lens review --only` to the `lens profiles` its prepare script runs.
+const ONLY_VAR: &str = "LENS_ONLY_PROFILES";
+
+/// The folder, inside the repo's state folder, an `--only` run keeps its work and report in, so
+/// a later full review neither reuses nor builds a delta on a partial one. Git allows no branch
+/// named like it, so it never meets a local pass's `<branch>/` folder.
+const ONLY_STATE: &str = ".only";
+
+fn only_from_env(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Moves every pick not named in `only` to the skipped list. An empty `only` keeps them all; a
+/// name no profile has is an error, so a typo doesn't silently review nothing.
+fn keep_only(
+    selection: &mut select::Selection,
+    only: &[String],
+    profiles: &[profile::Profile],
+) -> Result<()> {
+    if only.is_empty() {
+        return Ok(());
+    }
+    let unknown: Vec<&str> = only
+        .iter()
+        .filter(|n| !profiles.iter().any(|p| &p.meta.name == *n))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        let mut known: Vec<&str> = profiles.iter().map(|p| p.meta.name.as_str()).collect();
+        known.sort_unstable();
+        anyhow::bail!(
+            "no reviewer profile named {}; the profiles are {}",
+            unknown.join(", "),
+            known.join(", ")
+        );
+    }
+    let (kept, left) = std::mem::take(&mut selection.picked)
+        .into_iter()
+        .partition(|p| only.contains(&p.name));
+    selection.picked = kept;
+    selection
+        .skipped
+        .extend(left.into_iter().map(|p: select::Picked| select::Skipped {
+            name: p.name,
+            reason: "not named in --only".into(),
+        }));
+    Ok(())
+}
+
 /// `$LENS_PROFILES_DIR`, else the profiles built into lens.
 fn default_profiles_dir() -> Result<PathBuf> {
     if let Some(dir) = env::var_os("LENS_PROFILES_DIR") {
         return Ok(dir.into());
     }
     Ok(lens::assets::root()?.join("profiles"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lens::profile::{Profile, Source};
+
+    fn profiles(names: &[&str]) -> Vec<Profile> {
+        names
+            .iter()
+            .map(|n| {
+                let text = format!("---\nname: {n}\ndescription: d\nmodel: sonnet\neffort: high\nseverityGuidance: g\nenabled: true\n---\nprompt\n");
+                Profile::parse(
+                    &text,
+                    PathBuf::from(format!("{n}/profile.md")),
+                    Source::Default,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn names<T>(items: &[T], name: impl Fn(&T) -> &str) -> Vec<&str> {
+        items.iter().map(name).collect()
+    }
+
+    #[test]
+    fn keeps_only_the_named_picks_and_skips_the_rest() {
+        let all = profiles(&["correctness", "testing", "security"]);
+        let mut sel = select::select(&all, &["src/a.rs".into()]).unwrap();
+        keep_only(&mut sel, &["testing".into()], &all).unwrap();
+        assert_eq!(names(&sel.picked, |p| &p.name), ["testing"]);
+        assert_eq!(
+            names(&sel.skipped, |s| &s.name),
+            ["correctness", "security"]
+        );
+        assert!(sel
+            .skipped
+            .iter()
+            .all(|s| s.reason == "not named in --only"));
+    }
+
+    #[test]
+    fn no_names_keeps_every_pick() {
+        let all = profiles(&["correctness", "testing"]);
+        let mut sel = select::select(&all, &["src/a.rs".into()]).unwrap();
+        keep_only(&mut sel, &[], &all).unwrap();
+        assert_eq!(names(&sel.picked, |p| &p.name), ["correctness", "testing"]);
+        assert!(sel.skipped.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_name_is_an_error_listing_the_profiles() {
+        let all = profiles(&["testing", "correctness"]);
+        let mut sel = select::select(&all, &["src/a.rs".into()]).unwrap();
+        let err = keep_only(&mut sel, &["tesing".into()], &all).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no reviewer profile named tesing; the profiles are correctness, testing"
+        );
+    }
+
+    #[test]
+    fn reads_the_names_lens_review_passes_down() {
+        assert_eq!(
+            only_from_env(Some("testing, security,")),
+            ["testing", "security"]
+        );
+        assert!(only_from_env(Some("")).is_empty());
+        assert!(only_from_env(None).is_empty());
+    }
+
+    #[test]
+    fn only_needs_a_dry_run_of_a_pr() {
+        let parse = |args: &[&str]| Cli::try_parse_from(["lens", "review"].iter().chain(args));
+        assert!(parse(&["--pr", "15", "--only", "testing"]).is_err());
+        let Command::Review { only, .. } =
+            parse(&["--pr", "15", "--dry-run", "--only", "testing,security"])
+                .unwrap()
+                .command
+        else {
+            panic!("not a review");
+        };
+        assert_eq!(only, ["testing", "security"]);
+    }
 }

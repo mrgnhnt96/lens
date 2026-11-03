@@ -39,7 +39,7 @@ docs/PROVIDERS.md            the change-map provider contract
 docs/REVIEW.md               the report and protocol result formats, and where state is kept
 ```
 
-## `lens review [<base>] [--intent <file>] [--full]`, `lens review --floor`, `lens review --pr <n> [--full]`
+## `lens review [<base>] [--intent <file>] [--full]`, `lens review --floor`, `lens review --pr <n> [--full] [--dry-run [--only <profile>,...]]`
 
 Runs a pass and prints its summary; the report goes to `<state>/<branch>.json` (format in
 [docs/REVIEW.md](docs/REVIEW.md)). Nothing is written to the repo: `<state>` is
@@ -112,7 +112,18 @@ risky = ["src/auth/**", "migrations/**", "**/billing/*.rs", "**/payment*"]
 
 `$LENS_CLAUDE` names the `claude` program to run (the tests use a fake).
 
-## `lens profiles --base <ref>`
+**Tuning one reviewer.** `lens review --pr <n> --dry-run --only testing` runs only the named
+profiles (comma-separated, or `--only` again) and the verifiers of their findings, so checking
+one reviewer's consistency costs a fraction of a full PR pass. It posts nothing (`--only` needs
+`--dry-run`) and always reviews the whole PR (`--full`): reruns of one commit each run the
+reviewer again. Its work and report go to `<state>/.only/` (`pr-<n>.json`, and each run's report
+in `pr-<n>/reports/`), so the PR's real report is never reused or overwritten by a partial one,
+and `lens cost` still counts what it spent. Name `impact-assessment` to run the lead, and
+`correctness` with it to get its focus-area reviewers too. A name no profile has fails with the
+list of profiles; a named profile the change doesn't pick (wrong language, `enabled: false`)
+stays skipped with its reason.
+
+## `lens profiles --base <ref> [--only <profile>,...]`
 
 Prints, as JSON, the profiles that apply to everything that changed since the merge base of
 `<ref>` and `HEAD` (commits, staged, unstaged and untracked files):
@@ -126,6 +137,10 @@ Prints, as JSON, the profiles that apply to everything that changed since the me
 
 A repo's own `review-profiles/<name>/profile.md` replaces the default with that name; new
 names are added.
+
+`--only <profile>,...` (or `$LENS_ONLY_PROFILES`, which `lens review --only` sets and any other
+`lens review` clears) keeps just
+those picks and lists the others under `skipped` with `"not named in --only"`.
 
 ## `lens map --base <ref>`
 
