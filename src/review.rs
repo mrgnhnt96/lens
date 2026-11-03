@@ -714,6 +714,19 @@ impl Pass {
         }
     }
 
+    /// A stable hash of everything that instructs the lead: the preamble, the reviewer role and
+    /// its profile. An earlier assessment is reused only while this is the same.
+    fn lead_hash(&self, lead: &Plan) -> Result<String> {
+        let text = format!(
+            "{}\n{}\n{}",
+            agent::role_prompt(&self.assets, "preamble")?,
+            self.roles["reviewer"],
+            fs::read_to_string(&lead.path)
+                .with_context(|| format!("reading {}", lead.path.display()))?
+        );
+        Ok(format!("{:016x}", fnv1a(text.as_bytes())))
+    }
+
     pub(crate) fn reviewer_prompt(&self, plan: &Plan, extra: &str) -> Result<String> {
         let profile = fs::read_to_string(&plan.path)
             .with_context(|| format!("reading {}", plan.path.display()))?;
@@ -893,14 +906,15 @@ pub fn run(opts: Options) -> Result<Done> {
 /// of one repo keep apart. The hash is FNV-1a, which no toolchain update changes, so a rebuilt
 /// lens still finds the last report.
 pub(crate) fn state_dir(state_root: &Path, root: &Path) -> PathBuf {
-    let hash = root
-        .as_os_str()
-        .as_encoded_bytes()
-        .iter()
-        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
-            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
-        });
+    let hash = fnv1a(root.as_os_str().as_encoded_bytes());
     state_root.join(format!("{}-{hash:016x}", repo_name(root)))
+}
+
+/// FNV-1a: a hash a later build of lens computes the same way, for anything kept on disk.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 fn prepare(assets: &Path, root: &Path, state: &Path, opts: &Options) -> Result<Value> {
@@ -1664,9 +1678,68 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
     let mut risk = Value::Null;
     let mut assessment = Value::Null;
     let mut focus: Vec<Value> = Vec::new();
+    let mut lead_record = Value::Null;
     let mut correctness: Option<Plan> = None;
     let t = Instant::now();
-    if let Some(lead) = plans.iter().find(|p| p.name == LEAD && p.run) {
+    let lead = plans.iter().find(|p| p.name == LEAD && p.run);
+    let lead_hash = lead.map(|l| pass.lead_hash(l)).transpose()?;
+    let prior_lead = match (&lead_hash, pass.opts.full) {
+        (Some(hash), false) => delta
+            .as_ref()
+            .map_or_else(|| last_report(&pass.report_path), |d| d.previous.clone())
+            .filter(|prev| reusable_lead(prev, &prepared, hash, &files)),
+        _ => None,
+    };
+    if let (Some(lead), Some(prev)) = (lead, &prior_lead) {
+        let from = prev["head"].as_str().unwrap_or("");
+        let short = &from[..from.len().min(7)];
+        risk = prev["risk"].clone();
+        assessment = prev["assessment"].clone();
+        let all = prev["lead"]["focusAreas"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        focus = match &delta {
+            Some(d) => all
+                .iter()
+                .filter(|f| touches(f, &d.files))
+                .cloned()
+                .collect(),
+            None => all.clone(),
+        };
+        pass.log(&format!(
+            "reusing the lead's assessment of {short}: same base and files (--full runs it again); {} of {} focus area(s) to review again",
+            focus.len(),
+            all.len()
+        ));
+        // A full review re-raises what every other reviewer found; the lead's own findings come
+        // back only this way.
+        if delta.is_none() {
+            raised.extend(
+                prev["findings"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|f| {
+                        f["profiles"]
+                            .as_array()
+                            .is_some_and(|p| p.contains(&json!(LEAD)))
+                    })
+                    .filter_map(carry),
+            );
+        }
+        let mut reused = lead.clone();
+        reused.run = false;
+        reused.reason = format!("reused from {short}");
+        rows.push(reused.json(None));
+        lead_record =
+            json!({ "profile": lead_hash, "files": files, "focusAreas": all, "reusedFrom": from });
+        fs::write(
+            pass.work.join("impact.md"),
+            assessment.as_str().unwrap_or(""),
+        )?;
+    } else if let Some(lead) = lead {
         pass.log("running the lead reviewer (impact-assessment)");
         let prompt = pass.reviewer_prompt(lead, &format!("{extra}\nYou are the lead reviewer. Return the assessment, risk and focusAreas as well as findings.\n"))?;
         let o = pass.runner.run(pass.spec(
@@ -1685,6 +1758,7 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
                 assessment = r["assessment"].clone();
                 focus = r["focusAreas"].as_array().cloned().unwrap_or_default();
                 focus.truncate(lead.max_minions as usize);
+                lead_record = json!({ "profile": lead_hash, "files": files, "focusAreas": focus });
                 let fs: Vec<Finding> = r["findings"]
                     .as_array()
                     .cloned()
@@ -1816,6 +1890,7 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         "map": map_status(&pass.work),
         "risk": risk,
         "assessment": assessment,
+        "lead": lead_record,
         "profiles": rows,
         "findings": number_all(confirmed),
         "dropped": dropped,
@@ -1857,6 +1932,8 @@ struct PrDelta {
     from: String,
     /// `git diff <from> <head>`.
     patch: String,
+    /// The files `patch` touches.
+    files: Vec<String>,
     /// That review's report, when lens kept it: its blockers and majors are verified again.
     previous: Option<Value>,
 }
@@ -1878,10 +1955,16 @@ fn pr_delta(pass: &Pass) -> Option<PrDelta> {
     }
     crate::diff::git(tree, &["merge-base", "--is-ancestor", &from, head]).ok()?;
     let patch = crate::diff::git(tree, &["diff", "--full-index", &from, head]).ok()?;
+    let files = crate::diff::git(tree, &["diff", "--name-only", "--no-renames", &from, head])
+        .ok()?
+        .lines()
+        .map(String::from)
+        .collect();
     Some(PrDelta {
         previous: report_for(pass, &from),
         from,
         patch,
+        files,
     })
 }
 
@@ -1912,6 +1995,53 @@ fn reusable(path: &Path, prepared: &Value) -> Option<Value> {
         && prev["base"] == prepared["base"]
         && prev["lens"] == crate::assets::fingerprint().as_str())
     .then_some(prev)
+}
+
+/// The last pass's report, whatever head it reviewed.
+fn last_report(path: &Path) -> Option<Value> {
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+}
+
+/// Whether `prev`'s lead assessment still describes the PR: same base and merge base, the same
+/// lead instructions (`hash`), and the PR touches the same `files`. A re-review then skips the
+/// lead and reruns only the focus areas its delta touches.
+fn reusable_lead(prev: &Value, prepared: &Value, hash: &str, files: &[String]) -> bool {
+    let lead = &prev["lead"];
+    let same_files = || {
+        let before: BTreeSet<&str> = lead["files"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        before == files.iter().map(String::as_str).collect()
+    };
+    prev["pass"] == "pr"
+        && prev["base"] == prepared["base"]
+        && prev["mergeBase"] == prepared["mergeBase"]
+        && prev["assessment"]
+            .as_str()
+            .is_some_and(|a| !a.trim().is_empty())
+        && lead["profile"] == hash
+        && lead["focusAreas"].is_array()
+        && same_files()
+}
+
+/// Whether a lead focus area names one of `files` (or a folder holding one). An area naming no
+/// files counts as touched.
+fn touches(area: &Value, files: &[String]) -> bool {
+    let named: Vec<&str> = area["files"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    named.is_empty()
+        || named.iter().any(|n| {
+            let n = n.trim_end_matches('/');
+            files.iter().any(|f| {
+                f == n
+                    || n.strip_prefix(f.as_str())
+                        .is_some_and(|rest| rest.starts_with(':'))
+                    || f.strip_prefix(n).is_some_and(|rest| rest.starts_with('/'))
+            })
+        })
 }
 
 /// Posts a PR pass's report (unless it's a dry run) and adds what happened to `summary`.
@@ -2532,5 +2662,52 @@ mod tests {
     fn formats_iso_times() {
         assert_eq!(iso(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso(1_760_486_400), "2025-10-15T00:00:00Z");
+    }
+
+    #[test]
+    fn reuses_the_lead_only_while_base_instructions_and_files_hold() {
+        let prepared = json!({"base": "main", "mergeBase": "m1"});
+        let files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        let prev = json!({
+            "pass": "pr", "base": "main", "mergeBase": "m1", "assessment": "## Impact\n...",
+            "lead": {"profile": "h1", "files": ["src/b.rs", "src/a.rs"], "focusAreas": []}
+        });
+        assert!(reusable_lead(&prev, &prepared, "h1", &files));
+
+        let with = |path: &str, value: Value| {
+            let mut p = prev.clone();
+            *p.pointer_mut(path).unwrap() = value;
+            p
+        };
+        for changed in [
+            with("/pass", json!("local")),
+            with("/base", json!("develop")),
+            with("/mergeBase", json!("m2")),
+            with("/assessment", json!("  ")),
+            with("/lead/profile", json!("h2")),
+            with("/lead/focusAreas", Value::Null),
+            with("/lead/files", json!(["src/a.rs"])),
+            with("/lead", Value::Null),
+        ] {
+            assert!(
+                !reusable_lead(&changed, &prepared, "h1", &files),
+                "{changed}"
+            );
+        }
+        assert!(!reusable_lead(&prev, &prepared, "h1", &files[..1]));
+    }
+
+    #[test]
+    fn a_focus_area_is_touched_by_its_files_lines_or_folders() {
+        let files = vec!["src/review.rs".to_string(), "docs/a.md".to_string()];
+        let area = |named: Value| json!({"title": "t", "files": named});
+        assert!(touches(&area(json!(["src/review.rs"])), &files));
+        assert!(touches(&area(json!(["src/review.rs:120"])), &files));
+        assert!(touches(&area(json!(["docs/"])), &files));
+        assert!(touches(&area(json!(["docs"])), &files));
+        assert!(touches(&area(json!([])), &files));
+        assert!(touches(&json!({"title": "t"}), &files));
+        assert!(!touches(&area(json!(["src/review.rs.bak"])), &files));
+        assert!(!touches(&area(json!(["src/main.rs", "doc"])), &files));
     }
 }
