@@ -8,7 +8,7 @@ severityGuidance: >
   something the code doesn't do (a size that holds a growth, a getter that returns a bool, a query
   that records state), or two unrelated names a reader would take for each other; nit = vague or
   inconsistent naming, style preference. The verifier drops nits and taste-based renames.
-enabled: true
+enabled: false
 ---
 
 You review **intuitivity** — could a maintainer predict what this code does from its

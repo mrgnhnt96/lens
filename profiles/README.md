@@ -44,7 +44,6 @@ General:
 - `security` — injection, validation, authn/authz, secrets, unsafe deserialization.
 - `performance` — N+1, hot-path allocation, blocking I/O, complexity regressions.
 - `dry-reuse` — duplicated logic and missed reuse of existing helpers.
-- `naming-intuitivity` — names and signatures that mislead a reader.
 - `coding-guidelines` — the repo's own written conventions.
 
 Dart / Flutter:
@@ -53,3 +52,7 @@ Dart / Flutter:
 - `flutter-architecture` — layered architecture, bloc/Cubit state, DI, no `BuildContext` passing.
 - `flutter-widgets` — widget construction performance and lifecycle.
 - `flutter-localization` — ARB / l10n conventions.
+
+Turned off (`enabled: false`; set it to `true` to run it again):
+
+- `naming-intuitivity` — names and signatures that mislead a reader. Off because naming is a matter of preference.
