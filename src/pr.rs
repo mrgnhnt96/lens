@@ -82,6 +82,22 @@ pub struct Report {
     pub findings: Vec<Finding>,
     #[serde(default)]
     pub dropped: Vec<Value>,
+    /// The child PRs merged into this one whose review lens reused (docs/REVIEW.md, "Stacked PRs").
+    #[serde(default)]
+    pub stack: Option<Stack>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct Stack {
+    #[serde(default)]
+    pub children: Vec<Child>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Child {
+    pub number: u64,
+    #[serde(default)]
+    pub url: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -467,7 +483,11 @@ pub fn plan(
     let review = (new || changed).then(|| {
         // On GitHub an approval with nothing new to raise says nothing: the marker alone renders
         // empty. Bitbucket's verdict carries no text, so its summary comment always says something.
-        let full = new || event == "REQUEST_CHANGES" || !left_out.is_empty();
+        // Child PRs whose review was reused are always named.
+        let full = new
+            || event == "REQUEST_CHANGES"
+            || !left_out.is_empty()
+            || children_line(report).is_some();
         let body = if full || markup == Markup::Bitbucket {
             review_body(
                 report,
@@ -592,6 +612,29 @@ pub struct BodyParts<'a> {
     pub markup: Markup,
 }
 
+/// Where the code of the child PRs merged into this one was reviewed instead.
+fn children_line(report: &Report) -> Option<String> {
+    let children = &report.stack.as_ref()?.children;
+    if children.is_empty() {
+        return None;
+    }
+    let links: Vec<String> = children
+        .iter()
+        .map(|c| match c.url.as_str() {
+            "" => format!("#{}", c.number),
+            url => format!("[#{}]({url})", c.number),
+        })
+        .collect();
+    let (prs, those) = match links.len() {
+        1 => ("child PR", "that PR"),
+        _ => ("child PRs", "those PRs"),
+    };
+    Some(format!(
+        "Code from {prs} {} was reviewed on {those}; its findings aren't posted again here.\n\n",
+        links.join(", ")
+    ))
+}
+
 pub fn review_body(report: &Report, parts: &BodyParts, event: &str) -> String {
     let posted: Vec<&Finding> = report.findings.iter().filter(|f| !f.left_out()).collect();
     let n = posted.len();
@@ -603,6 +646,9 @@ pub fn review_body(report: &Report, parts: &BodyParts, event: &str) -> String {
         s.push_str(&format!(" · {} nit left out", parts.left_out));
     }
     s.push_str("\n\n");
+    if let Some(line) = children_line(report) {
+        s.push_str(&line);
+    }
     if parts.skipped > 0 {
         s.push_str(&format!(
             "{} already posted on an earlier run.\n\n",
@@ -670,6 +716,7 @@ mod tests {
             profiles: vec![],
             findings,
             dropped: vec![],
+            stack: None,
         }
     }
 
@@ -1012,6 +1059,65 @@ diff --git a/gone.rs b/gone.rs
             Comments::Single,
         );
         assert_eq!(p.event, "REQUEST_CHANGES");
+    }
+
+    fn stacked(findings: Vec<Finding>, children: &[(u64, &str)]) -> Report {
+        Report {
+            stack: Some(Stack {
+                children: children
+                    .iter()
+                    .map(|(number, url)| Child {
+                        number: *number,
+                        url: (*url).into(),
+                    })
+                    .collect(),
+            }),
+            ..report(findings)
+        }
+    }
+
+    #[test]
+    fn a_review_with_merged_children_points_at_their_prs() {
+        let report = stacked(
+            vec![finding("1", "src/a.rs", 2, "major", "breaks")],
+            &[(8, "https://github.com/o/r/pull/8"), (9, "")],
+        );
+        let review = plan(
+            &report,
+            &Earlier::default(),
+            &BTreeMap::new(),
+            Comments::Single,
+        )
+        .review
+        .map(github)
+        .unwrap();
+        let body = review["body"].as_str().unwrap();
+        assert!(
+            body.contains("Code from child PRs [#8](https://github.com/o/r/pull/8), #9 was reviewed on those PRs; its findings aren't posted again here."),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_clean_review_with_one_merged_child_still_names_it() {
+        let report = stacked(vec![], &[(8, "https://github.com/o/r/pull/8")]);
+        let review = plan(
+            &report,
+            &Earlier::default(),
+            &BTreeMap::new(),
+            Comments::Single,
+        )
+        .review
+        .map(github)
+        .unwrap();
+        assert_eq!(review["event"], "APPROVE");
+        let body = review["body"].as_str().unwrap();
+        assert!(
+            body.contains(
+                "Code from child PR [#8](https://github.com/o/r/pull/8) was reviewed on that PR;"
+            ),
+            "{body}"
+        );
     }
 
     #[test]

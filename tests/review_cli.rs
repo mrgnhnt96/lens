@@ -332,23 +332,97 @@ impl Fixture {
             &(fs::read_to_string(d.join("src/a.rs")).unwrap() + "// a fix\n"),
         );
         git(&d, &["commit", "-qam", "fix"]);
+        self.push_head(fake);
+    }
+
+    /// Force-pushes `feature` as PR 7's head and points the fake `gh` at it.
+    fn push_head(&self, fake: &Path) {
+        let d = self.repo();
         git(
             &d,
             &["push", "-q", "-f", "origin", "feature:refs/pull/7/head"],
         );
-        let head = String::from_utf8(
-            Command::new("git")
-                .arg("-C")
-                .arg(&d)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap();
         let mut pr: Value = read_json(&fake.join("pr.json"));
-        pr["headRefOid"] = json!(head.trim());
+        pr["headRefOid"] = json!(self.rev("HEAD"));
         fs::write(fake.join("pr.json"), pr.to_string()).unwrap();
+    }
+
+    /// Commits `files` on main, then rebases `feature` onto it (the rebase must apply cleanly).
+    fn move_main(&self, files: &[(&str, &str)]) {
+        let d = self.repo();
+        git(&d, &["switch", "-q", "main"]);
+        for (path, text) in files {
+            write(&d, path, text);
+        }
+        git(&d, &["add", "-A"]);
+        git(&d, &["commit", "-qm", "main moves"]);
+        git(&d, &["switch", "-q", "feature"]);
+        git(&d, &["rebase", "-q", "main"]);
+    }
+
+    /// Pushes main and `feature` as the base and head of PR 7.
+    fn push_rebase(&self, fake: &Path) {
+        git(&self.repo(), &["push", "-q", "origin", "main"]);
+        self.push_head(fake);
+    }
+
+    /// Cuts child PR `n` from `feature`, adding `file`, and merges it back into `feature` (squashed
+    /// or with a merge commit), listing it as merged in the fake `gh`. With `findings`, lens
+    /// reviewed the child on its own PR and raised them.
+    fn merge_child(&self, fake: &Path, n: u64, file: &str, squash: bool, findings: Option<Value>) {
+        let d = self.repo();
+        let base = self.rev("feature");
+        let branch = format!("child-{n}");
+        git(&d, &["switch", "-q", "-c", &branch]);
+        write(&d, file, "pub fn c() {}\n");
+        git(&d, &["add", file]);
+        git(&d, &["commit", "-qm", &format!("child {n}")]);
+        let head = self.rev("HEAD");
+        git(&d, &["switch", "-q", "feature"]);
+        if squash {
+            git(&d, &["merge", "-q", "--squash", &branch]);
+            git(&d, &["commit", "-qm", &format!("child {n} (#{n})")]);
+        } else {
+            git(
+                &d,
+                &[
+                    "merge",
+                    "-q",
+                    "--no-ff",
+                    "-m",
+                    &format!("merge #{n}"),
+                    &branch,
+                ],
+            );
+        }
+        if let Some(findings) = findings {
+            let report =
+                json!({"pass": "pr", "mergeBase": base, "head": head, "findings": findings});
+            fs::write(
+                self.state().join(format!("pr-{n}.json")),
+                report.to_string(),
+            )
+            .unwrap();
+        }
+        let path = fake.join("children.json");
+        let mut children: Vec<Value> = fs::read_to_string(&path)
+            .map(|t| serde_json::from_str(&t).unwrap())
+            .unwrap_or_default();
+        children.push(json!({
+            "number": n, "html_url": format!("https://github.test/pr/{n}"), "state": "closed",
+            "merged_at": "2026-11-01T00:00:00Z", "merge_commit_sha": self.rev("HEAD"),
+        }));
+        fs::write(path, Value::from(children).to_string()).unwrap();
+    }
+
+    fn rev(&self, rev: &str) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(self.repo())
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
     /// Every agent started so far, and clears the log.
@@ -670,7 +744,8 @@ fn the_floor_reviews_risky_paths_with_one_sonnet_and_nothing_else() {
 }
 
 /// A `gh` stand-in for the PR pass: `pr view` answers from a canned PR, `api` lists no earlier
-/// comments or reviews, and a posted review is saved to `$FAKE/posted.json`.
+/// comments or reviews and the PRs stacked on it from `$FAKE/children.json` (none without it), and
+/// a posted review is saved to `$FAKE/posted.json`.
 const FAKE_GH: &str = r#"#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
@@ -681,6 +756,8 @@ if args[:2] == ["pr", "view"]:
         print(pr[args[args.index("--jq") + 1].lstrip(".")])
     else:
         print(json.dumps(pr))
+elif args[0] == "api" and "pulls?base=" in args[-1] and os.path.exists(os.path.join(fake, "children.json")):
+    print(open(os.path.join(fake, "children.json")).read())
 elif args[0] == "api" and "POST" in args:
     open(os.path.join(fake, "posted.json"), "w").write(sys.stdin.read())
     print(json.dumps({"html_url": "https://github.test/pr/7#review-1"}))
@@ -938,6 +1015,342 @@ fn a_rereview_reviews_only_what_changed_since_the_last_posted_review() {
     // --full reviews the whole change again.
     fx.review_with(&[], &["--pr", "7", "--dry-run", "--full"], &env);
     assert_eq!(read_json(&fx.state().join("pr-7.json"))["mode"], "full");
+    assert!(fx.calls().iter().any(is_lead));
+}
+
+#[test]
+fn a_merged_child_reviewed_on_its_own_pr_is_not_reviewed_again_on_the_parent() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    fx.calls();
+
+    let raised = json!([{"file": "src/c.rs", "line": 1, "severity": "major",
+                         "title": "c is never called", "profiles": ["correctness"]}]);
+    fx.merge_child(&fake, 8, "src/c.rs", false, Some(raised));
+    fx.push_head(&fake);
+    // The last review approved, so this one posts its verdict and the body that names the child.
+    let mut earlier = read_json(&fake.join("posted.json"));
+    earlier["body"] = json!(earlier["body"]
+        .as_str()
+        .unwrap()
+        .replace("verdict=REQUEST_CHANGES", "verdict=APPROVE"));
+    fs::write(fake.join("posted.json"), earlier.to_string()).unwrap();
+
+    let (_, log) = fx.review_logged(&[], &["--pr", "7"], &env);
+    assert!(log.contains("taking out #8"), "{log}");
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "delta");
+    assert_eq!(report["stack"]["children"][0]["number"], 8);
+    assert_eq!(report["stack"]["children"][0]["files"], json!(["src/c.rs"]));
+    // Nothing is left once the child comes out, so only where it meets the parent is reviewed.
+    assert_eq!(ran(&report), ["stack-integration"]);
+    let calls = fx.calls();
+    let stack = calls
+        .iter()
+        .filter_map(|c| c["prompt"].as_str())
+        .find(|p| p.contains("## The stack"))
+        .expect("the stack reviewer ran");
+    assert!(
+        stack.contains("#8 (https://github.test/pr/8): src/c.rs"),
+        "{stack}"
+    );
+    assert!(stack.contains("Left over once the children came out (conflict resolutions, commits outside them; the delta above): none"), "{stack}");
+    assert!(stack.contains("child-findings.json"), "{stack}");
+    let posted: Value = read_json(&fake.join("posted.json"));
+    let body = posted["body"].as_str().unwrap();
+    assert!(
+        body.contains("Code from child PR [#8](https://github.test/pr/8) was reviewed on that PR"),
+        "{body}"
+    );
+    assert!(!body.contains("c is never called"), "{body}");
+}
+
+#[test]
+fn a_squash_merged_child_leaves_only_the_parents_own_commits_to_review() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    fx.calls();
+
+    // The child's review raised the blocker the correctness reviewer raises again on the parent.
+    let raised = json!([{"file": "src/a.rs", "line": 3, "severity": "blocker",
+                         "title": "empty input accepted", "profiles": ["correctness"]}]);
+    fx.merge_child(&fake, 8, "src/c.rs", true, Some(raised));
+    fx.push_fix(&fake);
+
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["stack"]["children"][0]["number"], 8);
+    assert_eq!(report["delta"]["changedLines"], 1);
+    let ran = ran(&report);
+    assert!(ran.contains(&"correctness".to_string()), "{ran:?}");
+    assert!(ran.contains(&"stack-integration".to_string()), "{ran:?}");
+    let calls = fx.calls();
+    let reviewer = calls
+        .iter()
+        .find(|c| {
+            c["prompt"]
+                .as_str()
+                .unwrap_or("")
+                .contains("name=\"correctness\"")
+        })
+        .unwrap();
+    let delta = delta_section(reviewer);
+    assert!(delta.contains("+// a fix"), "{delta}");
+    assert!(!delta.contains("src/c.rs"), "{delta}");
+    // The blocker the child already raised isn't raised again here; it points at the child.
+    let findings = report["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f["title"] != "empty input accepted"),
+        "{findings:?}"
+    );
+    let dropped = report["dropped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["title"] == "empty input accepted")
+        .expect("the child's finding is in dropped");
+    assert_eq!(dropped["child"], 8);
+    assert_eq!(
+        dropped["reason"],
+        "already raised on child PR #8 (https://github.test/pr/8)"
+    );
+}
+
+#[test]
+fn a_merged_child_lens_never_reviewed_is_reviewed_on_the_parent() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    fx.calls();
+
+    fx.merge_child(&fake, 8, "src/c.rs", false, None);
+    fx.push_head(&fake);
+
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["stack"]["children"], json!([]));
+    assert_eq!(report["stack"]["kept"][0]["number"], 8);
+    assert_eq!(report["stack"]["kept"][0]["reason"], "no lens review");
+    assert!(!ran(&report).contains(&"stack-integration".to_string()));
+    let calls = fx.calls();
+    let reviewer = calls
+        .iter()
+        .find(|c| {
+            c["prompt"]
+                .as_str()
+                .unwrap_or("")
+                .contains("name=\"correctness\"")
+        })
+        .unwrap();
+    assert!(delta_section(reviewer).contains("+pub fn c() {}"));
+}
+
+fn line_of(report: &Value, title: &str) -> u64 {
+    report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["title"] == title)
+        .unwrap_or_else(|| panic!("no {title} in {report}"))["line"]
+        .as_u64()
+        .unwrap()
+}
+
+/// The "what changed since the last review" section of an agent's system prompt.
+fn delta_section(call: &Value) -> &str {
+    let system = call["system"].as_str().unwrap();
+    let (_, rest) = system
+        .split_once("What changed since the last review")
+        .unwrap_or_else(|| panic!("no delta in {system}"));
+    rest.split("\n## ").next().unwrap()
+}
+
+fn carried(calls: &[Value]) -> Vec<&str> {
+    calls
+        .iter()
+        .filter_map(|c| c["prompt"].as_str())
+        .filter(|p| p.contains("an earlier review raised it"))
+        .collect()
+}
+
+const HEADER: &str = "// h0\n// h1\n// h2\n// h3\n// h4\n";
+
+#[test]
+fn a_rebase_that_keeps_every_patch_reuses_the_review_with_its_lines_moved() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    // Main's later edits land above the PR's hunk but outside its context, so its patch holds.
+    fx.move_main(&[("src/a.rs", &format!("{HEADER}pub fn a() {{}}\n"))]);
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    let first = read_json(&fx.state().join("pr-7.json"));
+    let at = line_of(&first, "empty input accepted");
+    assert!(!fx.calls().is_empty());
+
+    fx.move_main(&[("src/a.rs", &format!("// top\n{HEADER}pub fn a() {{}}\n"))]);
+    fx.push_rebase(&fake);
+    let (out, log) = fx.review_logged(&[], &["--pr", "7", "--dry-run"], &env);
+    assert!(fx.calls().is_empty(), "{out}");
+    assert!(out.contains("rebased with the same patches"), "{out}");
+    assert!(log.contains("every commit's patch is the same"), "{log}");
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "rebased");
+    assert_eq!(report["rebased"]["from"], first["head"]);
+    assert_eq!(report["head"], json!(fx.rev("HEAD")));
+    assert_eq!(report["mergeBase"], json!(fx.rev("main")));
+    assert!(report["delta"].is_null());
+    assert_eq!(line_of(&report, "empty input accepted"), at + 1);
+    assert_eq!(
+        report["findings"].as_array().unwrap().len(),
+        first["findings"].as_array().unwrap().len()
+    );
+
+    // Nothing new was posted, so the next rebase starts from the reused report, not the posted head.
+    let second = report["head"].clone();
+    fx.move_main(&[(
+        "src/a.rs",
+        &format!("// top\n// top\n{HEADER}pub fn a() {{}}\n"),
+    )]);
+    fx.push_rebase(&fake);
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    assert!(fx.calls().is_empty());
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "rebased");
+    assert_eq!(report["rebased"]["from"], second);
+    assert_eq!(line_of(&report, "empty input accepted"), at + 2);
+
+    // --full reviews it again.
+    fx.review_with(&[], &["--pr", "7", "--dry-run", "--full"], &env);
+    assert_eq!(read_json(&fx.state().join("pr-7.json"))["mode"], "full");
+    assert!(fx.calls().iter().any(is_lead));
+}
+
+#[test]
+fn a_rebase_with_one_edited_commit_reviews_only_that_commit() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    fx.move_main(&[("src/a.rs", &format!("{HEADER}pub fn a() {{}}\n"))]);
+    write(&d, "src/b.rs", "pub fn b() {}\npub fn b2() {}\n");
+    git(&d, &["commit", "-qam", "more"]);
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    let first = read_json(&fx.state().join("pr-7.json"));
+    let at = line_of(&first, "empty input accepted");
+    fx.calls();
+
+    // Four lines up, so the carried blocker sits too far from the one the delta raises to merge.
+    let top = "// top\n".repeat(4);
+    fx.move_main(&[("src/a.rs", &format!("{top}{HEADER}pub fn a() {{}}\n"))]);
+    write(&d, "src/b.rs", "pub fn b() {}\npub fn b3() {}\n");
+    git(&d, &["commit", "-qa", "--amend", "--no-edit"]);
+    fx.push_rebase(&fake);
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "delta");
+    assert_eq!(report["delta"]["from"], json!(fx.rev("HEAD~1")));
+    let calls = fx.calls();
+    let delta = delta_section(&calls[0]);
+    assert!(delta.contains("+pub fn b3() {}"), "{delta}");
+    assert!(!delta.contains("+// line 0"), "{delta}");
+    // The earlier blocker is verified again where it sits now.
+    let carried = carried(&calls);
+    assert!(
+        carried
+            .iter()
+            .any(|p| p.contains(&format!("line: {}", at + 4))),
+        "{carried:?}"
+    );
+}
+
+#[test]
+fn a_rebase_whose_conflicts_changed_a_commit_reviews_the_resolution() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    fx.move_main(&[("src/c.rs", "pub fn c() {}\n")]);
+    write(&d, "src/c.rs", "pub fn c() { todo!() }\n");
+    git(&d, &["commit", "-qam", "fill c"]);
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    fx.calls();
+
+    git(&d, &["switch", "-q", "main"]);
+    write(&d, "src/c.rs", "pub fn c() -> u8 { 0 }\n");
+    git(&d, &["commit", "-qam", "c returns"]);
+    git(&d, &["switch", "-q", "feature"]);
+    let conflicted = Command::new("git")
+        .arg("-C")
+        .arg(&d)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "rebase",
+            "-q",
+            "main",
+        ])
+        .output()
+        .unwrap();
+    assert!(!conflicted.status.success(), "the rebase should conflict");
+    write(&d, "src/c.rs", "pub fn c() -> u8 { todo!() }\n");
+    git(&d, &["add", "src/c.rs"]);
+    git(&d, &["-c", "core.editor=true", "rebase", "--continue"]);
+    fx.push_rebase(&fake);
+
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "delta");
+    assert_eq!(report["delta"]["from"], json!(fx.rev("HEAD~1")));
+    let calls = fx.calls();
+    let delta = delta_section(&calls[0]);
+    assert!(delta.contains("+pub fn c() -> u8 { todo!() }"), "{delta}");
+    assert!(!delta.contains("+// line 0"), "{delta}");
+}
+
+#[test]
+fn a_rebase_from_a_head_that_cant_be_fetched_is_reviewed_in_full() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    let first = read_json(&fx.state().join("pr-7.json"));
+    fx.calls();
+
+    // The posted review names a head that no longer exists anywhere.
+    let mut posted = read_json(&fake.join("posted.json"));
+    let body = posted["body"].as_str().unwrap();
+    let head = first["head"].as_str().unwrap();
+    assert!(body.contains(head), "{body}");
+    posted["body"] = json!(body.replace(head, &"e".repeat(40)));
+    fs::write(fake.join("posted.json"), posted.to_string()).unwrap();
+
+    fx.move_main(&[("README.md", "# a\n\nMoved.\n")]);
+    fx.push_rebase(&fake);
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "full");
+    assert!(report["rebased"].is_null());
     assert!(fx.calls().iter().any(is_lead));
 }
 

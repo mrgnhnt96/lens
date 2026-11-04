@@ -17,7 +17,8 @@ use anyhow::{bail, Context, Result};
 use base64::Engine;
 use serde_json::{json, Value};
 
-use super::{Forge, PrView};
+use super::github::query_escape;
+use super::{Child, Forge, PrView};
 use crate::config::{PostAs, PrConfig};
 use crate::pr::{earlier_from, Earlier, Markup, Review};
 
@@ -29,6 +30,8 @@ pub const TOKEN_ENV: &str = "LENS_BITBUCKET_TOKEN";
 const MAX_PAGES: usize = 100;
 
 const PR_FIELDS: &str = "id,title,description,links.html.href,source.branch.name,source.commit.hash,source.repository.full_name,destination.branch.name";
+const CHILD_FIELDS: &str =
+    "next,values.id,values.state,values.links.html.href,values.merge_commit.hash";
 const COMMENT_FIELDS: &str =
     "next,values.id,values.deleted,values.inline,values.content.raw,values.links.html.href";
 
@@ -414,6 +417,46 @@ impl Forge for Bitbucket {
         Ok(earlier_from_comments(values))
     }
 
+    fn children(&self, branch: &str) -> Result<Vec<Child>> {
+        let query = query_escape(&format!("destination.branch.name=\"{branch}\""));
+        let mut next = Some(format!(
+            "{}/repositories/{}/pullrequests?q={query}&state=OPEN&state=MERGED&pagelen=50&fields={CHILD_FIELDS}",
+            self.api, self.slug
+        ));
+        let mut out = Vec::new();
+        for _ in 0..MAX_PAGES {
+            let Some(url) = next.take() else { break };
+            let page = self.get(url)?;
+            for v in page["values"].as_array().into_iter().flatten() {
+                let Some(number) = v["id"].as_u64() else {
+                    continue;
+                };
+                let merged = v["state"].as_str() == Some("MERGED");
+                let merge_commit = match v.pointer("/merge_commit/hash").and_then(Value::as_str) {
+                    Some(h) if merged => {
+                        Some(self.full_hash(&self.slug, h).unwrap_or(h.to_string()))
+                    }
+                    _ => None,
+                };
+                out.push(Child {
+                    number,
+                    url: v
+                        .pointer("/links/html/href")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    merged,
+                    merge_commit,
+                });
+            }
+            next = page["next"].as_str().map(str::to_string);
+        }
+        if next.is_some() {
+            bail!("{branch} has more than {MAX_PAGES} pages of PRs");
+        }
+        Ok(out)
+    }
+
     fn markup(&self) -> Markup {
         Markup::Bitbucket
     }
@@ -592,6 +635,7 @@ diff --git a/src/a.rs b/src/a.rs
             profiles: vec![],
             findings,
             dropped: vec![],
+            stack: None,
         }
     }
 
@@ -760,6 +804,52 @@ diff --git a/src/a.rs b/src/a.rs
         let view = bb.view(7).unwrap();
         assert_eq!(view.head_repo.as_deref(), Some("them/fork"));
         assert_eq!(view.head_ref_oid, full);
+    }
+
+    #[test]
+    fn children_reads_every_page_of_prs_on_the_branch() {
+        let dir = repo_with_origin("https://bitbucket.org/team/repo.git");
+        let full = "abc123".to_string() + &"0".repeat(34);
+        let bb = bitbucket(
+            dir.path(),
+            &[
+                (
+                    "/repositories/team/repo/pullrequests?q=destination.branch.name%3D%22feat%2Fx%22&state=OPEN&state=MERGED",
+                    json!({
+                        "values": [
+                            {"id": 8, "state": "MERGED",
+                             "links": {"html": {"href": "u8"}},
+                             "merge_commit": {"hash": "abc123"}}
+                        ],
+                        "next": "http://bb/page2"
+                    }),
+                ),
+                ("/repositories/team/repo/commit/abc123", json!({"hash": full})),
+                (
+                    "/page2",
+                    json!({"values": [
+                        {"id": 9, "state": "OPEN", "links": {"html": {"href": "u9"}}}
+                    ]}),
+                ),
+            ],
+        );
+        assert_eq!(
+            bb.children("feat/x").unwrap(),
+            vec![
+                Child {
+                    number: 8,
+                    url: "u8".into(),
+                    merged: true,
+                    merge_commit: Some(full.clone()),
+                },
+                Child {
+                    number: 9,
+                    url: "u9".into(),
+                    merged: false,
+                    merge_commit: None,
+                },
+            ]
+        );
     }
 
     #[test]

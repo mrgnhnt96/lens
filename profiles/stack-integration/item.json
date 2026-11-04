@@ -1,0 +1,5 @@
+{
+  "name": "stack-integration",
+  "conformsTo": "reviewer@1",
+  "description": "Where child PRs merged into this PR's branch meet each other and the parent: broken contracts, lost changes, bad conflict resolutions."
+}

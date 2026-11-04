@@ -53,6 +53,10 @@ Dart / Flutter:
 - `flutter-widgets` — widget construction performance and lifecycle.
 - `flutter-localization` — ARB / l10n conventions.
 
+Run by the PR pass itself (`enabled: false` keeps the selector from picking it; leave it so):
+
+- `stack-integration` — where child PRs merged into this PR's branch meet each other and the parent. The PR pass runs it when it takes reviewed child PRs out of the delta (docs/REVIEW.md, "Stacked PRs").
+
 Turned off (`enabled: false`; set it to `true` to run it again):
 
 - `naming-intuitivity` — names and signatures that mislead a reader. Off because naming is a matter of preference.

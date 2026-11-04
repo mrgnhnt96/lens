@@ -17,4 +17,5 @@ pub mod profile;
 pub mod reply;
 pub mod review;
 pub mod select;
+pub mod stack;
 pub mod usage;
