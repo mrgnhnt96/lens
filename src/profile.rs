@@ -176,6 +176,6 @@ mod tests {
     fn shipped_profiles_all_parse() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
         let profiles = load_dir(&dir, Source::Default).unwrap();
-        assert_eq!(profiles.len(), 14);
+        assert_eq!(profiles.len(), 15);
     }
 }

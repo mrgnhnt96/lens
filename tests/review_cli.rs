@@ -366,6 +366,55 @@ impl Fixture {
         self.push_head(fake);
     }
 
+    /// Cuts child PR `n` from `feature`, adding `file`, and merges it back into `feature` (squashed
+    /// or with a merge commit), listing it as merged in the fake `gh`. With `findings`, lens
+    /// reviewed the child on its own PR and raised them.
+    fn merge_child(&self, fake: &Path, n: u64, file: &str, squash: bool, findings: Option<Value>) {
+        let d = self.repo();
+        let base = self.rev("feature");
+        let branch = format!("child-{n}");
+        git(&d, &["switch", "-q", "-c", &branch]);
+        write(&d, file, "pub fn c() {}\n");
+        git(&d, &["add", file]);
+        git(&d, &["commit", "-qm", &format!("child {n}")]);
+        let head = self.rev("HEAD");
+        git(&d, &["switch", "-q", "feature"]);
+        if squash {
+            git(&d, &["merge", "-q", "--squash", &branch]);
+            git(&d, &["commit", "-qm", &format!("child {n} (#{n})")]);
+        } else {
+            git(
+                &d,
+                &[
+                    "merge",
+                    "-q",
+                    "--no-ff",
+                    "-m",
+                    &format!("merge #{n}"),
+                    &branch,
+                ],
+            );
+        }
+        if let Some(findings) = findings {
+            let report =
+                json!({"pass": "pr", "mergeBase": base, "head": head, "findings": findings});
+            fs::write(
+                self.state().join(format!("pr-{n}.json")),
+                report.to_string(),
+            )
+            .unwrap();
+        }
+        let path = fake.join("children.json");
+        let mut children: Vec<Value> = fs::read_to_string(&path)
+            .map(|t| serde_json::from_str(&t).unwrap())
+            .unwrap_or_default();
+        children.push(json!({
+            "number": n, "html_url": format!("https://github.test/pr/{n}"), "state": "closed",
+            "merged_at": "2026-11-01T00:00:00Z", "merge_commit_sha": self.rev("HEAD"),
+        }));
+        fs::write(path, Value::from(children).to_string()).unwrap();
+    }
+
     fn rev(&self, rev: &str) -> String {
         let out = Command::new("git")
             .arg("-C")
@@ -695,7 +744,8 @@ fn the_floor_reviews_risky_paths_with_one_sonnet_and_nothing_else() {
 }
 
 /// A `gh` stand-in for the PR pass: `pr view` answers from a canned PR, `api` lists no earlier
-/// comments or reviews, and a posted review is saved to `$FAKE/posted.json`.
+/// comments or reviews and the PRs stacked on it from `$FAKE/children.json` (none without it), and
+/// a posted review is saved to `$FAKE/posted.json`.
 const FAKE_GH: &str = r#"#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
@@ -706,6 +756,8 @@ if args[:2] == ["pr", "view"]:
         print(pr[args[args.index("--jq") + 1].lstrip(".")])
     else:
         print(json.dumps(pr))
+elif args[0] == "api" and "pulls?base=" in args[-1] and os.path.exists(os.path.join(fake, "children.json")):
+    print(open(os.path.join(fake, "children.json")).read())
 elif args[0] == "api" and "POST" in args:
     open(os.path.join(fake, "posted.json"), "w").write(sys.stdin.read())
     print(json.dumps({"html_url": "https://github.test/pr/7#review-1"}))
@@ -964,6 +1016,146 @@ fn a_rereview_reviews_only_what_changed_since_the_last_posted_review() {
     fx.review_with(&[], &["--pr", "7", "--dry-run", "--full"], &env);
     assert_eq!(read_json(&fx.state().join("pr-7.json"))["mode"], "full");
     assert!(fx.calls().iter().any(is_lead));
+}
+
+#[test]
+fn a_merged_child_reviewed_on_its_own_pr_is_not_reviewed_again_on_the_parent() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    fx.calls();
+
+    let raised = json!([{"file": "src/c.rs", "line": 1, "severity": "major",
+                         "title": "c is never called", "profiles": ["correctness"]}]);
+    fx.merge_child(&fake, 8, "src/c.rs", false, Some(raised));
+    fx.push_head(&fake);
+    // The last review approved, so this one posts its verdict and the body that names the child.
+    let mut earlier = read_json(&fake.join("posted.json"));
+    earlier["body"] = json!(earlier["body"]
+        .as_str()
+        .unwrap()
+        .replace("verdict=REQUEST_CHANGES", "verdict=APPROVE"));
+    fs::write(fake.join("posted.json"), earlier.to_string()).unwrap();
+
+    let (_, log) = fx.review_logged(&[], &["--pr", "7"], &env);
+    assert!(log.contains("taking out #8"), "{log}");
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "delta");
+    assert_eq!(report["stack"]["children"][0]["number"], 8);
+    assert_eq!(report["stack"]["children"][0]["files"], json!(["src/c.rs"]));
+    // Nothing is left once the child comes out, so only where it meets the parent is reviewed.
+    assert_eq!(ran(&report), ["stack-integration"]);
+    let calls = fx.calls();
+    let stack = calls
+        .iter()
+        .filter_map(|c| c["prompt"].as_str())
+        .find(|p| p.contains("## The stack"))
+        .expect("the stack reviewer ran");
+    assert!(
+        stack.contains("#8 (https://github.test/pr/8): src/c.rs"),
+        "{stack}"
+    );
+    assert!(stack.contains("Left over once the children came out (conflict resolutions, commits outside them; the delta above): none"), "{stack}");
+    assert!(stack.contains("child-findings.json"), "{stack}");
+    let posted: Value = read_json(&fake.join("posted.json"));
+    let body = posted["body"].as_str().unwrap();
+    assert!(
+        body.contains("Code from child PR [#8](https://github.test/pr/8) was reviewed on that PR"),
+        "{body}"
+    );
+    assert!(!body.contains("c is never called"), "{body}");
+}
+
+#[test]
+fn a_squash_merged_child_leaves_only_the_parents_own_commits_to_review() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    fx.calls();
+
+    // The child's review raised the blocker the correctness reviewer raises again on the parent.
+    let raised = json!([{"file": "src/a.rs", "line": 3, "severity": "blocker",
+                         "title": "empty input accepted", "profiles": ["correctness"]}]);
+    fx.merge_child(&fake, 8, "src/c.rs", true, Some(raised));
+    fx.push_fix(&fake);
+
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["stack"]["children"][0]["number"], 8);
+    assert_eq!(report["delta"]["changedLines"], 1);
+    let ran = ran(&report);
+    assert!(ran.contains(&"correctness".to_string()), "{ran:?}");
+    assert!(ran.contains(&"stack-integration".to_string()), "{ran:?}");
+    let calls = fx.calls();
+    let reviewer = calls
+        .iter()
+        .find(|c| {
+            c["prompt"]
+                .as_str()
+                .unwrap_or("")
+                .contains("name=\"correctness\"")
+        })
+        .unwrap();
+    let delta = delta_section(reviewer);
+    assert!(delta.contains("+// a fix"), "{delta}");
+    assert!(!delta.contains("src/c.rs"), "{delta}");
+    // The blocker the child already raised isn't raised again here; it points at the child.
+    let findings = report["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f["title"] != "empty input accepted"),
+        "{findings:?}"
+    );
+    let dropped = report["dropped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["title"] == "empty input accepted")
+        .expect("the child's finding is in dropped");
+    assert_eq!(dropped["child"], 8);
+    assert_eq!(
+        dropped["reason"],
+        "already raised on child PR #8 (https://github.test/pr/8)"
+    );
+}
+
+#[test]
+fn a_merged_child_lens_never_reviewed_is_reviewed_on_the_parent() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    fx.calls();
+
+    fx.merge_child(&fake, 8, "src/c.rs", false, None);
+    fx.push_head(&fake);
+
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["stack"]["children"], json!([]));
+    assert_eq!(report["stack"]["kept"][0]["number"], 8);
+    assert_eq!(report["stack"]["kept"][0]["reason"], "no lens review");
+    assert!(!ran(&report).contains(&"stack-integration".to_string()));
+    let calls = fx.calls();
+    let reviewer = calls
+        .iter()
+        .find(|c| {
+            c["prompt"]
+                .as_str()
+                .unwrap_or("")
+                .contains("name=\"correctness\"")
+        })
+        .unwrap();
+    assert!(delta_section(reviewer).contains("+pub fn c() {}"));
 }
 
 fn line_of(report: &Value, title: &str) -> u64 {

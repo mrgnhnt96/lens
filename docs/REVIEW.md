@@ -240,6 +240,58 @@ until one has a patch the last review didn't see:
 A patch-id hashes a commit's diff with its context lines, so a base change within three lines of
 a PR's hunk makes that commit count as changed, and it is reviewed again.
 
+### Stacked PRs
+
+A PR's children are the PRs (open or merged) whose base branch is its head branch: a stack where
+each child merges into the parent's branch. Before a delta review the pass lists them through the
+forge (`gh api …/pulls?base=<branch>&state=all` on GitHub, `…/pullrequests?q=destination.branch.name="<branch>"`
+on Bitbucket); a hand-run `lens review --pr <n>` does the same. With no children, or when the
+lookup fails (it logs why), the delta is reviewed as above. A first review, `--full`, or a
+rebase that reuses the last report doesn't look for children.
+
+Each child merged since the last review (its merge commit isn't an ancestor of `delta.from`) that
+lens reviewed (`<state>/pr-<child>.json`, a `pr` pass) has its reviewed change,
+`mergeBase..head` of that report, taken out of the delta, squash-merged or with a merge commit
+alike. The pass merges each one, in PR-number order, onto the tree the last review was for with
+`git merge-tree -X theirs --merge-base=<child mergeBase>`, and the delta becomes
+`git diff <that tree> <head>`: what's left over is the parent's own commits since and any
+conflict resolution, reviewed as usual. The whole delta, children included, is kept in
+`<state>/pr-<n>/stack.patch`. A child keeps its lines in the delta when:
+
+- lens has no review of it (`no lens review`);
+- its reviewed commits can't be fetched (`its reviewed commits can't be fetched`);
+- its reviewed change doesn't merge onto the last-reviewed tree (`its reviewed change doesn't merge
+  onto the last-reviewed head`).
+
+A child reviewed only up to an earlier commit than the one merged keeps the later commits' lines
+in the leftover. Open children are listed and change nothing.
+
+When at least one child came out, the `stack-integration` profile runs once, even when nothing is
+left over (then it's the only reviewer). It gets each child's number, link, files and reviewed
+patch (`<state>/pr-<n>/child-<child>.patch`), the parent's own files up to the last review, the
+leftover's files, and the files more than one of them touch, and reviews only where they meet:
+contracts between them, a change one undoes in another, a bad conflict resolution. The profile is
+`enabled: false`, so only this path runs it, and it can be overridden in a repo's own `profiles/`
+like any other.
+
+The children's findings, moved to the parent's head, are in `<state>/pr-<n>/child-findings.json`,
+and every reviewer is told not to raise them again. One raised anyway (same file, within 3
+lines, same line or a similar title) goes to `dropped` with `"child": <child>` and
+`"reason": "already raised on child PR #<child> (<url>)"`. The review body says which child PRs'
+code was reviewed on those PRs, with links, so even a clean approval has a body. As on any
+re-review, nothing is posted when there are no new findings and the verdict is the same.
+
+The report records it all under `stack`, present whenever the PR has children:
+
+```json
+"stack": {
+  "children": [{ "number": 8, "url": "…/pull/8", "head": "<child's reviewed head>",
+                 "files": ["src/c.rs"], "findings": 1 }],
+  "kept": [{ "number": 9, "reason": "no lens review" }],
+  "open": [10]
+}
+```
+
 A PR pass whose `head` and `base` match the last report's, written by the same `lens`, runs no
 agents: it reuses that report and posts what's left to post. `--full` reviews it again. A PR
 gets one review per commit, and a rerun can't turn up a different set of findings for the same

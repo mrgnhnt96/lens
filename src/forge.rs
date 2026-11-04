@@ -44,6 +44,16 @@ impl PrView {
     }
 }
 
+/// A PR stacked on another: its base branch is the other PR's head branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Child {
+    pub number: u64,
+    pub url: String,
+    pub merged: bool,
+    /// The commit the merge made on the base branch, once merged, when the forge says.
+    pub merge_commit: Option<String>,
+}
+
 /// A forge's side of the PR pass, posting as `.lens.toml`'s `[pr] post_as`.
 pub trait Forge {
     fn view(&self, pr: u64) -> Result<PrView>;
@@ -68,6 +78,12 @@ pub trait Forge {
     /// What became of lens's findings on each of `prs`, read in as few calls as the forge
     /// allows, with each PR's head fetched to `refs/lens/pr/<n>`. A PR the forge can't tell about
     /// is left out; by default that is every PR.
+    /// The open and merged PRs whose base is `branch`; declined ones are left out. By default
+    /// none, for a forge that can't list them.
+    fn children(&self, _branch: &str) -> Result<Vec<Child>> {
+        Ok(vec![])
+    }
+
     fn discussions(&self, _prs: &[u64]) -> Result<BTreeMap<u64, Discussion>> {
         Ok(BTreeMap::new())
     }
