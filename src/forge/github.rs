@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::{Forge, PrView};
+use super::{Child, Forge, PrView};
 use crate::config::{PostAs, PrConfig};
 use crate::outcome::{self, Discussion};
 use crate::pr::{earlier_from, Earlier, Markup, Review};
@@ -130,6 +130,14 @@ impl Forge for GitHub {
         Ok(earlier_from(&comments, &reviews))
     }
 
+    fn children(&self, branch: &str) -> Result<Vec<Child>> {
+        let endpoint = format!(
+            "repos/{{owner}}/{{repo}}/pulls?base={}&state=all&per_page=100",
+            query_escape(branch)
+        );
+        Ok(children_from(&self.list(&endpoint)?))
+    }
+
     /// One GraphQL query per [`outcome::GITHUB_BATCH`] PRs, then one fetch of all their heads.
     fn discussions(&self, prs: &[u64]) -> Result<BTreeMap<u64, Discussion>> {
         let mut all = BTreeMap::new();
@@ -191,6 +199,40 @@ impl Forge for GitHub {
     }
 }
 
+/// The open and merged PRs among `pulls`, as `GET /repos/{owner}/{repo}/pulls` lists them.
+fn children_from(pulls: &[Value]) -> Vec<Child> {
+    pulls
+        .iter()
+        .filter_map(|p| {
+            let merged = p["merged_at"].is_string();
+            if !merged && p["state"].as_str() != Some("open") {
+                return None;
+            }
+            Some(Child {
+                number: p["number"].as_u64()?,
+                url: p["html_url"].as_str().unwrap_or_default().to_string(),
+                merged,
+                merge_commit: p["merge_commit_sha"]
+                    .as_str()
+                    .filter(|_| merged)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+/// `text` percent-encoded for a URL's query string.
+pub(crate) fn query_escape(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 /// The body of `POST /repos/{owner}/{repo}/pulls/{n}/reviews` for `review`.
 pub(crate) fn payload(review: &Review) -> Value {
     let comments: Vec<Value> = review
@@ -211,4 +253,72 @@ pub(crate) fn payload(review: &Review) -> Value {
         "body": review.body,
         "comments": comments,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `gh` that logs its arguments to `log` and prints `out`.
+    fn fake_gh(dir: &Path, out: &str) -> GitHub {
+        let script = dir.join("gh");
+        std::fs::write(dir.join("out"), out).unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{0}/log'\ncat '{0}/out'\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        GitHub {
+            program: script,
+            repo: dir.to_path_buf(),
+            token: None,
+        }
+    }
+
+    #[test]
+    fn children_lists_open_and_merged_prs_on_the_branch_and_drops_closed_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let pages = [
+            json!([
+                {"number": 8, "html_url": "u8", "state": "closed",
+                 "merged_at": "2026-11-01T00:00:00Z", "merge_commit_sha": "m8"},
+                {"number": 9, "html_url": "u9", "state": "open",
+                 "merged_at": null, "merge_commit_sha": "test-merge"}
+            ]),
+            json!([
+                {"number": 10, "html_url": "u10", "state": "closed",
+                 "merged_at": null, "merge_commit_sha": "m10"}
+            ]),
+        ];
+        let gh = fake_gh(dir.path(), &format!("{}\n{}", pages[0], pages[1]));
+        let children = gh.children("feat/a b").unwrap();
+        assert_eq!(
+            children,
+            vec![
+                Child {
+                    number: 8,
+                    url: "u8".into(),
+                    merged: true,
+                    merge_commit: Some("m8".into()),
+                },
+                Child {
+                    number: 9,
+                    url: "u9".into(),
+                    merged: false,
+                    merge_commit: None,
+                },
+            ]
+        );
+        let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+        assert_eq!(
+            log.trim(),
+            "api --paginate repos/{owner}/{repo}/pulls?base=feat%2Fa%20b&state=all&per_page=100"
+        );
+    }
 }

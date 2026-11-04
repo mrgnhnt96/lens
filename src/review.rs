@@ -33,6 +33,7 @@ use crate::diff::git;
 use crate::forge;
 use crate::pr;
 use crate::reply;
+use crate::stack::{self, Stack};
 use crate::usage;
 
 #[derive(Debug, Clone, Default)]
@@ -1631,12 +1632,18 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
     // A PR lens reviewed before is reviewed again only for what changed since: the findings it
     // already raised were raised, and the code it already read was read.
     let since = if pass.opts.full { None } else { pr_delta(pass) };
-    let delta = match since {
+    let mut delta = match since {
         Some(Since::Rebased { from, report }) => {
             return reuse_rebased(pass, number, &from, report);
         }
         Some(Since::Delta(d)) => Some(d),
         None => None,
+    };
+    // Child PRs merged into the PR's branch were reviewed on their own PRs: their lines come out
+    // of the delta.
+    let stack = match delta.as_mut() {
+        Some(d) => stack_of(pass, d)?,
+        None => Stack::default(),
     };
     if let Some(d) = &delta {
         pass.log(&format!(
@@ -1664,18 +1671,35 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         .filter_map(|f| f.as_str().map(String::from))
         .collect();
     let mut plans = plan_pr(&profiles, &files);
+    plans.retain(|p| p.name != STACK);
     pass.lighten(&mut plans);
     if delta.as_ref().is_some_and(|d| d.patch.trim().is_empty()) {
+        let why = match stack.leftover {
+            Some(_) => "nothing left once the merged child PRs came out",
+            None => "nothing changed since the last review",
+        };
         for p in &mut plans {
             p.run = false;
-            p.reason = "nothing changed since the last review".into();
+            p.reason = why.into();
         }
     }
-    let extra = format!(
+    // Where the children meet each other and the parent is reviewed even when nothing is left.
+    if !stack.taken.is_empty() {
+        let mut plan = stack_plan(pass)?;
+        pass.lighten(std::slice::from_mut(&mut plan));
+        plans.push(plan);
+    }
+    let mut extra = format!(
         "\nRepo: {}  (the PR's head; read files there, not in the current directory)\nAlready posted on this PR (don't raise these again): {}\n",
         pass.tree_dir.display(),
         pass.work.join("posted.json").display()
     );
+    if !stack.taken.is_empty() {
+        extra.push_str(&format!(
+            "Already raised on the child PRs merged into this one (don't raise these again): {}\n",
+            pass.work.join(CHILD_FINDINGS).display()
+        ));
+    }
     let system = pass.system_prompt(&pass.context(delta.as_ref().map(|d| d.patch.as_str()))?)?;
 
     // The lead first: its assessment goes in the review body and its focus areas get reviewers.
@@ -1798,7 +1822,10 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         if plan.name == "correctness" {
             correctness = Some(plan.clone());
         }
-        if plan.run {
+        if plan.run && plan.name == STACK {
+            let seams = stack_prompt(pass, &stack, delta.as_ref())?;
+            runs.push((plan.name.clone(), plan.clone(), format!("{extra}{seams}")));
+        } else if plan.run {
             runs.push((plan.name.clone(), plan.clone(), extra.clone()));
         } else {
             rows.push(plan.json(None));
@@ -1875,12 +1902,17 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
         rows.push(row);
     }
 
-    let (to_verify, nits) = skip_nits(merge(raised.into_iter().chain(carried).collect()));
+    let (raised, on_children) = raised_on_children(
+        merge(raised.into_iter().chain(carried).collect()),
+        &stack.taken,
+    );
+    let (to_verify, nits) = skip_nits(raised);
     let (confirmed, mut dropped) = pass.verify(&system, &to_verify, |_| true);
     if let Some(why) = pass.parked() {
         return Ok(parked(&why));
     }
     dropped.extend(nits);
+    dropped.extend(on_children);
     let pr_info: Value = serde_json::from_str(&fs::read_to_string(pass.work.join("pr.json"))?)
         .unwrap_or(Value::Null);
     let mut report = json!({
@@ -1906,6 +1938,9 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
     });
     if let Some(d) = &delta {
         report["delta"] = json!({ "from": d.from, "changedLines": changed_lines(&d.patch) });
+    }
+    if let Some(s) = stack_json(&stack) {
+        report["stack"] = s;
     }
     finish(pass, &mut report)?;
 
@@ -1953,6 +1988,220 @@ fn skip_nits(findings: Vec<Finding>) -> (Vec<Finding>, Vec<Value>) {
         })
         .collect();
     (rest, dropped)
+}
+
+/// The profile the PR pass runs over the seams of a stack (docs/REVIEW.md, "Stacked PRs"). It's
+/// off by default, so it never runs as an ordinary reviewer.
+const STACK: &str = "stack-integration";
+
+/// The child findings the PR pass shows its reviewers, in the work folder.
+const CHILD_FINDINGS: &str = "child-findings.json";
+
+/// The PRs stacked on this one: `prepared["branch"]`'s children on the forge. The merged ones
+/// lens reviewed come out of `d` (docs/REVIEW.md, "Stacked PRs"); each one's patch and findings,
+/// and the delta before they came out (`stack.patch`), go in the work folder for the
+/// stack-integration reviewer. A forge that can't list them leaves the delta as it is.
+fn stack_of(pass: &Pass, d: &mut PrDelta) -> Result<Stack> {
+    let (Some(branch), Some(head)) = (
+        pass.prepared["branch"].as_str(),
+        pass.prepared["head"].as_str(),
+    ) else {
+        return Ok(Stack::default());
+    };
+    let children = match forge::open(&pass.root, &pass.cfg.pr).and_then(|f| f.children(branch)) {
+        Ok(c) => c,
+        Err(e) => {
+            pass.log(&format!(
+                "couldn't list the PRs stacked on {branch}; reviewing the whole delta: {e:#}"
+            ));
+            return Ok(Stack::default());
+        }
+    };
+    if children.is_empty() {
+        return Ok(Stack::default());
+    }
+    let state = pass.report_path.parent().unwrap_or(Path::new("."));
+    let stack = stack::subtract(&pass.tree_dir, state, &d.from, head, &children);
+    let mut said = Vec::new();
+    if !stack.taken.is_empty() {
+        let numbers: Vec<String> = stack
+            .taken
+            .iter()
+            .map(|t| format!("#{}", t.number))
+            .collect();
+        said.push(format!(
+            "taking out {}, reviewed on their own PRs",
+            numbers.join(", ")
+        ));
+    }
+    for (n, why) in &stack.kept {
+        said.push(format!("keeping #{n}'s lines: {why}"));
+    }
+    if !stack.open.is_empty() {
+        let numbers: Vec<String> = stack.open.iter().map(|n| format!("#{n}")).collect();
+        said.push(format!("{} not merged yet", numbers.join(", ")));
+    }
+    if !said.is_empty() {
+        pass.log(&format!("stacked on {branch}: {}", said.join("; ")));
+    }
+    if let Some(left) = &stack.leftover {
+        fs::write(pass.work.join("stack.patch"), &d.patch)?;
+        d.patch = left.patch.clone();
+        d.files = left.files.clone();
+    }
+    let mut findings = Vec::new();
+    for t in &stack.taken {
+        let patch = git(&pass.tree_dir, &["diff", "--full-index", &t.base, &t.head])?;
+        fs::write(pass.work.join(format!("child-{}.patch", t.number)), patch)?;
+        for f in &t.findings {
+            let mut f = f.clone();
+            f["child"] = json!(t.number);
+            findings.push(f);
+        }
+    }
+    if !stack.taken.is_empty() {
+        fs::write(
+            pass.work.join(CHILD_FINDINGS),
+            serde_json::to_string_pretty(&findings)?,
+        )?;
+    }
+    Ok(stack)
+}
+
+/// The stack-integration reviewer's plan: the profile by that name, a repo's own over lens's.
+fn stack_plan(pass: &Pass) -> Result<Plan> {
+    let dir = std::env::var_os("LENS_PROFILES_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| pass.assets.join("profiles"));
+    let profile = crate::profile::load_all(&dir, &pass.root)?
+        .into_iter()
+        .find(|p| p.meta.name == STACK)
+        .with_context(|| format!("no {STACK} profile in {}", dir.display()))?;
+    Ok(Plan {
+        name: STACK.into(),
+        path: profile.path,
+        model: profile.meta.model,
+        effort: profile.meta.effort,
+        reason: "merged child PRs".into(),
+        run: true,
+        max_minions: profile.meta.max_minions.unwrap_or(0),
+    })
+}
+
+/// What the stack-integration reviewer is told: each child taken out of the delta, the parent's
+/// own files, the files more than one of them touch and what was left over.
+fn stack_prompt(pass: &Pass, stack: &Stack, delta: Option<&PrDelta>) -> Result<String> {
+    let mut s = String::from(
+        "\n## The stack\n\nChild PRs merged into this PR's branch, each reviewed on its own PR:\n",
+    );
+    for t in &stack.taken {
+        s.push_str(&format!(
+            "- #{} ({}): {} — its reviewed patch is {}\n",
+            t.number,
+            t.url,
+            t.files.join(", "),
+            pass.work
+                .join(format!("child-{}.patch", t.number))
+                .display()
+        ));
+    }
+    let from = delta.map_or("", |d| d.from.as_str());
+    let parent: Vec<String> = git(
+        &pass.tree_dir,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            pass.merge_base(),
+            from,
+        ],
+    )
+    .unwrap_or_default()
+    .lines()
+    .map(String::from)
+    .collect();
+    let leftover = stack
+        .leftover
+        .as_ref()
+        .map_or(&[][..], |l| l.files.as_slice());
+    s.push_str(&format!(
+        "\nThe parent's own files (its change up to the last review, {}): {}\n",
+        &from[..from.len().min(7)],
+        list_or_none(&parent)
+    ));
+    s.push_str(&format!(
+        "Left over once the children came out (conflict resolutions, commits outside them; the delta above): {}\n",
+        list_or_none(leftover)
+    ));
+    let meeting = stack::meeting(stack, &parent, leftover);
+    if meeting.is_empty() {
+        s.push_str("No file is touched by more than one of them: check the contracts between them (calls, types, config) and return no findings if they fit.\n");
+    } else {
+        s.push_str("Where they meet (files more than one of them touches):\n");
+        for (file, who) in &meeting {
+            s.push_str(&format!("- {file}: {}\n", who.join(", ")));
+        }
+    }
+    s.push_str(&format!(
+        "The whole delta since the last review, children included: {}\n",
+        pass.work.join("stack.patch").display()
+    ));
+    Ok(s)
+}
+
+fn list_or_none(files: &[String]) -> String {
+    if files.is_empty() {
+        "none".into()
+    } else {
+        files.join(", ")
+    }
+}
+
+/// Splits off the findings a child PR's review already raised: each goes to `dropped` naming the
+/// child, and the review body points at the child PRs instead.
+fn raised_on_children(
+    findings: Vec<Finding>,
+    taken: &[stack::Taken],
+) -> (Vec<Finding>, Vec<Value>) {
+    let raised: Vec<(&stack::Taken, Finding)> = taken
+        .iter()
+        .flat_map(|t| t.findings.iter().filter_map(carry).map(move |f| (t, f)))
+        .collect();
+    let mut keep = Vec::new();
+    let mut dropped = Vec::new();
+    for f in findings {
+        match raised.iter().find(|(_, c)| same(&f, c)) {
+            Some((t, _)) => {
+                let mut e = f.json();
+                e["reason"] = json!(format!(
+                    "already raised on child PR #{} ({})",
+                    t.number, t.url
+                ));
+                e["child"] = json!(t.number);
+                dropped.push(e);
+            }
+            None => keep.push(f),
+        }
+    }
+    (keep, dropped)
+}
+
+/// The report's `stack`, when the PR has children.
+fn stack_json(stack: &Stack) -> Option<Value> {
+    if stack.taken.is_empty() && stack.kept.is_empty() && stack.open.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "children": stack.taken.iter().map(|t| json!({
+            "number": t.number,
+            "url": t.url,
+            "head": t.head,
+            "files": t.files,
+            "findings": t.findings.len(),
+        })).collect::<Vec<_>>(),
+        "kept": stack.kept.iter().map(|(n, why)| json!({ "number": n, "reason": why })).collect::<Vec<_>>(),
+        "open": stack.open,
+    }))
 }
 
 /// What a PR changed since lens last reviewed it.
@@ -2075,7 +2324,7 @@ fn delta_between(tree: &Path, from: &str, head: &str, previous: Option<Value>) -
 }
 
 /// Moves each finding's line from where it was at `from` to where that line is at `to`.
-fn move_findings(tree: &Path, from: &str, to: &str, findings: &mut [Value]) {
+pub(crate) fn move_findings(tree: &Path, from: &str, to: &str, findings: &mut [Value]) {
     let mut diffs: HashMap<String, Option<String>> = HashMap::new();
     for f in findings {
         let (Some(file), Some(line)) = (f["file"].as_str(), f["line"].as_u64()) else {
@@ -2866,6 +3115,78 @@ mod tests {
             );
         }
         assert!(!reusable_lead(&prev, &prepared, "h1", &files[..1]));
+    }
+
+    fn child(number: u64, findings: Value) -> stack::Taken {
+        stack::Taken {
+            number,
+            url: format!("https://github.test/pr/{number}"),
+            base: "b".into(),
+            head: "h".into(),
+            files: vec!["src/c.rs".into()],
+            findings: findings.as_array().cloned().unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn a_finding_a_child_pr_raised_is_dropped_naming_the_child() {
+        let on_child = json!([{"file": "src/c.rs", "line": 4, "severity": "major",
+                               "title": "c leaks a handle", "failureScenario": "x",
+                               "profiles": ["correctness"]}]);
+        let taken = [child(8, json!([])), child(9, on_child)];
+        let raised = |file: &str, line: u64, title: &str| {
+            Finding::from_reply(
+                "correctness",
+                &json!({"file": file, "line": line, "severity": "major", "title": title,
+                        "failureScenario": "x"}),
+            )
+            .unwrap()
+        };
+        let (keep, dropped) = raised_on_children(
+            vec![
+                raised("src/c.rs", 5, "c leaks a handle"),
+                raised("src/c.rs", 40, "c leaks a handle"),
+                raised("src/a.rs", 4, "c leaks a handle"),
+            ],
+            &taken,
+        );
+        let kept: Vec<(&str, u64)> = keep.iter().map(|f| (f.file.as_str(), f.line)).collect();
+        assert_eq!(kept, [("src/c.rs", 40), ("src/a.rs", 4)]);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0]["child"], 9);
+        assert_eq!(
+            dropped[0]["reason"],
+            "already raised on child PR #9 (https://github.test/pr/9)"
+        );
+
+        let (keep, dropped) = raised_on_children(vec![raised("src/c.rs", 4, "t")], &[]);
+        assert_eq!(keep.len(), 1);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn the_report_lists_a_stack_only_when_the_pr_has_children() {
+        assert_eq!(stack_json(&Stack::default()), None);
+        let stack = Stack {
+            taken: vec![child(8, json!([{"file": "src/c.rs", "line": 1}]))],
+            kept: vec![(9, "no lens review".into())],
+            open: vec![10],
+            leftover: None,
+        };
+        assert_eq!(
+            stack_json(&stack),
+            Some(json!({
+                "children": [{"number": 8, "url": "https://github.test/pr/8", "head": "h",
+                              "files": ["src/c.rs"], "findings": 1}],
+                "kept": [{"number": 9, "reason": "no lens review"}],
+                "open": [10],
+            }))
+        );
+        let open_only = Stack {
+            open: vec![10],
+            ..Stack::default()
+        };
+        assert_eq!(stack_json(&open_only).unwrap()["children"], json!([]));
     }
 
     #[test]
