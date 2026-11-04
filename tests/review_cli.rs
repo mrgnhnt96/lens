@@ -332,23 +332,48 @@ impl Fixture {
             &(fs::read_to_string(d.join("src/a.rs")).unwrap() + "// a fix\n"),
         );
         git(&d, &["commit", "-qam", "fix"]);
+        self.push_head(fake);
+    }
+
+    /// Force-pushes `feature` as PR 7's head and points the fake `gh` at it.
+    fn push_head(&self, fake: &Path) {
+        let d = self.repo();
         git(
             &d,
             &["push", "-q", "-f", "origin", "feature:refs/pull/7/head"],
         );
-        let head = String::from_utf8(
-            Command::new("git")
-                .arg("-C")
-                .arg(&d)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap();
         let mut pr: Value = read_json(&fake.join("pr.json"));
-        pr["headRefOid"] = json!(head.trim());
+        pr["headRefOid"] = json!(self.rev("HEAD"));
         fs::write(fake.join("pr.json"), pr.to_string()).unwrap();
+    }
+
+    /// Commits `files` on main, then rebases `feature` onto it (the rebase must apply cleanly).
+    fn move_main(&self, files: &[(&str, &str)]) {
+        let d = self.repo();
+        git(&d, &["switch", "-q", "main"]);
+        for (path, text) in files {
+            write(&d, path, text);
+        }
+        git(&d, &["add", "-A"]);
+        git(&d, &["commit", "-qm", "main moves"]);
+        git(&d, &["switch", "-q", "feature"]);
+        git(&d, &["rebase", "-q", "main"]);
+    }
+
+    /// Pushes main and `feature` as the base and head of PR 7.
+    fn push_rebase(&self, fake: &Path) {
+        git(&self.repo(), &["push", "-q", "origin", "main"]);
+        self.push_head(fake);
+    }
+
+    fn rev(&self, rev: &str) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(self.repo())
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
     /// Every agent started so far, and clears the log.
@@ -938,6 +963,202 @@ fn a_rereview_reviews_only_what_changed_since_the_last_posted_review() {
     // --full reviews the whole change again.
     fx.review_with(&[], &["--pr", "7", "--dry-run", "--full"], &env);
     assert_eq!(read_json(&fx.state().join("pr-7.json"))["mode"], "full");
+    assert!(fx.calls().iter().any(is_lead));
+}
+
+fn line_of(report: &Value, title: &str) -> u64 {
+    report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["title"] == title)
+        .unwrap_or_else(|| panic!("no {title} in {report}"))["line"]
+        .as_u64()
+        .unwrap()
+}
+
+/// The "what changed since the last review" section of an agent's system prompt.
+fn delta_section(call: &Value) -> &str {
+    let system = call["system"].as_str().unwrap();
+    let (_, rest) = system
+        .split_once("What changed since the last review")
+        .unwrap_or_else(|| panic!("no delta in {system}"));
+    rest.split("\n## ").next().unwrap()
+}
+
+fn carried(calls: &[Value]) -> Vec<&str> {
+    calls
+        .iter()
+        .filter_map(|c| c["prompt"].as_str())
+        .filter(|p| p.contains("an earlier review raised it"))
+        .collect()
+}
+
+const HEADER: &str = "// h0\n// h1\n// h2\n// h3\n// h4\n";
+
+#[test]
+fn a_rebase_that_keeps_every_patch_reuses_the_review_with_its_lines_moved() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    // Main's later edits land above the PR's hunk but outside its context, so its patch holds.
+    fx.move_main(&[("src/a.rs", &format!("{HEADER}pub fn a() {{}}\n"))]);
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    let first = read_json(&fx.state().join("pr-7.json"));
+    let at = line_of(&first, "empty input accepted");
+    assert!(!fx.calls().is_empty());
+
+    fx.move_main(&[("src/a.rs", &format!("// top\n{HEADER}pub fn a() {{}}\n"))]);
+    fx.push_rebase(&fake);
+    let (out, log) = fx.review_logged(&[], &["--pr", "7", "--dry-run"], &env);
+    assert!(fx.calls().is_empty(), "{out}");
+    assert!(out.contains("rebased with the same patches"), "{out}");
+    assert!(log.contains("every commit's patch is the same"), "{log}");
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "rebased");
+    assert_eq!(report["rebased"]["from"], first["head"]);
+    assert_eq!(report["head"], json!(fx.rev("HEAD")));
+    assert_eq!(report["mergeBase"], json!(fx.rev("main")));
+    assert!(report["delta"].is_null());
+    assert_eq!(line_of(&report, "empty input accepted"), at + 1);
+    assert_eq!(
+        report["findings"].as_array().unwrap().len(),
+        first["findings"].as_array().unwrap().len()
+    );
+
+    // Nothing new was posted, so the next rebase starts from the reused report, not the posted head.
+    let second = report["head"].clone();
+    fx.move_main(&[(
+        "src/a.rs",
+        &format!("// top\n// top\n{HEADER}pub fn a() {{}}\n"),
+    )]);
+    fx.push_rebase(&fake);
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    assert!(fx.calls().is_empty());
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "rebased");
+    assert_eq!(report["rebased"]["from"], second);
+    assert_eq!(line_of(&report, "empty input accepted"), at + 2);
+
+    // --full reviews it again.
+    fx.review_with(&[], &["--pr", "7", "--dry-run", "--full"], &env);
+    assert_eq!(read_json(&fx.state().join("pr-7.json"))["mode"], "full");
+    assert!(fx.calls().iter().any(is_lead));
+}
+
+#[test]
+fn a_rebase_with_one_edited_commit_reviews_only_that_commit() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    fx.move_main(&[("src/a.rs", &format!("{HEADER}pub fn a() {{}}\n"))]);
+    write(&d, "src/b.rs", "pub fn b() {}\npub fn b2() {}\n");
+    git(&d, &["commit", "-qam", "more"]);
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    let first = read_json(&fx.state().join("pr-7.json"));
+    let at = line_of(&first, "empty input accepted");
+    fx.calls();
+
+    // Four lines up, so the carried blocker sits too far from the one the delta raises to merge.
+    let top = "// top\n".repeat(4);
+    fx.move_main(&[("src/a.rs", &format!("{top}{HEADER}pub fn a() {{}}\n"))]);
+    write(&d, "src/b.rs", "pub fn b() {}\npub fn b3() {}\n");
+    git(&d, &["commit", "-qa", "--amend", "--no-edit"]);
+    fx.push_rebase(&fake);
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "delta");
+    assert_eq!(report["delta"]["from"], json!(fx.rev("HEAD~1")));
+    let calls = fx.calls();
+    let delta = delta_section(&calls[0]);
+    assert!(delta.contains("+pub fn b3() {}"), "{delta}");
+    assert!(!delta.contains("+// line 0"), "{delta}");
+    // The earlier blocker is verified again where it sits now.
+    let carried = carried(&calls);
+    assert!(
+        carried
+            .iter()
+            .any(|p| p.contains(&format!("line: {}", at + 4))),
+        "{carried:?}"
+    );
+}
+
+#[test]
+fn a_rebase_whose_conflicts_changed_a_commit_reviews_the_resolution() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    fx.move_main(&[("src/c.rs", "pub fn c() {}\n")]);
+    write(&d, "src/c.rs", "pub fn c() { todo!() }\n");
+    git(&d, &["commit", "-qam", "fill c"]);
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    fx.calls();
+
+    git(&d, &["switch", "-q", "main"]);
+    write(&d, "src/c.rs", "pub fn c() -> u8 { 0 }\n");
+    git(&d, &["commit", "-qam", "c returns"]);
+    git(&d, &["switch", "-q", "feature"]);
+    let conflicted = Command::new("git")
+        .arg("-C")
+        .arg(&d)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "rebase",
+            "-q",
+            "main",
+        ])
+        .output()
+        .unwrap();
+    assert!(!conflicted.status.success(), "the rebase should conflict");
+    write(&d, "src/c.rs", "pub fn c() -> u8 { todo!() }\n");
+    git(&d, &["add", "src/c.rs"]);
+    git(&d, &["-c", "core.editor=true", "rebase", "--continue"]);
+    fx.push_rebase(&fake);
+
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "delta");
+    assert_eq!(report["delta"]["from"], json!(fx.rev("HEAD~1")));
+    let calls = fx.calls();
+    let delta = delta_section(&calls[0]);
+    assert!(delta.contains("+pub fn c() -> u8 { todo!() }"), "{delta}");
+    assert!(!delta.contains("+// line 0"), "{delta}");
+}
+
+#[test]
+fn a_rebase_from_a_head_that_cant_be_fetched_is_reviewed_in_full() {
+    let fx = Fixture::new(60);
+    let d = fx.repo();
+    let (gh, fake) = fx.pr_remote();
+    write(&d, ".lens.toml", "[pr]\nsample = 1\n");
+    let env = [("LENS_GH", gh.as_path()), ("FAKE", fake.as_path())];
+    fx.review_with(&[], &["--pr", "7"], &env);
+    let first = read_json(&fx.state().join("pr-7.json"));
+    fx.calls();
+
+    // The posted review names a head that no longer exists anywhere.
+    let mut posted = read_json(&fake.join("posted.json"));
+    let body = posted["body"].as_str().unwrap();
+    let head = first["head"].as_str().unwrap();
+    assert!(body.contains(head), "{body}");
+    posted["body"] = json!(body.replace(head, &"e".repeat(40)));
+    fs::write(fake.join("posted.json"), posted.to_string()).unwrap();
+
+    fx.move_main(&[("README.md", "# a\n\nMoved.\n")]);
+    fx.push_rebase(&fake);
+    fx.review_with(&[], &["--pr", "7", "--dry-run"], &env);
+    let report = read_json(&fx.state().join("pr-7.json"));
+    assert_eq!(report["mode"], "full");
+    assert!(report["rebased"].is_null());
     assert!(fx.calls().iter().any(is_lead));
 }
 

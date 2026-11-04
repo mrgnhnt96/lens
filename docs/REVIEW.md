@@ -82,7 +82,9 @@ its latest report in `<state>/pr-<n>.json`.
   next pass compares against it.
 - `mode`: `full`, or `delta` when only what changed since the last report (`delta.from`) was
   reviewed. A delta carries the last report's findings over: unfixed blockers, and majors in
-  files the delta touched, are verified again; other majors are kept as they were.
+  files the delta touched, are verified again; other majors are kept as they were. A PR pass
+  also writes `rebased` when a rebase changed no patch and it reused the last report (see "The
+  PR pass").
 - `incomplete`: the profiles whose reviewer gave no readable reply. The next pass doesn't trust
   such a report and reviews the whole change.
 - `tier`: `skip` (only docs changed: no agents ran), `small` (at most `[review] small_lines`
@@ -215,7 +217,28 @@ the last review". Reviewers and the verifier raise nothing about code the delta 
 or newly depend on, unless it is a blocker. The last review's blockers and majors (from its kept
 report) are verified again at the head: still failing, they stay and keep the verdict; fixed,
 they drop. The report has `"mode": "delta"` and `"delta": {"from", "changedLines"}`; a first
-review, a rewritten history or `--full` reviews the whole change (`"mode": "full"`).
+review or `--full` reviews the whole change (`"mode": "full"`).
+
+When that commit is no longer an ancestor of the head (the PR was rebased), the pass matches
+the commits its last report covered (`mergeBase..<that commit>`) to the PR's commits
+(`mergeBase..<head>`) by `git patch-id --stable`, counting the PR's commits from the first one
+until one has a patch the last review didn't see:
+
+- Every patch is still there, and no new one: the PR runs no agents. It reuses the last report,
+  with each finding's line moved to where that line sits at the new head (by
+  `git diff -U0 <that commit> <head>`), and records `"mode": "rebased"` and
+  `"rebased": {"from"}`. The reused report's `head`, `base` and `mergeBase` are the new ones, so
+  a later rebase starts from it, even when the reuse posted nothing new. A different `lens` reviews
+  it again instead.
+- Some commits kept their patch: the rest is reviewed as a delta from the last commit that kept
+  it (`delta.from`), with the last report's findings, at their moved lines, carried over as
+  above. A commit the rebase changed (an edit, a conflict resolved against the new base) and
+  every commit after it count as new.
+- The first commit changed, the old commit can't be fetched, there's no kept report for it, or
+  the PR has a merge commit: the whole change is reviewed (`"mode": "full"`).
+
+A patch-id hashes a commit's diff with its context lines, so a base change within three lines of
+a PR's hunk makes that commit count as changed, and it is reviewed again.
 
 A PR pass whose `head` and `base` match the last report's, written by the same `lens`, runs no
 agents: it reuses that report and posts what's left to post. `--full` reviews it again. A PR

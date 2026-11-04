@@ -1630,7 +1630,14 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
     let _ = fs::remove_dir_all(pass.work.join("agents"));
     // A PR lens reviewed before is reviewed again only for what changed since: the findings it
     // already raised were raised, and the code it already read was read.
-    let delta = if pass.opts.full { None } else { pr_delta(pass) };
+    let since = if pass.opts.full { None } else { pr_delta(pass) };
+    let delta = match since {
+        Some(Since::Rebased { from, report }) => {
+            return reuse_rebased(pass, number, &from, report);
+        }
+        Some(Since::Delta(d)) => Some(d),
+        None => None,
+    };
     if let Some(d) = &delta {
         pass.log(&format!(
             "reviewing the {} changed lines since the last review of {}",
@@ -1906,6 +1913,28 @@ fn pr_pass(pass: &mut Pass) -> Result<Done> {
     Ok(post_pr(pass, number, &report, summary, &failed))
 }
 
+/// Reuses the review of `from` for a PR rebased since with the same patches: its findings, moved
+/// to the new head, are posted for that head.
+fn reuse_rebased(pass: &mut Pass, number: u64, from: &str, mut report: Value) -> Result<Done> {
+    pass.log(&format!(
+        "PR #{number} was rebased since the last review of {} and every commit's patch is the same; reusing that review (--full reviews again)",
+        &from[..from.len().min(7)]
+    ));
+    let prepared = pass.prepared.clone();
+    for key in ["branch", "base", "mergeBase", "head", "changedLines"] {
+        report[key] = prepared[key].clone();
+    }
+    report["startedAt"] = json!(pass.started_at);
+    report["mode"] = json!("rebased");
+    report["rebased"] = json!({ "from": from });
+    if let Some(r) = report.as_object_mut() {
+        r.remove("delta");
+    }
+    finish(pass, &mut report)?;
+    let summary = summarize(&report, &pass.report_path, true);
+    Ok(post_pr(pass, number, &report, summary, &[]))
+}
+
 /// Why a nit the PR pass never verified is in the report's `dropped`.
 const NIT_UNVERIFIED: &str = "nit: never posted, so not verified";
 
@@ -1938,13 +1967,33 @@ struct PrDelta {
     previous: Option<Value>,
 }
 
+/// What became of the PR since its last lens review.
+enum Since {
+    /// The PR was rebased and every commit's patch is the same: `report` is the last review's,
+    /// moved to the new head.
+    Rebased { from: String, report: Value },
+    /// Review only this.
+    Delta(PrDelta),
+}
+
 /// The PR's change since the commit its last lens review was for (read from that review's
-/// marker in `posted.json`), when that commit is an ancestor of the head. `None` means a full
-/// review: a first review, the same head, or history rewritten since.
-fn pr_delta(pass: &Pass) -> Option<PrDelta> {
+/// marker in `posted.json`). When that commit is an ancestor of the head, the delta is
+/// everything since it; when the PR was rebased since, it's what follows the commits whose
+/// patches stayed the same (`rebased_since`). `None` means a full review: a first review, the
+/// same head, a reviewed commit lens can't fetch, or a rewrite it can't match.
+fn pr_delta(pass: &Pass) -> Option<Since> {
     let posted: Value =
         serde_json::from_str(&fs::read_to_string(pass.work.join("posted.json")).ok()?).ok()?;
-    let from = posted["head"].as_str()?.to_string();
+    let mut from = posted["head"].as_str()?.to_string();
+    // A rebase whose review was reused may post nothing new, so the marker can still name the
+    // head from before it: that review covered the head it was moved to.
+    if let Some(last) = last_report(&pass.report_path) {
+        if last["mode"] == "rebased" && last["rebased"]["from"] == from.as_str() {
+            if let Some(h) = last["head"].as_str() {
+                from = h.to_string();
+            }
+        }
+    }
     let head = pass.prepared["head"].as_str()?;
     if from == head {
         return None;
@@ -1953,19 +2002,106 @@ fn pr_delta(pass: &Pass) -> Option<PrDelta> {
     if crate::diff::git(tree, &["cat-file", "-e", &format!("{from}^{{commit}}")]).is_err() {
         let _ = crate::diff::git(tree, &["fetch", "--quiet", "origin", &from]);
     }
-    crate::diff::git(tree, &["merge-base", "--is-ancestor", &from, head]).ok()?;
-    let patch = crate::diff::git(tree, &["diff", "--full-index", &from, head]).ok()?;
-    let files = crate::diff::git(tree, &["diff", "--name-only", "--no-renames", &from, head])
+    crate::diff::git(tree, &["cat-file", "-e", &format!("{from}^{{commit}}")]).ok()?;
+    let previous = report_for(pass, &from);
+    if crate::diff::git(tree, &["merge-base", "--is-ancestor", &from, head]).is_ok() {
+        return delta_between(tree, &from, head, previous).map(Since::Delta);
+    }
+    rebased_since(pass, &from, previous?)
+}
+
+/// The delta for a PR rebased since `previous` reviewed `from`, matching its old commits to the
+/// new ones by patch-id. The new commits up to the first whose patch the old ones don't have
+/// were reviewed already. All of them: the review is reused when nothing was dropped either (and
+/// the same lens made it), and otherwise the delta is empty and only the carried findings are
+/// verified again. None of them, or a merge commit in either range: a full review.
+fn rebased_since(pass: &Pass, from: &str, mut previous: Value) -> Option<Since> {
+    let tree = &pass.tree_dir;
+    let head = pass.prepared["head"].as_str()?;
+    let old_base = previous["mergeBase"].as_str()?;
+    let new_base = pass.prepared["mergeBase"].as_str()?;
+    let old = crate::diff::patch_ids(tree, &format!("{old_base}..{from}")).ok()?;
+    let new = crate::diff::patch_ids(tree, &format!("{new_base}..{head}")).ok()?;
+    let reviewed = reviewed_prefix(&old, &new);
+    if reviewed == 0 {
+        return None;
+    }
+    if let Some(findings) = previous["findings"].as_array_mut() {
+        move_findings(tree, from, head, findings);
+    }
+    let all_kept = old
+        .iter()
+        .filter_map(|(_, id)| id.as_ref())
+        .all(|id| new.iter().any(|(_, n)| n.as_ref() == Some(id)));
+    if reviewed == new.len() && all_kept {
+        // Like an unchanged head, a review by another lens isn't reused.
+        if previous["lens"] != crate::assets::fingerprint().as_str() {
+            return None;
+        }
+        return Some(Since::Rebased {
+            from: from.to_string(),
+            report: previous,
+        });
+    }
+    let last = &new[reviewed - 1].0;
+    delta_between(tree, last, head, Some(previous)).map(Since::Delta)
+}
+
+/// How many of `new`'s commits, from the oldest, have a patch one of `old`'s has. A commit that
+/// changes nothing counts as having one.
+fn reviewed_prefix(old: &[(String, Option<String>)], new: &[(String, Option<String>)]) -> usize {
+    new.iter()
+        .take_while(|(_, id)| {
+            id.as_ref()
+                .is_none_or(|id| old.iter().any(|(_, o)| o.as_ref() == Some(id)))
+        })
+        .count()
+}
+
+/// `git diff <from> <head>` in `tree` as a delta over `previous`.
+fn delta_between(tree: &Path, from: &str, head: &str, previous: Option<Value>) -> Option<PrDelta> {
+    let patch = crate::diff::git(tree, &["diff", "--full-index", from, head]).ok()?;
+    let files = crate::diff::git(tree, &["diff", "--name-only", "--no-renames", from, head])
         .ok()?
         .lines()
         .map(String::from)
         .collect();
     Some(PrDelta {
-        previous: report_for(pass, &from),
-        from,
+        from: from.to_string(),
         patch,
         files,
+        previous,
     })
+}
+
+/// Moves each finding's line from where it was at `from` to where that line is at `to`.
+fn move_findings(tree: &Path, from: &str, to: &str, findings: &mut [Value]) {
+    let mut diffs: HashMap<String, Option<String>> = HashMap::new();
+    for f in findings {
+        let (Some(file), Some(line)) = (f["file"].as_str(), f["line"].as_u64()) else {
+            continue;
+        };
+        let diff = diffs.entry(file.to_string()).or_insert_with(|| {
+            crate::diff::git(
+                tree,
+                &[
+                    "diff",
+                    "-U0",
+                    "--no-renames",
+                    "--no-color",
+                    "--no-ext-diff",
+                    from,
+                    to,
+                    "--",
+                    file,
+                ],
+            )
+            .ok()
+        });
+        if let (Some(diff), Ok(line)) = (diff, u32::try_from(line)) {
+            f["line"] = json!(crate::diff::moved_line(diff, line));
+        }
+    }
 }
 
 /// The kept report (or the latest one) that reviewed `head`.
@@ -2200,7 +2336,9 @@ pub fn summarize(report: &Value, path: &Path, fresh: bool) -> String {
             format!(" ({})", counts.join(", "))
         },
     );
-    if fresh {
+    if fresh && report["mode"] == "rebased" {
+        head.push_str(" · rebased with the same patches as the last review");
+    } else if fresh {
         head.push_str(" · unchanged since the last review");
     } else {
         let secs = report["seconds"]["total"].as_u64().unwrap_or(0);
@@ -2662,6 +2800,39 @@ mod tests {
     fn formats_iso_times() {
         assert_eq!(iso(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso(1_760_486_400), "2025-10-15T00:00:00Z");
+    }
+
+    #[test]
+    fn a_rebase_was_reviewed_up_to_its_first_new_patch() {
+        let commits = |ids: &[Option<&str>]| -> Vec<(String, Option<String>)> {
+            ids.iter()
+                .enumerate()
+                .map(|(i, id)| (format!("c{i}"), id.map(String::from)))
+                .collect()
+        };
+        let old = commits(&[Some("p1"), Some("p2"), Some("p3")]);
+        assert_eq!(reviewed_prefix(&old, &old), 3);
+        assert_eq!(
+            reviewed_prefix(&old, &commits(&[Some("p1"), Some("p2")])),
+            2
+        );
+        assert_eq!(
+            reviewed_prefix(&old, &commits(&[Some("p1"), Some("x"), Some("p3")])),
+            1,
+            "an edited commit and everything after it are reviewed again"
+        );
+        assert_eq!(reviewed_prefix(&old, &commits(&[Some("x"), Some("p1")])), 0);
+        assert_eq!(
+            reviewed_prefix(&old, &commits(&[Some("p2"), Some("p1"), Some("p3")])),
+            3,
+            "reordered commits with the same patches were reviewed"
+        );
+        assert_eq!(
+            reviewed_prefix(&old, &commits(&[None, Some("p1"), Some("p4")])),
+            2,
+            "a commit that changes nothing needs no review"
+        );
+        assert_eq!(reviewed_prefix(&[], &commits(&[Some("p1")])), 0);
     }
 
     #[test]
