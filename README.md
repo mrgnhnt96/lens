@@ -41,6 +41,9 @@ docs/REVIEW.md               the report and protocol result formats, and where s
 
 ## `lens review [<base>] [--intent <file>] [--full]`, `lens review --floor`, `lens review --pr <n> [--full] [--dry-run [--only <profile>,...]]`
 
+Every form takes `--profiles <dir>` (repeatable) to lay profiles kept outside the repo over the
+rest; see "Profiles kept outside the repo" under `lens profiles` below.
+
 Runs a pass and prints its summary; the report goes to `<state>/<branch>.json` (format in
 [docs/REVIEW.md](docs/REVIEW.md)). Nothing is written to the repo: `<state>` is
 `$XDG_CACHE_HOME/lens/state/<repo>-<hash>` (`~/.cache` without it), one folder per checkout.
@@ -123,7 +126,7 @@ and `lens cost` still counts what it spent. Name `impact-assessment` to run the 
 list of profiles; a named profile the change doesn't pick (wrong language, `enabled: false`)
 stays skipped with its reason.
 
-## `lens profiles --base <ref> [--only <profile>,...]`
+## `lens profiles --base <ref> [--only <profile>,...] [--profiles <dir>]...`
 
 Prints, as JSON, the profiles that apply to everything that changed since the merge base of
 `<ref>` and `HEAD` (commits, staged, unstaged and untracked files):
@@ -137,6 +140,25 @@ Prints, as JSON, the profiles that apply to everything that changed since the me
 
 A repo's own `review-profiles/<name>/profile.md` replaces the default with that name; new
 names are added.
+
+**Profiles kept outside the repo.** For a repo you can't add files to, keep the profiles in a
+folder of your own, laid out like `review-profiles/`, and point lens at it with
+`--profiles <dir>` (on `lens review` and `lens profiles`; repeat it for more folders) or
+`$LENS_PROFILE_OVERRIDES` (a path list, `:`-separated like `$PATH`). The layers go, last one
+winning by name:
+
+1. the profiles built into lens (or `$LENS_PROFILES_DIR`, which replaces them),
+2. the repo's `review-profiles/`,
+3. each override folder, in the order given.
+
+The override folders come last because they are the reviewer's own choice on their machine: they
+beat both lens's defaults and what the repo ships. `--profiles` replaces
+`$LENS_PROFILE_OVERRIDES` rather than adding to it. A folder that doesn't exist is an error; an
+empty one changes nothing. Relative paths are taken from where lens runs, and `lens review`
+passes the folders on to every process it starts. Each profile's `source` in the JSON says where
+it came from: `default`, `repo` or `override`. When something runs lens with a fixed command line
+(the task board), set the variable in that program's environment; it then applies to every repo
+lens reviews there.
 
 `--only <profile>,...` (or `$LENS_ONLY_PROFILES`, which `lens review --only` sets and any other
 `lens review` clears) keeps just

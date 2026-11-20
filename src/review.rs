@@ -2068,12 +2068,14 @@ fn stack_of(pass: &Pass, d: &mut PrDelta) -> Result<Stack> {
     Ok(stack)
 }
 
-/// The stack-integration reviewer's plan: the profile by that name, a repo's own over lens's.
+/// The stack-integration reviewer's plan: the profile by that name, an override folder's over a
+/// repo's own over lens's.
 fn stack_plan(pass: &Pass) -> Result<Plan> {
     let dir = std::env::var_os("LENS_PROFILES_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| pass.assets.join("profiles"));
-    let profile = crate::profile::load_all(&dir, &pass.root)?
+    let overrides = crate::profile::overrides_from_env()?;
+    let profile = crate::profile::load_all(&dir, &pass.root, &overrides)?
         .into_iter()
         .find(|p| p.meta.name == STACK)
         .with_context(|| format!("no {STACK} profile in {}", dir.display()))?;
