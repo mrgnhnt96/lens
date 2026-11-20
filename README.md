@@ -18,6 +18,14 @@ doesn't depend on taskboard.
 
 ## Install
 
+From a release tag:
+
+```sh
+cargo install --locked --git https://github.com/mrgnhnt96/lens --tag v0.2.0
+```
+
+From a checkout:
+
 ```sh
 cargo install --locked --path .
 ```
