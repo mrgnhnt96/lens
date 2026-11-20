@@ -9,6 +9,7 @@ pub mod config;
 pub mod cost;
 pub mod diff;
 pub mod forge;
+pub mod guideline;
 pub mod lang;
 pub mod map;
 pub mod outcome;

@@ -31,6 +31,7 @@ use crate::backoff;
 use crate::config::{self, Config};
 use crate::diff::git;
 use crate::forge;
+use crate::guideline;
 use crate::pr;
 use crate::reply;
 use crate::stack::{self, Stack};
@@ -128,6 +129,7 @@ pub(crate) const ROLES: &[&str] = &["reviewer", "verifier"];
 /// Above this many bytes the diff isn't put in the prompt; agents read the file instead.
 const INLINE_DIFF_MAX: usize = 150_000;
 const INLINE_MAP_MAX: usize = 60_000;
+/// Characters of each repo guideline file shown, counting the files it imports.
 const INLINE_GUIDELINE_MAX: usize = 20_000;
 
 /// A finding as a reviewer raised it, after merging duplicates.
@@ -627,11 +629,11 @@ impl Pass {
                 s.push_str(&format!("\n## The task ({name})\n\n{}\n", text.trim()));
             }
         }
-        for path in self.guidelines()? {
-            let text = fs::read_to_string(self.tree_dir.join(&path)).unwrap_or_default();
-            let text: String = text.chars().take(INLINE_GUIDELINE_MAX).collect();
-            s.push_str(&format!("\n## Repo guideline: {path}\n\n{}\n", text.trim()));
-        }
+        s.push_str(&guideline::sections(
+            &self.tree_dir,
+            &self.guidelines()?,
+            INLINE_GUIDELINE_MAX,
+        ));
         Ok(s)
     }
 
