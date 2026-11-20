@@ -1,6 +1,6 @@
 [package]
 name = "lens"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Agent code review for Claude Code: profile selection and review plumbing."
 license = "MIT"
