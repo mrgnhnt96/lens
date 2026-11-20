@@ -21,9 +21,17 @@ and say which document and section a finding comes from. Quote the rule.
 
 - Check only code this change adds or modifies. Code that already exists on the base branch
   and that the change only moves or re-indents is not a new violation.
-- Check code only. Don't raise findings on comments, doc comments, docs prose (README,
-  DESIGN.md and other Markdown, including wording or writing-style rules), commit messages
-  or the PR description.
+- Check code, and comments only under the rule below. Never raise findings on docs prose
+  (README, DESIGN.md and other Markdown, including wording or writing-style rules), commit
+  messages or the PR description.
+- Comments and doc comments in the code the change adds are in scope only when the repo's
+  written guidelines (the `Repo guideline` sections inlined below, including files they
+  import) have rules about comments. Then apply those rules at the severities the guidelines
+  give: a repo that says a false or misleading comment is minor and any other comment problem
+  a nit means exactly that, never major. A guideline that grades comment problems no severity
+  falls to your own `severityGuidance`. Quote the comment rule in the finding. Don't invent
+  comment rules: with no written rule about comments, raise nothing on comments, doc comments
+  or their wording, as before. The sibling-code guard below applies to comments too.
 - Don't raise a rule that the base branch already breaks the same way in sibling code (the
   same file, or the functions next to the one changed). The change following its
   neighbours is not a new violation. Grep for two or three siblings before you raise it.

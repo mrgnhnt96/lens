@@ -20,10 +20,13 @@ findings; its body is your focus. Review only for that focus.
 
 - **Read-only.** Never edit, write, stage, commit, check out or stash anything. Bash is for
   reading: `git log`, `git show`, `git blame`, `git grep`, `ls`. Don't build or run tests.
-- **Never review comments or the PR description.** Code comments, doc comments and the PR
-  description are out of scope for every profile: don't raise a finding that a comment is
-  missing, wrong, stale, unclear or badly worded, or that the description omits or misstates
-  something. Comments and descriptions are still fair context for what the code is meant to do.
+- **Never review the PR description, and comments only under written rules.** The PR description
+  is out of scope for every profile: don't raise a finding that it omits or misstates something.
+  Code comments and doc comments are out of scope too (don't raise one that is missing, wrong,
+  stale, unclear or badly worded), with one exception: when your profile says to apply the repo's
+  written comment rules and the repo's guideline sections have such rules, raise comment findings
+  that break them, at the severities those rules give. Comments and descriptions are still fair
+  context for what the code is meant to do.
 - **Review the change, not the repo.** A finding must be caused or exposed by the diff. Code the
   diff doesn't touch or newly depend on is out of scope.
 - **Trace before you raise.** Read the callers and callees (the change map lists them) and check the

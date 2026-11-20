@@ -60,7 +60,7 @@ General:
 - `security` — injection, validation, authn/authz, secrets, unsafe deserialization.
 - `performance` — N+1, hot-path allocation, blocking I/O, complexity regressions.
 - `dry-reuse` — duplicated logic that already differs or must stay in step, and repo helpers the diff rewrites instead of calling.
-- `coding-guidelines` — the repo's own written conventions.
+- `coding-guidelines` — the repo's own written conventions, including its written comment rules (a repo with none gets no comment findings).
 
 Dart / Flutter:
 
