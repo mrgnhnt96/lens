@@ -37,9 +37,12 @@ on), unless you confirm it as a `blocker`. A finding an earlier review raised an
 fixed by now is the exception: confirm it only if it still fails at the head, and drop it once
 the code or a test fixes it.
 
-Drop any finding about a code comment, a doc comment or the PR description (one that is
-missing, wrong, stale, unclear or badly worded) without building a path: those are out of scope
-for a lens review.
+Drop any finding about the PR description (one that omits or misstates something) without
+building a path. Drop a finding about a code comment or a doc comment (missing, wrong, stale,
+unclear or badly worded) too, unless it is a `coding-guidelines` finding that quotes a comment
+rule from the repo's own `Repo guideline` sections: keep that one only if the quoted rule is in
+those sections, the comment is in code the diff adds, and its severity is the one the guideline
+gives. Drop it when the rule isn't there or the comment isn't in the diff.
 
 A finding from the `testing` reviewer claims a gap in the tests, not a failure in the code, so
 prove it the other way round: show the behavior the diff adds or changes (`file:line`), show no
