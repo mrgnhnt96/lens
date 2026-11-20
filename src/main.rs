@@ -51,6 +51,11 @@ enum Command {
         /// The repo to review. Defaults to the current directory.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// A folder of profiles kept outside the repo, laid over the defaults and the repo's
+        /// review-profiles/ by name (repeat it; a later folder wins). Replaces
+        /// $LENS_PROFILE_OVERRIDES.
+        #[arg(long = "profiles", value_name = "DIR")]
+        profiles: Vec<PathBuf>,
     },
     /// Pick the reviewer profiles that apply to the change since <base> and print them as JSON.
     Profiles {
@@ -67,6 +72,11 @@ enum Command {
         /// Defaults to $LENS_ONLY_PROFILES, which `lens review --only` sets.
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
+        /// A folder of profiles kept outside the repo, laid over the defaults and the repo's
+        /// review-profiles/ by name (repeat it; a later folder wins). Replaces
+        /// $LENS_PROFILE_OVERRIDES.
+        #[arg(long = "profiles", value_name = "DIR")]
+        profiles: Vec<PathBuf>,
     },
     /// Map the change since <base>: changed files and symbols, their callers and covering tests.
     Map {
@@ -196,6 +206,7 @@ fn main() -> Result<()> {
             repo,
             defaults,
             only,
+            profiles,
         } => {
             let defaults = match defaults {
                 Some(dir) => dir,
@@ -206,7 +217,9 @@ fn main() -> Result<()> {
                 false => only,
             };
             let change = diff::changed_files(&repo, &base)?;
-            let profiles = profile::load_all(&defaults, &change.root)?;
+            let overrides =
+                profile::overrides(profiles, env::var_os(profile::OVERRIDES_VAR).as_deref())?;
+            let profiles = profile::load_all(&defaults, &change.root, &overrides)?;
             let mut selection = select::select(&profiles, &change.files)?;
             keep_only(&mut selection, &only, &profiles)?;
             let out = ProfilesOut {
@@ -236,7 +249,16 @@ fn main() -> Result<()> {
             dry_run,
             only,
             repo,
+            profiles,
         } => {
+            // Every process the pass starts reads the overrides from the env, so the flag's
+            // folders, made absolute, go there.
+            let overrides =
+                profile::overrides(profiles, env::var_os(profile::OVERRIDES_VAR).as_deref())?;
+            match overrides.is_empty() {
+                true => env::remove_var(profile::OVERRIDES_VAR),
+                false => env::set_var(profile::OVERRIDES_VAR, env::join_paths(&overrides)?),
+            }
             let state = match only.is_empty() {
                 true => {
                     env::remove_var(ONLY_VAR);

@@ -12,6 +12,22 @@ Each profile is a folder:
   profile.md    YAML frontmatter + the reviewer's instructions (markdown body)
 ```
 
+## Replacing and adding profiles
+
+The profiles here are the defaults. Two layers go over them, matched by `name`: a profile with a
+default's name replaces it, and a new name adds a reviewer.
+
+1. The reviewed repo's `review-profiles/<name>/profile.md`.
+2. Folders outside the repo, for repos you can't add files to: `lens review --profiles <dir>`
+   (repeatable) or `$LENS_PROFILE_OVERRIDES` (a `:`-separated path list). They win over the
+   repo's own profiles, and a later folder wins over an earlier one. `--profiles` replaces the
+   variable.
+
+An override folder is laid out like this one (`<name>/profile.md`; `item.json` is optional). To
+change one reviewer, copy its folder and edit it, since an override replaces the whole profile,
+frontmatter and prompt alike. To turn a reviewer off, copy it with `enabled: false`.
+`$LENS_PROFILES_DIR` is different: it replaces this whole set.
+
 ## Frontmatter
 
 | Field | Required | Meaning |

@@ -168,6 +168,7 @@ impl Fixture {
         Command::new(env!("CARGO_BIN_EXE_lens"))
             .arg("review")
             .args(args)
+            .env_remove("LENS_PROFILE_OVERRIDES")
             .envs(env.iter().copied())
             .current_dir(self.repo())
             // The files built into lens and the state of reviews run by hand, under this test's
@@ -1777,4 +1778,31 @@ fn a_local_review_the_plan_turns_away_mid_pass_keeps_the_last_report() {
             "{role}: the last review stays the current one"
         );
     }
+}
+
+#[test]
+fn an_override_folder_outside_the_repo_reaches_the_reviewers() {
+    let fx = Fixture::new(60);
+    let over = fx.dir.path().join("overrides");
+    let shipped = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles/correctness/profile.md"),
+    )
+    .unwrap();
+    write(
+        &over,
+        "correctness/profile.md",
+        &format!("{shipped}\nOVERRIDE-FROM-FLAG\n"),
+    );
+    // Relative to where lens runs; the scripts and agents run elsewhere.
+    fx.review(&["--profiles", "../overrides"]);
+    let calls = fx.calls();
+    let correctness = calls
+        .iter()
+        .filter(|c| c["role"] == "reviewer")
+        .find(|c| c["prompt"].as_str().unwrap().contains("OVERRIDE-FROM-FLAG"));
+    assert!(correctness.is_some(), "{calls:?}");
+
+    let missing = fx.run(&["main", "--profiles", "../nowhere"], &[]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("nowhere"));
 }

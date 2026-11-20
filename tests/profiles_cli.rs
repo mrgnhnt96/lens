@@ -43,9 +43,20 @@ fn repo() -> tempfile::TempDir {
 }
 
 fn lens_profiles(repo: &Path) -> Value {
-    let out = Command::new(env!("CARGO_BIN_EXE_lens"))
+    lens_profiles_with(repo, &[], None)
+}
+
+/// `lens profiles` with extra args and `$LENS_PROFILE_OVERRIDES` set to `overrides`.
+fn lens_profiles_with(repo: &Path, args: &[&str], overrides: Option<&Path>) -> Value {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_lens"));
+    cmd.env_remove("LENS_PROFILE_OVERRIDES");
+    if let Some(dir) = overrides {
+        cmd.env("LENS_PROFILE_OVERRIDES", dir);
+    }
+    let out = cmd
         .args(["profiles", "--base", "main", "--repo"])
         .arg(repo)
+        .args(args)
         .env(
             "LENS_PROFILES_DIR",
             Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles"),
@@ -175,4 +186,66 @@ fn unknown_base_is_an_error() {
         .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("merge base"));
+}
+
+fn profile_text(name: &str, description: &str) -> String {
+    format!(
+        "---\nname: {name}\ndescription: {description}\nmodel: sonnet\neffort: high\n\
+         severityGuidance: x\nenabled: true\n---\nBody\n"
+    )
+}
+
+fn picked_entry<'a>(v: &'a Value, name: &str) -> &'a Value {
+    v["picked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("{name} not picked: {v}"))
+}
+
+#[test]
+fn an_out_of_repo_folder_wins_over_the_repos_own_and_the_flag_over_the_env() {
+    let dir = repo();
+    write(
+        dir.path(),
+        "review-profiles/house/profile.md",
+        &profile_text("house", "Repo's."),
+    );
+    let outside = tempfile::tempdir().unwrap();
+    let (env_dir, flag_dir) = (outside.path().join("env"), outside.path().join("flag"));
+    write(
+        &env_dir,
+        "house/profile.md",
+        &profile_text("house", "From the env."),
+    );
+    write(
+        &env_dir,
+        "mine/profile.md",
+        &profile_text("mine", "Only in the env."),
+    );
+    write(
+        &flag_dir,
+        "house/profile.md",
+        &profile_text("house", "From the flag."),
+    );
+
+    let v = lens_profiles(dir.path());
+    assert_eq!(picked_entry(&v, "house")["source"], "repo");
+
+    let v = lens_profiles_with(dir.path(), &[], Some(&env_dir));
+    let house = picked_entry(&v, "house");
+    assert_eq!(house["source"], "override");
+    assert_eq!(house["description"], "From the env.");
+    assert_eq!(picked_entry(&v, "mine")["source"], "override");
+    // The shipped profiles are still there.
+    assert_eq!(picked_entry(&v, "correctness")["source"], "default");
+
+    let flag = flag_dir.to_str().unwrap();
+    let v = lens_profiles_with(dir.path(), &["--profiles", flag], Some(&env_dir));
+    assert_eq!(picked_entry(&v, "house")["description"], "From the flag.");
+    assert!(
+        decision_of(&v, "mine").is_none(),
+        "the flag replaces the env list"
+    );
 }
