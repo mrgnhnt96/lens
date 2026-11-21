@@ -37,6 +37,10 @@ enum Command {
         /// `[floor] risky` glob of .lens.toml.
         #[arg(long, conflicts_with_all = ["pr", "full"])]
         floor: bool,
+        /// Review your own branch strictly: every picked profile runs and every severity is
+        /// kept, nits included, even for a small change. Costs more per round.
+        #[arg(long, conflicts_with_all = ["pr", "floor"])]
+        strict: bool,
         /// Run the PR pass on this PR: every profile, all severities, posted on the PR.
         #[arg(long, conflicts_with_all = ["base"])]
         pr: Option<u64>,
@@ -245,6 +249,7 @@ fn main() -> Result<()> {
             intent,
             full,
             floor,
+            strict,
             pr,
             dry_run,
             only,
@@ -275,6 +280,7 @@ fn main() -> Result<()> {
                 base,
                 intent,
                 floor,
+                strict,
                 pr,
                 dry_run,
                 state,

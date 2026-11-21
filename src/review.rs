@@ -7,7 +7,8 @@
 //! - **Tiers.** A change that touches only docs isn't reviewed. A small change (`[review]
 //!   small_lines`) gets the correctness reviewer only. Otherwise correctness, testing and, when
 //!   there's a task, intent-alignment. No lead reviewer and no focus-area reviewers locally: those
-//!   are the PR pass's.
+//!   are the PR pass's. Only blockers and majors are kept. `--strict` turns the tiers and the
+//!   severity cut off: every picked profile runs and every severity is kept.
 //! - **Deltas.** When the last report reviewed this branch from the same merge base, only what
 //!   changed since then is reviewed, and blockers it left unfixed are verified again.
 //! - **Fresh reports** aren't redone: an unchanged tree isn't reviewed again.
@@ -48,6 +49,9 @@ pub struct Options {
     pub full: bool,
     /// Run the PR pass on this PR instead of the local pass.
     pub pr: Option<u64>,
+    /// Local pass: run every picked profile and keep every severity, nits included, whatever
+    /// the change's size. A strict report and a light one never stand in for each other.
+    pub strict: bool,
     /// PR pass: build the review but don't post it.
     pub dry_run: bool,
     /// The per-PR floor: one Sonnet correctness reviewer, only when the change touches a
@@ -419,6 +423,36 @@ pub(crate) fn plan_pr(profiles: &Value, files: &[String]) -> Vec<Plan> {
             }
         })
         .collect()
+}
+
+/// The strict local pass's profiles: every one lens picked, whatever the change's size.
+/// Docs only skips all but intent-alignment, and intent-alignment needs a task or intent.
+fn plan_strict(profiles: &Value, tier: Tier, has_intent: bool) -> Vec<Plan> {
+    profiles["picked"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| {
+            let intent = p["name"] == "intent-alignment";
+            if tier == Tier::Skip && !intent {
+                Plan::from_picked(p, false, "docs only".into())
+            } else if intent && !has_intent {
+                Plan::from_picked(p, false, "no task context".into())
+            } else {
+                Plan::from_picked(p, true, reason_of(p))
+            }
+        })
+        .collect()
+}
+
+/// The lowest severity rank the local pass keeps: every severity when strict, else major.
+fn kept_rank(strict: bool) -> u8 {
+    if strict {
+        rank("nit")
+    } else {
+        rank("major")
+    }
 }
 
 fn reason_of(p: &Value) -> String {
@@ -1025,6 +1059,16 @@ enum Mode {
     Full,
 }
 
+/// Whether a local pass can reuse the last local report or review only what changed since it:
+/// the same base and merge base, as strict as this pass, and every reviewer finished (a report
+/// some failed on makes the next pass review everything).
+fn builds_on(prev: &Value, prepared: &Value, strict: bool) -> bool {
+    prev["base"] == prepared["base"]
+        && prev["mergeBase"] == prepared["mergeBase"]
+        && prev["strict"].as_bool().unwrap_or(false) == strict
+        && prev["incomplete"].as_array().is_none_or(Vec::is_empty)
+}
+
 fn local_pass(pass: &mut Pass) -> Result<Done> {
     let prepared = pass.prepared.clone();
     let changed = prepared["changedLines"].as_u64().unwrap_or(0) as u32;
@@ -1066,12 +1110,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     let last = prior.as_ref().map_or(0, last_id);
     let previous = prior.filter(|r: &Value| r["pass"] == "local" && !pass.opts.floor);
     let mode = match previous {
-        // A report some reviewers failed on doesn't count: the next pass reviews everything.
-        Some(prev)
-            if prev["base"] == prepared["base"]
-                && prev["mergeBase"] == prepared["mergeBase"]
-                && prev["incomplete"].as_array().is_none_or(Vec::is_empty) =>
-        {
+        Some(prev) if builds_on(&prev, &prepared, pass.opts.strict) => {
             match reviewed_tree(&pass.root, &prev) {
                 Some(t) if t == now && !pass.opts.full => Mode::Fresh(prev),
                 Some(t) if !pass.opts.full => match git(
@@ -1182,7 +1221,18 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     };
     let tier = tier(&files, lines, pass.cfg.review.small_lines);
     let has_intent = pass.work.join("task.json").is_file() || pass.work.join("intent.md").is_file();
-    let mut plans = plan_local(&profiles, tier, has_intent);
+    let strict = pass.opts.strict && !pass.opts.floor;
+    let mut plans = match strict {
+        true => plan_strict(&profiles, tier, has_intent),
+        false => plan_local(&profiles, tier, has_intent),
+    };
+    let tier_name = if pass.opts.floor {
+        "floor"
+    } else if strict && tier != Tier::Skip {
+        "strict"
+    } else {
+        tier.name()
+    };
     if let Some(reason) = &floor_reason {
         plans.retain(|p| p.name == "correctness");
         for p in &mut plans {
@@ -1194,14 +1244,12 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     pass.lighten(&mut plans);
     if let Some(d) = &delta_info {
         pass.log(&format!(
-            "reviewing the {} changed lines since the last review ({} tier)",
+            "reviewing the {} changed lines since the last review ({tier_name} tier)",
             d["changedLines"],
-            tier.name()
         ));
     } else {
         pass.log(&format!(
-            "reviewing {lines} changed lines ({} tier)",
-            tier.name()
+            "reviewing {lines} changed lines ({tier_name} tier)"
         ));
     }
 
@@ -1300,7 +1348,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
                         .unwrap_or_default()
                 ));
                 drop.push(e);
-            } else if rank(&f.severity) <= 1 {
+            } else if rank(&f.severity) <= kept_rank(strict) {
                 keep.push(f);
             } else {
                 let mut e = f.json();
@@ -1310,7 +1358,8 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
         }
         (keep, drop)
     };
-    let (mut confirmed, unverified) = pass.verify(&system, &to_verify, |s| rank(s) <= 1);
+    let (mut confirmed, unverified) =
+        pass.verify(&system, &to_verify, |s| rank(s) <= kept_rank(strict));
     if let Some(why) = pass.parked() {
         return unpark_previous(pass, &prev_dir, &why);
     }
@@ -1329,7 +1378,7 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
         "tree": now,
         "changedLines": changed,
         "mode": if delta_info.is_some() { "delta" } else { "full" },
-        "tier": if pass.opts.floor { "floor" } else { tier.name() },
+        "tier": tier_name,
         "startedAt": pass.started_at,
         "map": map_status(&pass.work),
         "profiles": profile_rows,
@@ -1338,6 +1387,9 @@ fn local_pass(pass: &mut Pass) -> Result<Done> {
     });
     if let Some(d) = delta_info {
         report["delta"] = d;
+    }
+    if strict {
+        report["strict"] = json!(true);
     }
     if !settled.is_empty() {
         report["settled"] = json!(settled);
@@ -2917,6 +2969,69 @@ mod tests {
         assert_eq!(run(Tier::Full, false), vec!["correctness", "testing"]);
         assert_eq!(run(Tier::Small, true), vec!["correctness"]);
         assert!(run(Tier::Skip, true).is_empty());
+    }
+
+    #[test]
+    fn strict_plan_runs_every_picked_profile_whatever_the_size() {
+        let profiles = json!({ "picked": [
+            { "name": "correctness", "path": "c.md" },
+            { "name": "reviewability", "path": "r.md", "reasons": ["always"] },
+            { "name": "security", "path": "s.md" },
+            { "name": "intent-alignment", "path": "i.md" },
+        ]});
+        let run = |tier, intent| -> Vec<String> {
+            plan_strict(&profiles, tier, intent)
+                .into_iter()
+                .filter(|p| p.run)
+                .map(|p| p.name)
+                .collect()
+        };
+        let all = vec![
+            "correctness",
+            "reviewability",
+            "security",
+            "intent-alignment",
+        ];
+        assert_eq!(run(Tier::Full, true), all);
+        assert_eq!(run(Tier::Small, true), all);
+        assert_eq!(
+            run(Tier::Small, false),
+            vec!["correctness", "reviewability", "security"]
+        );
+        assert_eq!(run(Tier::Skip, true), vec!["intent-alignment"]);
+        let reviewability = plan_strict(&profiles, Tier::Small, true)
+            .into_iter()
+            .find(|p| p.name == "reviewability")
+            .unwrap();
+        assert_eq!(reviewability.reason, "always");
+    }
+
+    #[test]
+    fn strict_keeps_every_severity_and_the_default_keeps_major_and_up() {
+        let kept = |strict| {
+            ["blocker", "major", "minor", "nit"]
+                .into_iter()
+                .filter(|s| rank(s) <= kept_rank(strict))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kept(true), vec!["blocker", "major", "minor", "nit"]);
+        assert_eq!(kept(false), vec!["blocker", "major"]);
+    }
+
+    #[test]
+    fn a_strict_pass_and_a_light_one_never_build_on_each_others_report() {
+        let prepared = json!({ "base": "origin/main", "mergeBase": "abc" });
+        let light = json!({ "base": "origin/main", "mergeBase": "abc" });
+        let strict = json!({ "base": "origin/main", "mergeBase": "abc", "strict": true });
+        assert!(builds_on(&light, &prepared, false));
+        assert!(builds_on(&strict, &prepared, true));
+        assert!(!builds_on(&light, &prepared, true));
+        assert!(!builds_on(&strict, &prepared, false));
+        let failed =
+            json!({ "base": "origin/main", "mergeBase": "abc", "incomplete": ["testing"] });
+        assert!(!builds_on(&failed, &prepared, false));
+        let moved = json!({ "base": "origin/main", "mergeBase": "def" });
+        assert!(!builds_on(&moved, &prepared, false));
     }
 
     #[test]

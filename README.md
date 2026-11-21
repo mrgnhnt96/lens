@@ -21,7 +21,7 @@ doesn't depend on taskboard.
 From a release tag:
 
 ```sh
-cargo install --locked --git https://github.com/mrgnhnt96/lens --tag v0.2.0
+cargo install --locked --git https://github.com/mrgnhnt96/lens --tag v0.3.0
 ```
 
 From a checkout:
@@ -47,7 +47,7 @@ docs/PROVIDERS.md            the change-map provider contract
 docs/REVIEW.md               the report and protocol result formats, and where state is kept
 ```
 
-## `lens review [<base>] [--intent <file>] [--full]`, `lens review --floor`, `lens review --pr <n> [--full] [--dry-run [--only <profile>,...]]`
+## `lens review [<base>] [--intent <file>] [--full] [--strict]`, `lens review --floor`, `lens review --pr <n> [--full] [--dry-run [--only <profile>,...]]`
 
 Every form takes `--profiles <dir>` (repeatable) to lay profiles kept outside the repo over the
 rest; see "Profiles kept outside the repo" under `lens profiles` below.
@@ -73,6 +73,17 @@ only touches docs runs nothing. Blockers and majors go to a Sonnet verifier each
 blockers are in the report; fixing them is the task board's job. The PR pass runs every profile lens picks,
 the `impact-assessment` lead first and a correctness reviewer per focus area it names. Reviewers
 run on their profile's `model` (Sonnet for every built-in one); verifiers run on Sonnet.
+
+**Strict reviews of your own branch.** `lens review --strict` runs every profile lens picks (the
+same set `lens profiles` lists, without the PR pass's lead and focus-area reviewers), whatever the
+change's size, and keeps every severity: minors and nits are verified and reported too. It costs
+more per round. A change that only touches docs still runs only `intent-alignment`, and
+`intent-alignment` still needs a task or `--intent`. It's a flag, so nothing goes in the repo; for
+the task board, add it to the review command, e.g.
+`lens review --strict --profiles ~/.config/lens/profiles/<repo>`. The report records
+`"strict": true` and tier `strict`. A strict pass never reuses or builds a delta on a report from a
+pass that wasn't, or the other way round. `--strict` can't be combined with `--pr` or `--floor`;
+the PR pass is unchanged.
 
 **Reviewing again.** When the last report reviewed this branch from the same merge base, an
 unchanged tree isn't reviewed again (its report stands), and a changed tree is reviewed

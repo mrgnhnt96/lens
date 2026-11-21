@@ -88,7 +88,10 @@ its latest report in `<state>/pr-<n>.json`.
 - `incomplete`: the profiles whose reviewer gave no readable reply. The next pass doesn't trust
   such a report and reviews the whole change.
 - `tier`: `skip` (only docs changed: no agents ran), `small` (at most `[review] small_lines`
-  changed lines: correctness only) or `full`.
+  changed lines: correctness only), `full`, `strict` (`--strict`: every picked profile, whatever
+  the size) or `floor`.
+- `strict`: `true` on a `--strict` pass; missing otherwise. A pass builds only on a report as
+  strict as itself.
 - `agents`: one row per agent session: its `label`, `model`, `tools`, `costUsd` and `turns` as
   Claude Code reports them, `seconds`, and an `error` when it failed. `cacheCreationInputTokens`
   and `cacheReadInputTokens` are the usage of its first request, which is where the change gets
@@ -103,7 +106,8 @@ its latest report in `<state>/pr-<n>.json`.
   (its cache is best-effort).
 - `totals`: `agents` (how many sessions ran), `costUsd`, and the two cache fields summed over
   `agents`. The top-level `costUsd` is the same total, kept for older readers.
-- `findings`: blocker and major only, every one confirmed by a verifier. `severity` is the
+- `findings`: blocker and major only (every severity on a `--strict` pass), every one confirmed
+  by a verifier. `severity` is the
   verifier's, `line` the verifier's when it moved it, and `failureScenario` the verifier's when
   it took out a failure it couldn't reach (otherwise the reviewer's). `suggestedFix` is an
   optional one-line fix, only ever the verifier's (a reviewer's suggestion is a hint it checks).
